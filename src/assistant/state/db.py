@@ -38,6 +38,11 @@ async def apply_schema(conn: aiosqlite.Connection) -> None:
     current = row[0] if row else 0
     if current >= SCHEMA_VERSION:
         return
-    await conn.executescript(SCHEMA_SQL)
-    await conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-    await conn.commit()
+    try:
+        await conn.execute("BEGIN IMMEDIATE")
+        await conn.executescript(SCHEMA_SQL)
+        await conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise

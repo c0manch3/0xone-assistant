@@ -8,7 +8,12 @@ import structlog
 
 def setup_logging(level: str = "INFO") -> None:
     level_int = logging.getLevelNamesMapping()[level.upper()]
-    logging.basicConfig(stream=sys.stdout, level=level_int, format="%(message)s")
+    logging.basicConfig(
+        stream=sys.stdout,
+        level=level_int,
+        format="%(message)s",
+        force=True,
+    )
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,

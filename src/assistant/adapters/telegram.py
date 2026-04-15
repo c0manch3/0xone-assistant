@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import Protocol
+from collections.abc import Awaitable, Callable
+from typing import Any, Protocol
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import Message
+from aiogram.types import Message, TelegramObject, Update
 from aiogram.utils.chat_action import ChatActionSender
 
 from assistant.adapters.base import IncomingMessage, MessengerAdapter
@@ -32,8 +33,9 @@ class TelegramAdapter(MessengerAdapter):
         self._handler: _Handler | None = None
         self._polling_task: asyncio.Task[None] | None = None
 
-        self._dp.message.filter(F.chat.id == settings.owner_chat_id)
+        self._dp.update.outer_middleware.register(self._log_non_owner_middleware)
 
+        self._dp.message.filter(F.chat.id == settings.owner_chat_id)
         self._dp.message.register(self._on_text, F.text)
         self._dp.message.register(self._on_non_text)
 
@@ -41,6 +43,26 @@ class TelegramAdapter(MessengerAdapter):
 
     def set_handler(self, handler: _Handler) -> None:
         self._handler = handler
+
+    async def _log_non_owner_middleware(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        if isinstance(event, Update):
+            msg = event.message
+            if (
+                msg is not None
+                and msg.from_user is not None
+                and msg.from_user.id != self._settings.owner_chat_id
+            ):
+                log.debug(
+                    "non_owner_rejected",
+                    chat_id=msg.chat.id,
+                    user_id=msg.from_user.id,
+                )
+        return await handler(event, data)
 
     async def _on_text(self, message: Message) -> None:
         if self._handler is None:
@@ -57,7 +79,7 @@ class TelegramAdapter(MessengerAdapter):
 
     async def _on_non_text(self, message: Message) -> None:
         log.info("non_text_rejected", content_type=message.content_type)
-        await message.answer("Медиа пока не поддерживаю — это будет в phase 6.")
+        await message.answer("Пока принимаю только текст.")
 
     async def _on_shutdown(self) -> None:
         log.info("telegram_shutdown")
@@ -69,11 +91,14 @@ class TelegramAdapter(MessengerAdapter):
         )
 
     async def stop(self) -> None:
-        await self._dp.stop_polling()
-        if self._polling_task is not None:
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._polling_task
-        await self._bot.session.close()
+        if self._polling_task is None:
+            return
+        try:
+            await self._dp.stop_polling()
+        except (RuntimeError, LookupError) as exc:
+            log.warning("stop_polling_skipped", error=str(exc))
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._polling_task
 
     async def send_text(self, chat_id: int, text: str) -> None:
         await self._bot.send_message(chat_id=chat_id, text=text)

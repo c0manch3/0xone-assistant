@@ -12,12 +12,11 @@ from assistant.logger import get_logger, setup_logging
 from assistant.state.conversations import ConversationStore
 from assistant.state.db import apply_schema, connect
 
-log = get_logger("main")
-
 
 class Daemon:
     def __init__(self) -> None:
         self._settings = get_settings()
+        self._log = get_logger("main")
         self._conn: aiosqlite.Connection | None = None
         self._adapter: TelegramAdapter | None = None
 
@@ -29,15 +28,21 @@ class Daemon:
         handler = EchoHandler(store, self._adapter)
         self._adapter.set_handler(handler)
         await self._adapter.start()
-        log.info("daemon_started", owner=self._settings.owner_chat_id)
+        self._log.info("daemon_started", owner=self._settings.owner_chat_id)
 
     async def stop(self) -> None:
-        log.info("daemon_stopping")
+        self._log.info("daemon_stopping")
         if self._adapter is not None:
-            await self._adapter.stop()
+            try:
+                await self._adapter.stop()
+            except Exception:
+                self._log.warning("stop_step_failed", step="adapter", exc_info=True)
         if self._conn is not None:
-            await self._conn.close()
-        log.info("daemon_stopped")
+            try:
+                await self._conn.close()
+            except Exception:
+                self._log.warning("stop_step_failed", step="db", exc_info=True)
+        self._log.info("daemon_stopped")
 
 
 async def main() -> None:
