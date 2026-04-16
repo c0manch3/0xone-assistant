@@ -1,234 +1,70 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from collections.abc import AsyncIterator
-from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
-    HookMatcher,
     ResultMessage,
     SystemMessage,
     query,
 )
 
 from assistant.bridge.history import history_to_user_envelopes
+from assistant.bridge.hooks import make_pretool_hooks
 from assistant.bridge.skills import build_manifest
 from assistant.config import Settings
 from assistant.logger import get_logger
 
 log = get_logger("bridge.claude")
 
-# -----------------------------------------------------------------------------
-# Bash prefilter (allowlist-first, slip-guard regex as defence-in-depth).
-# -----------------------------------------------------------------------------
-_BASH_ALLOWLIST_PREFIXES: tuple[str, ...] = (
-    "python tools/",
-    "uv run tools/",
-    "git status",
-    "git log",
-    "git diff",
-    "ls ",
-    "ls\n",
-    "pwd",
-    "echo ",
-)
-
-_BASH_SLIP_GUARD_RE = re.compile(
-    r"(\benv\b|\bprintenv\b|\bset\b\s*$|"
-    r"\.env|\.ssh|\.aws|secrets|\.db\b|token|password|ANTHROPIC_API_KEY|"
-    r"\$'\\[0-7]|"
-    r"base64\s+-d|openssl\s+enc|xxd\s+-r|"
-    r"[A-Za-z0-9+/]{48,}={0,2}"
-    r")",
-    re.IGNORECASE,
-)
-
-_FILE_TOOLS: tuple[str, ...] = ("Read", "Write", "Edit", "Glob", "Grep")
-
-# WebFetch SSRF — defence in depth. Real ACLs belong at the OS/firewall layer.
-_WEBFETCH_BLOCKED_NEEDLES: tuple[str, ...] = (
-    "localhost",
-    "127.",
-    "0.0.0.0",
-    "169.254.",
-    "10.",
-    "192.168.",
-    "172.16.",
-    "172.17.",
-    "172.18.",
-    "172.19.",
-    "172.20.",
-    "172.21.",
-    "172.22.",
-    "172.23.",
-    "172.24.",
-    "172.25.",
-    "172.26.",
-    "172.27.",
-    "172.28.",
-    "172.29.",
-    "172.30.",
-    "172.31.",
-    "[::1]",
-    "[fc",
-    "[fd",
-)
-
-
-def _deny(reason: str) -> dict[str, Any]:
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason,
-        }
-    }
-
-
-def _bash_allowlist_check(cmd: str, project_root: Path) -> str | None:
-    """Return a deny-reason iff `cmd` is NOT allowed. `None` → allow."""
-    stripped = cmd.strip()
-    if not stripped:
-        return "empty command"
-    if any(stripped.startswith(p) for p in _BASH_ALLOWLIST_PREFIXES):
-        return None
-    # Special-case `cat <path>` — allow iff path resolves inside project_root.
-    if stripped.startswith("cat "):
-        rest = stripped[4:].strip()
-        # Reject flags (`cat -A`, etc.) — too open.
-        first = rest.split()[0] if rest else ""
-        if first and not first.startswith("-"):
-            try:
-                target = Path(first)
-                resolved = (
-                    target.resolve() if target.is_absolute() else (project_root / target).resolve()
-                )
-                root = project_root.resolve()
-                if str(resolved).startswith(str(root) + "/") or resolved == root:
-                    return None
-            except OSError:
-                pass
-    return (
-        "not in allowlist; if you genuinely need this, ask the owner to add it "
-        "to a skill's allowed-tools with explicit approval."
-    )
-
-
-def _make_bash_hook(project_root: Path) -> Any:
-    async def bash_hook(
-        input_data: dict[str, Any],
-        tool_use_id: str | None,
-        ctx: Any,
-    ) -> dict[str, Any]:
-        tool_input = input_data.get("tool_input") or {}
-        cmd = str(tool_input.get("command", "") or "")
-        reason = _bash_allowlist_check(cmd, project_root)
-        if reason is not None:
-            log.warning(
-                "pretool_decision",
-                tool_name="Bash",
-                decision="deny",
-                reason="allowlist",
-                cmd=cmd[:200],
-            )
-            return _deny(reason)
-        if _BASH_SLIP_GUARD_RE.search(cmd):
-            log.warning(
-                "pretool_decision",
-                tool_name="Bash",
-                decision="deny",
-                reason="slip_guard",
-                cmd=cmd[:200],
-            )
-            return _deny(
-                "Command matched a secrets/encoded-payload pattern. "
-                "Reading .env/.ssh/.aws/tokens/encoded blobs via Bash is blocked."
-            )
-        log.debug("pretool_decision", tool_name="Bash", decision="allow", cmd=cmd[:120])
-        return {}
-
-    return bash_hook
-
-
-def _make_file_hook(project_root: Path) -> Any:
-    root = project_root.resolve()
-
-    async def file_hook(
-        input_data: dict[str, Any],
-        tool_use_id: str | None,
-        ctx: Any,
-    ) -> dict[str, Any]:
-        tool_input = input_data.get("tool_input") or {}
-        candidate = (
-            tool_input.get("file_path") or tool_input.get("path") or tool_input.get("pattern") or ""
-        )
-        if not candidate:
-            return {}
-        try:
-            p = Path(str(candidate))
-            if p.is_absolute():
-                resolved = p.resolve()
-                if not (str(resolved).startswith(str(root) + "/") or resolved == root):
-                    log.warning(
-                        "pretool_decision",
-                        tool_name=input_data.get("tool_name"),
-                        decision="deny",
-                        reason="outside_project_root",
-                        path=str(resolved),
-                    )
-                    return _deny(f"Path outside project_root ({root}) is not allowed: {resolved}")
-        except OSError as exc:
-            return _deny(f"invalid path {candidate!r}: {exc}")
-        return {}
-
-    return file_hook
-
-
-def _make_webfetch_hook() -> Any:
-    async def webfetch_hook(
-        input_data: dict[str, Any],
-        tool_use_id: str | None,
-        ctx: Any,
-    ) -> dict[str, Any]:
-        tool_input = input_data.get("tool_input") or {}
-        url = str(tool_input.get("url", "") or "").strip()
-        if not url:
-            return {}
-        try:
-            host = (urlparse(url).hostname or "").lower()
-        except ValueError:
-            return _deny(f"malformed URL: {url!r}")
-        raw = url.lower()
-        for needle in _WEBFETCH_BLOCKED_NEEDLES:
-            bare = needle.rstrip(".").rstrip("]")
-            if host.startswith(bare) or needle in raw:
-                log.warning(
-                    "pretool_decision",
-                    tool_name="WebFetch",
-                    decision="deny",
-                    reason="ssrf_private_ip",
-                    url=url[:200],
-                )
-                return _deny(f"WebFetch to private/link-local/metadata host is blocked: {host!r}.")
-        return {}
-
-    return webfetch_hook
-
 
 class ClaudeBridgeError(RuntimeError):
     """Raised when the SDK call times out or fails irrecoverably."""
 
 
-class ClaudeBridge:
-    """Streams Blocks (+ final ResultMessage) for a single model turn.
+# Sentinel emitted before any block when the SDK announces the model name in
+# its `init` SystemMessage. Handler unpacks `payload["model"]` into
+# `turns.meta_json` so phase-8 health/admin can attribute cost per model.
+class InitMeta:
+    """Lightweight carrier for `SystemMessage(subtype='init').data`.
 
-    Auth is OAuth via the user's `claude` CLI — no API key. The bridge is
+    Yielded as the very first item of `ClaudeBridge.ask`. Handler matches it
+    via isinstance and folds `model` into the turn meta. Not persisted as a
+    `conversations` row.
+    """
+
+    __slots__ = ("cwd", "model", "session_id", "skills")
+
+    def __init__(
+        self,
+        *,
+        model: str | None,
+        skills: list[str],
+        cwd: str | None,
+        session_id: str | None,
+    ) -> None:
+        self.model = model
+        self.skills = skills
+        self.cwd = cwd
+        self.session_id = session_id
+
+
+class ClaudeBridge:
+    """Streams Blocks (+ a final ResultMessage) for a single model turn.
+
+    Auth is OAuth via the user's `claude` CLI -- no API key. The bridge is
     stateless per call; persistence is the handler's responsibility.
+
+    Lifecycle invariants:
+    * The very first yielded item is an `InitMeta` (carries `model` etc.).
+    * On success, the LAST yielded item is `ResultMessage`, then the
+      generator returns cleanly.
+    * On timeout / SDK error, the underlying async generator is `aclose()`d
+      in `finally` so we don't leak a CLI subprocess; we then raise
+      `ClaudeBridgeError`.
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -239,12 +75,7 @@ class ClaudeBridge:
 
     def _build_options(self, *, system_prompt: str) -> ClaudeAgentOptions:
         pr = self._settings.project_root
-        pretool_matchers: list[HookMatcher] = [
-            HookMatcher(matcher="Bash", hooks=[_make_bash_hook(pr)]),
-            *[HookMatcher(matcher=t, hooks=[_make_file_hook(pr)]) for t in _FILE_TOOLS],
-            HookMatcher(matcher="WebFetch", hooks=[_make_webfetch_hook()]),
-        ]
-        hooks: dict[Any, list[HookMatcher]] = {"PreToolUse": pretool_matchers}
+        hooks: dict[Any, Any] = {"PreToolUse": make_pretool_hooks(pr)}
         thinking_kwargs: dict[str, Any] = {}
         if self._settings.claude.thinking_budget > 0:
             thinking_kwargs["max_thinking_tokens"] = self._settings.claude.thinking_budget
@@ -279,12 +110,14 @@ class ClaudeBridge:
         user_text: str,
         history: list[dict[str, Any]],
     ) -> AsyncIterator[Any]:
-        """Yield Blocks, then one final ResultMessage, then return cleanly.
+        """Yield InitMeta, then Blocks, then one final ResultMessage.
 
-        Handler contract: the ResultMessage is the success sentinel.
+        Handler contract: ResultMessage is the success sentinel.
         If the stream aborts (TimeoutError / SDK exception) we raise
-        ClaudeBridgeError and NEVER yield a ResultMessage — handler's
-        `finally` must call `turns.interrupt`.
+        `ClaudeBridgeError` and NEVER yield a ResultMessage; the handler's
+        `finally` calls `turns.interrupt`. The underlying SDK async-gen is
+        always closed in `finally`, even on timeout, so the CLI subprocess
+        is reaped.
         """
         opts = self._build_options(system_prompt=self._render_system_prompt())
         log.info(
@@ -305,17 +138,25 @@ class ClaudeBridge:
             }
 
         async with self._sem:
+            sdk_iter = query(prompt=prompt_stream(), options=opts)
             try:
                 async with asyncio.timeout(self._settings.claude.timeout):
-                    async for message in query(prompt=prompt_stream(), options=opts):
+                    async for message in sdk_iter:
                         if isinstance(message, SystemMessage) and message.subtype == "init":
                             data = message.data or {}
-                            log.info(
-                                "sdk_init",
+                            init = InitMeta(
                                 model=data.get("model"),
                                 skills=list(data.get("skills") or []),
                                 cwd=data.get("cwd"),
+                                session_id=data.get("session_id"),
                             )
+                            log.info(
+                                "sdk_init",
+                                model=init.model,
+                                skills=init.skills,
+                                cwd=init.cwd,
+                            )
+                            yield init
                             continue
                         if isinstance(message, AssistantMessage):
                             for block in message.content:
@@ -332,7 +173,7 @@ class ClaudeBridge:
                             )
                             yield message
                             return
-                        # SystemMessage(other), RateLimitEvent, UserMessage — ignore.
+                        # SystemMessage(other), RateLimitEvent, UserMessage -- skip.
             except TimeoutError as exc:
                 log.warning(
                     "timeout",
@@ -340,8 +181,15 @@ class ClaudeBridge:
                     timeout_s=self._settings.claude.timeout,
                 )
                 raise ClaudeBridgeError("timeout") from exc
-            except ClaudeBridgeError:
-                raise
             except Exception as exc:
                 log.error("sdk_error", error=repr(exc))
                 raise ClaudeBridgeError(f"sdk error: {exc}") from exc
+            finally:
+                # Always close the SDK async-gen so the CLI subprocess does not
+                # become a zombie on timeout/exception/early return.
+                aclose = getattr(sdk_iter, "aclose", None)
+                if aclose is not None:
+                    try:
+                        await aclose()
+                    except Exception as close_exc:
+                        log.warning("sdk_aclose_failed", error=repr(close_exc))

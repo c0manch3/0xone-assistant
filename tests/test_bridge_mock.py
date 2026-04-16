@@ -19,7 +19,7 @@ from claude_agent_sdk import (
 )
 
 import assistant.bridge.claude as bridge_module
-from assistant.bridge.claude import ClaudeBridge
+from assistant.bridge.claude import ClaudeBridge, InitMeta
 from assistant.config import ClaudeSettings, Settings
 
 
@@ -82,11 +82,16 @@ async def test_bridge_yields_blocks_then_result(
     bridge = ClaudeBridge(_make_settings(tmp_path))
     items = await _drain(bridge.ask(chat_id=1, user_text="hi", history=[]))
 
-    # 1 TextBlock + 1 ResultMessage (SystemMessage is consumed, not yielded).
-    assert len(items) == 2
-    assert isinstance(items[0], TextBlock)
-    assert items[0].text == "hello"
-    assert isinstance(items[1], ResultMessage)
+    # InitMeta (carries `model`) + TextBlock + ResultMessage. The bridge
+    # promotes SystemMessage(subtype='init') into an InitMeta sentinel so the
+    # handler can fold `model` into `turns.meta_json` (phase 2 unverified item
+    # 7 -- proxy through InitMeta).
+    assert len(items) == 3
+    assert isinstance(items[0], InitMeta)
+    assert items[0].model == "m"
+    assert isinstance(items[1], TextBlock)
+    assert items[1].text == "hello"
+    assert isinstance(items[2], ResultMessage)
 
     # Empty history → only the current user envelope.
     assert len(captured_prompts) == 1
