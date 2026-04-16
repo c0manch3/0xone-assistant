@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -12,7 +13,7 @@ from claude_agent_sdk import (
 )
 
 from assistant.adapters.base import IncomingMessage
-from assistant.bridge.claude import ClaudeBridge, ClaudeBridgeError
+from assistant.bridge.claude import ClaudeBridge, ClaudeBridgeError, InitMeta
 from assistant.config import Settings
 from assistant.logger import get_logger
 from assistant.state.conversations import ConversationStore
@@ -23,27 +24,28 @@ Emit = Callable[[str], Awaitable[None]]
 log = get_logger("handlers.message")
 
 
+def _result_meta(item: ResultMessage) -> dict[str, Any]:
+    return {
+        "subtype": item.subtype,
+        "stop_reason": item.stop_reason,
+        "usage": item.usage,
+        "model_usage": item.model_usage,
+        "cost_usd": item.total_cost_usd,
+        "duration_ms": item.duration_ms,
+        "num_turns": item.num_turns,
+        "session_id": item.session_id,
+    }
+
+
 def _classify(
     item: Any,
 ) -> tuple[str | None, dict[str, Any], str | None, str | None]:
-    """Map an SDK block/message to `(role, payload, text_to_emit, block_type)`.
+    """Map an SDK block to `(role, payload, text_to_emit, block_type)`.
 
-    role ∈ {'user', 'assistant', 'tool', 'result', None}. 'result' is meta-only
-    — it's NOT written to `conversations`; it flips the handler's completed
-    flag and feeds `turns.complete(meta=...)`.
+    role ∈ {'user', 'assistant', 'tool', None}. ResultMessage and InitMeta
+    are NOT handled here -- they're metadata that flips handler state and
+    is dispatched explicitly in `handle()`.
     """
-    if isinstance(item, ResultMessage):
-        meta: dict[str, Any] = {
-            "subtype": item.subtype,
-            "stop_reason": item.stop_reason,
-            "usage": item.usage,
-            "model_usage": item.model_usage,
-            "cost_usd": item.total_cost_usd,
-            "duration_ms": item.duration_ms,
-            "num_turns": item.num_turns,
-            "session_id": item.session_id,
-        }
-        return ("result", meta, None, None)
     if isinstance(item, TextBlock):
         return (
             "assistant",
@@ -90,7 +92,13 @@ def _classify(
 
 
 class ClaudeHandler:
-    """Bridges an IncomingMessage to ClaudeBridge with full turn lifecycle."""
+    """Bridges an IncomingMessage to ClaudeBridge with full turn lifecycle.
+
+    A per-chat asyncio lock serialises concurrent turns for the same chat
+    (e.g. an owner message arriving while a phase-5 scheduler trigger is
+    already mid-flight). Different chats run independently up to
+    `claude.max_concurrent`.
+    """
 
     def __init__(
         self,
@@ -103,10 +111,22 @@ class ClaudeHandler:
         self._conv = conv
         self._turns = turns
         self._bridge = bridge
+        self._chat_locks: dict[int, asyncio.Lock] = {}
+
+    def _chat_lock(self, chat_id: int) -> asyncio.Lock:
+        lock = self._chat_locks.get(chat_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._chat_locks[chat_id] = lock
+        return lock
 
     async def handle(self, msg: IncomingMessage, emit: Emit) -> None:
+        async with self._chat_lock(msg.chat_id):
+            await self._run_turn(msg, emit)
+
+    async def _run_turn(self, msg: IncomingMessage, emit: Emit) -> None:
         turn_id = await self._turns.start(msg.chat_id)
-        log.info("turn_started", turn_id=turn_id, chat_id=msg.chat_id)
+        log.info("turn_started", turn_id=turn_id, chat_id=msg.chat_id, origin=msg.origin)
 
         await self._conv.append(
             msg.chat_id,
@@ -117,21 +137,30 @@ class ClaudeHandler:
         )
 
         history = await self._conv.load_recent(msg.chat_id, self._settings.claude.history_limit)
-        # Current turn is still 'pending' → excluded from load_recent's filter.
+        # Current turn is still 'pending' -> excluded from load_recent's filter.
 
         completed = False
+        meta: dict[str, Any] = {}
         try:
             async for item in self._bridge.ask(msg.chat_id, msg.text, history):
-                role, payload, text_out, block_type = _classify(item)
-                if role == "result":
-                    await self._turns.complete(turn_id, meta=payload)
+                if isinstance(item, InitMeta):
+                    if item.model is not None:
+                        meta["model"] = item.model
+                    if item.session_id is not None:
+                        meta["sdk_session_id"] = item.session_id
+                    continue
+                if isinstance(item, ResultMessage):
+                    meta.update(_result_meta(item))
+                    await self._turns.complete(turn_id, meta=meta)
                     completed = True
                     log.info(
                         "turn_complete",
                         turn_id=turn_id,
-                        cost_usd=payload.get("cost_usd"),
+                        cost_usd=meta.get("cost_usd"),
+                        model=meta.get("model"),
                     )
                     continue
+                role, payload, text_out, block_type = _classify(item)
                 if role is None:
                     continue
                 await self._conv.append(
@@ -144,8 +173,18 @@ class ClaudeHandler:
                 if text_out:
                     await emit(text_out)
         except ClaudeBridgeError as exc:
-            await emit(f"\n\n⚠ {exc}")
+            log.warning("bridge_error", turn_id=turn_id, error=repr(exc))
+            await emit("\n\n⚠ Внутренняя ошибка, детали в логах.")
         finally:
             if not completed:
-                await self._turns.interrupt(turn_id)
+                # Shield the interrupt so a CancelledError mid-finally
+                # doesn't leave the turn stuck in 'pending'.
+                try:
+                    await asyncio.shield(self._turns.interrupt(turn_id))
+                except asyncio.CancelledError:
+                    log.warning(
+                        "turn_interrupt_cancelled",
+                        turn_id=turn_id,
+                    )
+                    raise
                 log.warning("turn_interrupted", turn_id=turn_id)

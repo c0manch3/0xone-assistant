@@ -95,8 +95,9 @@ class TelegramAdapter(MessengerAdapter):
         assert message.text is not None
         incoming = IncomingMessage(
             chat_id=message.chat.id,
-            message_id=message.message_id,
             text=message.text,
+            message_id=message.message_id,
+            origin="telegram",
         )
         chunks: list[str] = []
 
@@ -108,7 +109,8 @@ class TelegramAdapter(MessengerAdapter):
 
         full = "".join(chunks).strip()
         if not full:
-            full = "(пустой ответ)"
+            log.info("empty_reply_skipped", chat_id=message.chat.id)
+            return
         for part in split_for_telegram(full):
             await self._bot.send_message(chat_id=message.chat.id, text=part)
 
