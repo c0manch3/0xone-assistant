@@ -20,16 +20,22 @@ from assistant.state.turns import TurnStore
 AUTH_PREFLIGHT_FAIL_EXIT = 3
 
 
-async def _preflight_claude_auth(log: structlog.stdlib.BoundLogger) -> None:
-    """Fail-fast if the `claude` CLI is missing or unauthenticated.
+async def _preflight_claude_cli(log: structlog.stdlib.BoundLogger) -> None:
+    """Fail-fast if the `claude` CLI is missing.
 
-    Exit 3 signals "user action required" (install CLI / run `claude login`).
+    `claude --version` is cheap (no model turn, no cost) -- it confirms the
+    binary is on $PATH. Auth is *not* checked here because every available
+    "real" probe (`claude --print ping`, etc.) costs a model call on every
+    daemon restart. Authentication errors surface from the first user message
+    via `ClaudeBridgeError` with a clear "auth/login" hint in the structured
+    log, which is good enough for a single-user bot.
+
+    Exit 3 signals "user action required" (install CLI).
     """
     try:
         proc = await asyncio.create_subprocess_exec(
             "claude",
-            "--print",
-            "ping",
+            "--version",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -41,32 +47,23 @@ async def _preflight_claude_auth(log: structlog.stdlib.BoundLogger) -> None:
         sys.exit(AUTH_PREFLIGHT_FAIL_EXIT)
 
     try:
-        _stdout, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=10.0)
     except TimeoutError:
         proc.kill()
         await proc.wait()
         log.error(
             "claude_cli_hanging",
-            hint="`claude --print ping` did not respond within 15s.",
+            hint="`claude --version` did not respond within 10s.",
         )
         sys.exit(AUTH_PREFLIGHT_FAIL_EXIT)
 
     if proc.returncode != 0:
-        err = (stderr_bytes or b"").decode("utf-8", "replace").lower()
-        if any(needle in err for needle in ("auth", "login", "not authenticated")):
-            log.error(
-                "claude_cli_not_authenticated",
-                hint="Run `claude login` before starting the bot.",
-            )
-        else:
-            log.error(
-                "claude_cli_failed",
-                stderr=err[:500],
-                rc=proc.returncode,
-            )
+        err = (stderr_bytes or b"").decode("utf-8", "replace")
+        log.error("claude_cli_failed", stderr=err[:500], rc=proc.returncode)
         sys.exit(AUTH_PREFLIGHT_FAIL_EXIT)
 
-    log.info("auth_preflight_ok")
+    version = (stdout_bytes or b"").decode("utf-8", "replace").strip()
+    log.info("auth_preflight_ok", claude_version=version[:120])
 
 
 class Daemon:
@@ -77,7 +74,7 @@ class Daemon:
         self._adapter: TelegramAdapter | None = None
 
     async def start(self) -> None:
-        await _preflight_claude_auth(self._log)
+        await _preflight_claude_cli(self._log)
         ensure_skills_symlink(self._settings.project_root)
 
         self._settings.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -86,6 +83,13 @@ class Daemon:
 
         conv = ConversationStore(self._conn)
         turns = TurnStore(self._conn, lock=conv.lock)
+
+        # A previous process may have crashed mid-turn; promote any orphan
+        # 'pending' rows to 'interrupted' so they're excluded from history.
+        swept = await turns.sweep_pending()
+        if swept:
+            self._log.warning("startup_swept_pending_turns", count=swept)
+
         bridge = ClaudeBridge(self._settings)
 
         self._adapter = TelegramAdapter(self._settings)

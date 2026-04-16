@@ -57,3 +57,19 @@ class TurnStore:
                 (_utcnow_iso(), turn_id),
             )
             await self._conn.commit()
+
+    async def sweep_pending(self) -> int:
+        """Mark every leftover 'pending' turn as 'interrupted'.
+
+        Run once at daemon startup -- a previous process may have crashed
+        mid-turn, leaving rows that would otherwise pollute history filtering
+        forever. Returns the number of rows updated.
+        """
+        async with self._lock:
+            cursor = await self._conn.execute(
+                "UPDATE turns SET status = 'interrupted', completed_at = ? "
+                "WHERE status = 'pending'",
+                (_utcnow_iso(),),
+            )
+            await self._conn.commit()
+            return cursor.rowcount or 0
