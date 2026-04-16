@@ -8,6 +8,8 @@ dependencies = [
   "pydantic-settings>=2.6",
   "aiosqlite>=0.20,<0.22",
   "structlog>=25.1",
+  "claude-agent-sdk>=0.1.59,<0.2",
+  "pyyaml>=6.0",
 ]
 
 [dependency-groups]
@@ -16,6 +18,7 @@ dev = [
   "pytest-asyncio>=1.0",
   "ruff>=0.8",
   "mypy>=1.13",
+  "types-pyyaml>=6.0",
 ]
 
 [build-system]
@@ -29,13 +32,19 @@ module-root = "src"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = ["spikes", "plan"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF", "ASYNC"]
+# ASYNC240 flags pathlib in `async def`. Our file-hook's Path.resolve is an
+# in-memory symbolic operation (no disk I/O on each hop once cached), and
+# swapping to anyio.Path here would add a dep boundary for no real benefit.
+ignore = ["ASYNC240"]
 
 [tool.mypy]
 strict = true
 python_version = "3.12"
+exclude = ["^spikes/", "^plan/"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

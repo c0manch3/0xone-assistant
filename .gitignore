@@ -11,3 +11,9 @@ data/
 .pytest_cache/
 dist/
 *.egg-info/
+
+# Phase 2: bootstrap-created symlink (regenerated on daemon start).
+.claude/skills
+
+# Spike probes generate machine-readable reports; keep source files, skip reports.
+spikes/sdk_probe*_report.json
