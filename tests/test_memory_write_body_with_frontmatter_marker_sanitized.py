@@ -11,7 +11,7 @@ from tests._helpers.memory_cli import run_memory
 def test_sanitize_indents_dashes() -> None:
     src = "first\n---\nsecond\n"
     out = sanitize_body(src)
-    assert "first\n ---\nsecond\n" == out
+    assert out == "first\n ---\nsecond\n"
 
 
 def test_sanitize_preserves_inline_dashes() -> None:

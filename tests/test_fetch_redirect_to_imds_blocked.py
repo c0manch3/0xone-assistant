@@ -16,8 +16,9 @@ from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-import _lib.fetch as fetch_mod
 import pytest
+
+import _lib.fetch as fetch_mod
 
 
 class _Redirect302To(BaseHTTPRequestHandler):

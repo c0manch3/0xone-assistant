@@ -311,12 +311,45 @@ class Daemon:
 
     # ------------------------------------------------------------------
 
+    def _ensure_vault(self) -> None:
+        """Create the vault root (0o700) and log a warning if it is loose.
+
+        The memory CLI also does this on every invocation, but doing it here
+        at daemon startup (a) makes the `{vault_dir}` reference in the
+        system prompt point to something that exists, and (b) surfaces the
+        advisory-flock failure as a Telegram notice (future phase 5) rather
+        than hiding it behind a single CLI error.
+
+        We do NOT trigger the S3 lock probe here (it's CLI-local). An
+        advisory-flock filesystem will surface via `exit 5` on the first
+        `memory write`, which the model is instructed to relay to the owner
+        in SKILL.md.
+        """
+        vault_dir = self._settings.vault_dir
+        try:
+            vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            (vault_dir / ".tmp").mkdir(exist_ok=True, mode=0o700)
+        except OSError as exc:
+            self._log.warning("vault_init_failed", error=repr(exc), path=str(vault_dir))
+            return
+        try:
+            mode = vault_dir.stat().st_mode & 0o777
+        except OSError:
+            return
+        if mode & 0o077:
+            self._log.warning(
+                "vault_dir_permissions_too_open",
+                path=str(vault_dir),
+                mode=oct(mode),
+            )
+
     async def start(self) -> None:
         await _preflight_claude_cli(self._log)
         ensure_skills_symlink(self._settings.project_root)
 
         self._settings.db_path.parent.mkdir(parents=True, exist_ok=True)
         (self._settings.data_dir / "run").mkdir(parents=True, exist_ok=True)
+        self._ensure_vault()
         self._conn = await connect(self._settings.db_path)
         await apply_schema(self._conn)
 

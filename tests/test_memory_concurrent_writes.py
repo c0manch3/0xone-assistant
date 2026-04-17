@@ -13,9 +13,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _MAIN = _PROJECT_ROOT / "tools" / "memory" / "main.py"
 
 
-def _popen_write(
-    rel_path: str, body: str, vault: Path, idx: Path
-) -> subprocess.Popen[str]:
+def _popen_write(rel_path: str, body: str, vault: Path, idx: Path) -> subprocess.Popen[str]:
     env = dict(os.environ)
     env["MEMORY_VAULT_DIR"] = str(vault)
     env["MEMORY_INDEX_DB_PATH"] = str(idx)

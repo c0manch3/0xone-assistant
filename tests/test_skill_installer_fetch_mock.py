@@ -9,8 +9,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import _lib.fetch as fetch_mod
 import pytest
+
+import _lib.fetch as fetch_mod
 
 
 def test_git_repo_https_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -47,9 +47,7 @@ def test_search_match(tmp_path: Path) -> None:
 def test_search_area_filter(tmp_path: Path) -> None:
     vault, idx = _prepare(tmp_path)
     # Both notes contain the word "day"; the area filter narrows it.
-    res = run_memory(
-        "search", "day", "--area", "inbox", vault_dir=vault, index_db=idx
-    )
+    res = run_memory("search", "day", "--area", "inbox", vault_dir=vault, index_db=idx)
     paths = {h["path"] for h in res.json_out["data"]["hits"]}
     assert paths == {"inbox/a.md"}
 
@@ -76,7 +74,5 @@ def test_search_limit(tmp_path: Path) -> None:
             index_db=idx,
             stdin="common",
         )
-    res = run_memory(
-        "search", "common", "--limit", "2", vault_dir=vault, index_db=idx
-    )
+    res = run_memory("search", "common", "--limit", "2", vault_dir=vault, index_db=idx)
     assert len(res.json_out["data"]["hits"]) == 2

@@ -7,9 +7,10 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
-import _lib.fetch as fetch_mod
 import main as installer_main
 import pytest
+
+import _lib.fetch as fetch_mod
 
 
 def _materialise_bundle(content: str) -> Callable[[str, Path], None]:

@@ -9,7 +9,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _MAIN = _PROJECT_ROOT / "tools" / "memory" / "main.py"
 

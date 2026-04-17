@@ -6,8 +6,9 @@ import base64
 import json
 from typing import Any
 
-import _lib.marketplace as mkt
 import pytest
+
+import _lib.marketplace as mkt
 
 
 class _FakeProc:

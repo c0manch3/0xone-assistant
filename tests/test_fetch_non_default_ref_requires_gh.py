@@ -12,8 +12,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import _lib.fetch as fetch_mod
 import pytest
+
+import _lib.fetch as fetch_mod
 
 
 def _allow_everything(monkeypatch: pytest.MonkeyPatch) -> None:

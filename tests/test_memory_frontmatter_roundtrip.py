@@ -27,9 +27,7 @@ def test_tags_null_becomes_empty_list() -> None:
 
 
 def test_serialize_auto_fills_created() -> None:
-    out = serialize_note(
-        {"title": "T", "tags": [], "area": None, "related": []}, "body\n"
-    )
+    out = serialize_note({"title": "T", "tags": [], "area": None, "related": []}, "body\n")
     assert "title: T" in out
     assert "created:" in out
 

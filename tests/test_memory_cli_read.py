@@ -42,8 +42,6 @@ def test_read_invalid_frontmatter(tmp_path: Path) -> None:
     bad = vault / "inbox"
     bad.mkdir()
     (bad / "corrupt.md").write_text("no frontmatter here\n", encoding="utf-8")
-    res = run_memory(
-        "read", "inbox/corrupt.md", vault_dir=vault, index_db=tmp_path / "i.db"
-    )
+    res = run_memory("read", "inbox/corrupt.md", vault_dir=vault, index_db=tmp_path / "i.db")
     assert res.rc == 3
     assert "frontmatter" in res.json_err["error"].lower()

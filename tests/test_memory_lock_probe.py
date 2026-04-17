@@ -27,9 +27,7 @@ def test_ensure_exits_5_on_noop_fs(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert exc.value.code == 5
 
 
-def test_ensure_skip_env_bypass(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_ensure_skip_env_bypass(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Probe would fail, but the env override keeps us going.
     monkeypatch.setattr(fts_mod, "_probe_lock_semantics", lambda _p: False)
     monkeypatch.setenv("ASSISTANT_SKIP_LOCK_PROBE", "1")

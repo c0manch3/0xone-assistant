@@ -74,9 +74,7 @@ def test_list_skips_tmp_and_git(tmp_path: Path) -> None:
     for excluded in (".tmp", ".git", ".trash"):
         d = vault / excluded
         d.mkdir(parents=True, exist_ok=True)
-        (d / "hidden.md").write_text(
-            "---\ntitle: nope\n---\n", encoding="utf-8"
-        )
+        (d / "hidden.md").write_text("---\ntitle: nope\n---\n", encoding="utf-8")
     res = run_memory("list", vault_dir=vault, index_db=idx)
     paths = {n["path"] for n in res.json_out["data"]["notes"]}
     assert all(not p.startswith((".tmp/", ".git/", ".trash/")) for p in paths)

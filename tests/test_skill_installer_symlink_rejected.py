@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+
 from _lib.validate import ValidationError, validate_bundle
 
 

@@ -41,6 +41,13 @@ select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF", "ASYNC"]
 # swapping to anyio.Path here would add a dep boundary for no real benefit.
 ignore = ["ASYNC240"]
 
+[tool.ruff.lint.isort]
+# Phase 3/4: installer and memory CLIs inject their `_lib/` / `_memlib/`
+# directories onto sys.path via tests/conftest.py. Tell isort those are
+# first-party so imports land in the right section rather than getting
+# grouped with pytest/pyyaml.
+known-first-party = ["assistant", "_lib", "_memlib", "tests"]
+
 [tool.mypy]
 strict = true
 python_version = "3.12"
