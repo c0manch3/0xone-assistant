@@ -343,6 +343,22 @@ class Daemon:
                 mode=oct(mode),
             )
 
+        # B-CRIT-1 (review wave 3): `memory write --body-file` reads staged
+        # body files inside `<project_root>/data/run/memory-stage/`. Pre-
+        # create the dir at 0o700 so the model's first Write tool call has
+        # a valid landing spot. The stage lives under project_root (inside
+        # the phase-2 file-hook allowlist), intentionally not under
+        # `<data_dir>/` which is OUTSIDE the project.
+        stage_dir = self._settings.project_root / "data" / "run" / "memory-stage"
+        try:
+            stage_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        except OSError as exc:
+            self._log.warning(
+                "memory_stage_init_failed",
+                error=repr(exc),
+                path=str(stage_dir),
+            )
+
     async def start(self) -> None:
         await _preflight_claude_cli(self._log)
         ensure_skills_symlink(self._settings.project_root)

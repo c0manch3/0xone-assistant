@@ -68,6 +68,15 @@ EXIT_NOT_FOUND = 7
 _DEFAULT_SEARCH_LIMIT = 10
 _MAX_BODY_BYTES_DEFAULT = 1_048_576
 
+# Project root resolved once at import: memory/main.py → ../../ .
+# Used to path-guard `--body-file`, mirroring phase-2 file-hook semantics
+# (bodies staged outside the repo would defeat that guard).
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# Staging area for body-files written by the model via the Write tool and
+# consumed by `memory write --body-file`. Daemon.start() pre-creates it
+# with mode 0o700; CLI auto-cleans after successful write.
+_STAGE_SUBDIR = Path("data") / "run" / "memory-stage"
+
 
 # ---------------------------------------------------------------------------
 # Config resolution (env-driven; stdlib-only — no pydantic import)
@@ -96,6 +105,33 @@ def _resolve_index_path() -> Path:
 
 def _resolve_tokenizer() -> str:
     return os.environ.get("MEMORY_FTS_TOKENIZER") or "porter unicode61 remove_diacritics 2"
+
+
+def _resolve_staged_body_file(raw: str) -> tuple[Path | None, str | None]:
+    """Return `(path, None)` if `raw` points inside the sanctioned stage dir.
+
+    The stage dir is `<project_root>/data/run/memory-stage/`. Relative input
+    is joined to `project_root`; absolute input must resolve into the same
+    subtree. Any `.resolve()` escape (symlink / `..`) rejects the path.
+
+    B-CRIT-1: this is the only vector the model uses to push a body through
+    the Bash hook (which rejects the `|` pipe). Locking the accepted target
+    to a small allowlist keeps the surface minimal — we never read arbitrary
+    files on the model's say-so.
+    """
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = _PROJECT_ROOT / candidate
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        return None, f"--body-file: cannot resolve: {exc}"
+    stage_root = (_PROJECT_ROOT / _STAGE_SUBDIR).resolve()
+    if not resolved.is_relative_to(stage_root):
+        return None, (f"--body-file must live under {stage_root} (got {resolved})")
+    if not resolved.is_file():
+        return None, f"--body-file is not a regular file: {resolved}"
+    return resolved, None
 
 
 def _resolve_max_body_bytes() -> int:
@@ -194,13 +230,35 @@ def cmd_write(args: argparse.Namespace) -> int:
     if args.title is None or not args.title.strip():
         return _fail(EXIT_VAL, "--title is required and must be non-empty")
 
-    if args.body != "-":
+    # B-CRIT-1 (review wave 3): Bash hook's `_SHELL_METACHARS` rejects `|`,
+    # so the phase-4 v1 contract (`--body -` only) was unreachable from the
+    # model. Two accepted paths now:
+    #   * `--body -`         → stdin read (usable from direct subprocess /
+    #                          tests, kept for CI/devops).
+    #   * `--body-file PATH` → relative-to-project_root path inside
+    #                          `data/run/memory-stage/`; the model writes
+    #                          the body through the phase-2 Write tool and
+    #                          then invokes `memory write --body-file ...`
+    #                          via Bash. The staging file is unlinked on
+    #                          success to prevent leftover accumulation.
+    body_file_path: Path | None = None
+    if args.body == "-":
+        body_raw = sys.stdin.read()
+    elif args.body_file:
+        body_file_path, reason = _resolve_staged_body_file(args.body_file)
+        if body_file_path is None:
+            return _fail(EXIT_VAL, reason or "invalid --body-file")
+        try:
+            body_raw = body_file_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return _fail(EXIT_IO, f"read --body-file failed: {exc}")
+    else:
         return _fail(
             EXIT_USAGE,
-            "only --body - (stdin) is supported; pipe the body on stdin",
+            "must provide --body - (stdin) or --body-file PATH "
+            f"(relative to {_PROJECT_ROOT / _STAGE_SUBDIR})",
         )
 
-    body_raw = sys.stdin.read()
     if len(body_raw.encode("utf-8")) > max_body:
         return _fail(
             EXIT_VAL,
@@ -257,6 +315,15 @@ def cmd_write(args: argparse.Namespace) -> int:
             )
     except OSError as exc:
         return _fail(EXIT_IO, f"write failed: {exc}", path=str(rel))
+
+    # Successful commit: drop the stage file so it cannot accumulate.
+    # Failures (above `return _fail(...)`) preserve the stage so the model
+    # can retry after inspecting stderr.
+    if body_file_path is not None:
+        try:
+            body_file_path.unlink(missing_ok=True)
+        except OSError as exc:
+            sys.stderr.write(f"[memory] warn: stage cleanup failed: {exc}\n")
 
     return _ok({"path": str(rel), "title": frontmatter["title"], "area": area})
 
@@ -397,12 +464,30 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_read.add_argument("path")
     sp_read.set_defaults(func=cmd_read)
 
-    sp_write = sub.add_parser("write", help="write a note (body on stdin)")
+    sp_write = sub.add_parser(
+        "write",
+        help="write a note (body from stdin via `--body -` or from a staged file)",
+    )
     sp_write.add_argument("path")
     sp_write.add_argument("--title", required=True)
     sp_write.add_argument("--tags", default=None, help="comma-separated tag list")
     sp_write.add_argument("--area", default=None)
-    sp_write.add_argument("--body", required=True, help="must be '-' (stdin)")
+    # The hyphen literal `-` is the sentinel for stdin; `None` (neither flag
+    # given) prints usage help. Mutually exclusive: argparse rejects both.
+    body_group = sp_write.add_mutually_exclusive_group()
+    body_group.add_argument(
+        "--body",
+        default=None,
+        help="'-' to read from stdin (test harness); otherwise use --body-file",
+    )
+    body_group.add_argument(
+        "--body-file",
+        default=None,
+        help=(
+            "path (abs or project-root-relative) to a staged body inside "
+            "data/run/memory-stage/; CLI unlinks it on success"
+        ),
+    )
     sp_write.add_argument("--overwrite", action="store_true")
     sp_write.set_defaults(func=cmd_write)
 

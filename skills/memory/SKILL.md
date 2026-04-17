@@ -37,7 +37,7 @@ PreToolUse hook их отклонит (vault лежит вне `project_root`).
 | code | смысл |
 |---|---|
 | 0 | ok |
-| 2 | usage (argparse / `--body` не `-`) |
+| 2 | usage (argparse / ни `--body -`, ни `--body-file` не указаны) |
 | 3 | validation (frontmatter / path / size) |
 | 4 | IO (vault недоступен) |
 | 5 | FTS5 / lock-probe (см. предупреждение ниже) |
@@ -50,13 +50,39 @@ PreToolUse hook их отклонит (vault лежит вне `project_root`).
 список `wikilinks` в `memory read`. Навигация — через повторный `memory read`
 на target.
 
+## Как передать body (важно)
+
+Bash hook запрещает shell-метасимволы (`|`, `<`, `&`, `>`, `` ` ``, `$(`, …) —
+pipe через `echo "…" | memory write …` не работает. Используй двухшаговый
+pattern:
+
+1. **Stage body через Write tool** в `data/run/memory-stage/<уникальный>.md`
+   (директория создаётся при старте daemon; phase-2 path-guard разрешает
+   Write под project_root).
+2. **Вызови CLI** `python tools/memory/main.py write <path> --title "…"
+   --body-file data/run/memory-stage/<уникальный>.md`.
+3. CLI автоматически удалит stage-файл после успешного write.
+
+Уникальный suffix — любой предсказуемый: `stage-<turn_id>.md` / `<epoch>.md`.
+Не хардкодь имя `stage.md` — между turn'ами модель может конкурировать сама
+с собой.
+
 ## Примеры
 
 User: "запомни, что у жены день рождения 3 апреля"
-→ `echo "3 апреля" | python tools/memory/main.py write inbox/wife-birthday.md --title "День рождения жены" --tags personal,family --body -`
+→ Шаг 1 (Write tool):
+  `file_path: data/run/memory-stage/stage-wife-birthday.md`
+  `content: "3 апреля"`
+→ Шаг 2 (Bash):
+  `python tools/memory/main.py write inbox/wife-birthday.md
+   --title "День рождения жены" --tags personal,family
+   --body-file data/run/memory-stage/stage-wife-birthday.md`
 
 User: "когда у жены день рождения?"
-→ `python tools/memory/main.py search "жена день рождения"` → 1 hit → ответ.
+→ `python tools/memory/main.py search "жена"` → 1 hit → ответ.
+
+**Альтернатива для коротких фактов:** `--body -` (stdin) доступен только для
+тестов / CLI-скриптов. Через Bash hook он недостижим (требует pipe).
 
 **Проактивность:** любой важный факт из диалога (имена, даты, предпочтения)
 записывай в `inbox/` сразу — не спрашивая подтверждения. Разбор в `projects/`
