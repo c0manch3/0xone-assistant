@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -13,8 +14,12 @@ from claude_agent_sdk import (
 )
 
 from assistant.bridge.history import history_to_user_envelopes
-from assistant.bridge.hooks import make_pretool_hooks
-from assistant.bridge.skills import build_manifest
+from assistant.bridge.hooks import make_posttool_hooks, make_pretool_hooks
+from assistant.bridge.skills import (
+    build_manifest,
+    invalidate_manifest_cache,
+    touch_skills_dir,
+)
 from assistant.config import Settings
 from assistant.logger import get_logger
 
@@ -75,7 +80,11 @@ class ClaudeBridge:
 
     def _build_options(self, *, system_prompt: str) -> ClaudeAgentOptions:
         pr = self._settings.project_root
-        hooks: dict[Any, Any] = {"PreToolUse": make_pretool_hooks(pr)}
+        dd = self._settings.data_dir
+        hooks: dict[Any, Any] = {
+            "PreToolUse": make_pretool_hooks(pr),
+            "PostToolUse": make_posttool_hooks(pr, dd),
+        }
         thinking_kwargs: dict[str, Any] = {}
         if self._settings.claude.thinking_budget > 0:
             thinking_kwargs["max_thinking_tokens"] = self._settings.claude.thinking_budget
@@ -90,7 +99,34 @@ class ClaudeBridge:
             **thinking_kwargs,
         )
 
+    def _check_skills_sentinel(self) -> None:
+        """Drop + rebuild the manifest cache when the PostToolUse sentinel is set.
+
+        The sentinel is touched by `bridge/hooks.make_posttool_sentinel_hook`
+        whenever Write/Edit lands under `skills/` or `tools/`. Reading it
+        here (before every turn's system-prompt render) closes the
+        feedback loop — the same turn that installed a new skill won't
+        see it, but the very next one will.
+
+        Race (S-8 formal invariants): two concurrent chats entering this
+        method see `exists() is True`, both invalidate + touch (both
+        idempotent), one wins `unlink`, the other sees FileNotFoundError
+        which we swallow.
+        """
+        sentinel = self._settings.data_dir / "run" / "skills.dirty"
+        if not sentinel.exists():
+            return
+        invalidate_manifest_cache()
+        touch_skills_dir(self._settings.project_root / "skills")
+        # Cross-chat race with another turn also clearing the sentinel:
+        # benign — both observe the dirty state, both invalidate (idempotent),
+        # and whichever loses the unlink gets `FileNotFoundError` here.
+        with contextlib.suppress(FileNotFoundError):
+            sentinel.unlink()
+        log.info("skills_cache_invalidated_via_sentinel")
+
     def _render_system_prompt(self) -> str:
+        self._check_skills_sentinel()
         template_path = (
             self._settings.project_root / "src" / "assistant" / "bridge" / "system_prompt.md"
         )
@@ -109,6 +145,8 @@ class ClaudeBridge:
         chat_id: int,
         user_text: str,
         history: list[dict[str, Any]],
+        *,
+        system_notes: list[str] | None = None,
     ) -> AsyncIterator[Any]:
         """Yield InitMeta, then Blocks, then one final ResultMessage.
 
@@ -118,6 +156,12 @@ class ClaudeBridge:
         `finally` calls `turns.interrupt`. The underlying SDK async-gen is
         always closed in `finally`, even on timeout, so the CLI subprocess
         is reaped.
+
+        `system_notes` is an optional list of ephemeral hints to attach to
+        the *current* user envelope's `content` as extra `{type: text}`
+        blocks. The notes never touch `ConversationStore` — the handler
+        writes the raw `user_text` unchanged, so history stays honest.
+        Phase 3 uses this for the URL-detector nudge (S-4).
         """
         opts = self._build_options(system_prompt=self._render_system_prompt())
         log.info(
@@ -125,14 +169,25 @@ class ClaudeBridge:
             chat_id=chat_id,
             prompt_len=len(user_text),
             history_rows=len(history),
+            system_notes=len(system_notes or []),
         )
 
         async def prompt_stream() -> AsyncIterator[dict[str, Any]]:
             for envelope in history_to_user_envelopes(history, chat_id):
                 yield envelope
+            if system_notes:
+                # Mixed-block content: original text + one text-block per note.
+                content_blocks: list[dict[str, str]] = [
+                    {"type": "text", "text": user_text},
+                ]
+                for note in system_notes:
+                    content_blocks.append({"type": "text", "text": f"[system-note: {note}]"})
+                user_content: str | list[dict[str, str]] = content_blocks
+            else:
+                user_content = user_text
             yield {
                 "type": "user",
-                "message": {"role": "user", "content": user_text},
+                "message": {"role": "user", "content": user_content},
                 "parent_tool_use_id": None,
                 "session_id": f"chat-{chat_id}",
             }

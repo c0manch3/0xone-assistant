@@ -68,8 +68,10 @@ class _SlowBridge:
         chat_id: int,
         user_text: str,
         history: list[dict[str, Any]],
+        *,
+        system_notes: list[str] | None = None,
     ) -> AsyncIterator[Any]:
-        del chat_id, user_text, history
+        del chat_id, user_text, history, system_notes
         self.in_flight += 1
         self.max_in_flight = max(self.max_in_flight, self.in_flight)
         try:

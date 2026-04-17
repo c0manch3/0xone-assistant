@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -22,6 +23,28 @@ from assistant.state.turns import TurnStore
 Emit = Callable[[str], Awaitable[None]]
 
 log = get_logger("handlers.message")
+
+# Phase-3 S-7 URL detector. Brackets + parens intentionally excluded from the
+# URL body — markdown-style `[text](url)` and parenthetical `(url)` wrappers
+# would otherwise absorb the closing delimiter. Trailing punctuation
+# (.,;:!?)) is stripped post-match so "см. https://github.com/x/y." yields
+# `https://github.com/x/y` without the full-stop.
+_URL_RE = re.compile(r"https?://[^\s<>\[\]()]+|git@[^\s:]+:\S+", re.IGNORECASE)
+_URL_TRAILING_STRIP = ".,;:!?)"
+_URL_DETECT_MAX = 3
+
+
+def _detect_urls(text: str) -> list[str]:
+    """Return up to `_URL_DETECT_MAX` URLs found in `text`."""
+    matches = _URL_RE.findall(text)
+    out: list[str] = []
+    for raw in matches:
+        cleaned = raw.rstrip(_URL_TRAILING_STRIP)
+        if cleaned:
+            out.append(cleaned)
+        if len(out) >= _URL_DETECT_MAX:
+            break
+    return out
 
 
 def _result_meta(item: ResultMessage) -> dict[str, Any]:
@@ -128,6 +151,9 @@ class ClaudeHandler:
         turn_id = await self._turns.start(msg.chat_id)
         log.info("turn_started", turn_id=turn_id, chat_id=msg.chat_id, origin=msg.origin)
 
+        # Store the ORIGINAL user text — history must not leak the
+        # URL-detector's ephemeral system-notes. The enriched envelope
+        # goes only to the SDK via `system_notes`.
         await self._conv.append(
             msg.chat_id,
             turn_id,
@@ -139,10 +165,30 @@ class ClaudeHandler:
         history = await self._conv.load_recent(msg.chat_id, self._settings.claude.history_limit)
         # Current turn is still 'pending' -> excluded from load_recent's filter.
 
+        urls = _detect_urls(msg.text)
+        system_notes: list[str] | None = None
+        if urls:
+            system_notes = [
+                (
+                    f"user message contains URL(s): {urls!r}. "
+                    "If the user appears to want a skill installed, run "
+                    "`python tools/skill-installer/main.py preview <URL>` "
+                    "first; otherwise reply as usual."
+                )
+            ]
+            log.info(
+                "url_detected",
+                chat_id=msg.chat_id,
+                turn_id=turn_id,
+                urls=urls,
+            )
+
         completed = False
         meta: dict[str, Any] = {}
         try:
-            async for item in self._bridge.ask(msg.chat_id, msg.text, history):
+            async for item in self._bridge.ask(
+                msg.chat_id, msg.text, history, system_notes=system_notes
+            ):
                 if isinstance(item, InitMeta):
                     if item.model is not None:
                         meta["model"] = item.model

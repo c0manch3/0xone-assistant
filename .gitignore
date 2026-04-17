@@ -17,3 +17,15 @@ dist/
 
 # Spike probes generate machine-readable reports; keep source files, skip reports.
 spikes/sdk_probe*_report.json
+
+# Phase 3: skills installed at runtime via marketplace/installer. The two
+# canonical skills that ARE tracked are explicitly whitelisted below.
+skills/*
+!skills/ping/
+!skills/skill-installer/
+
+# Same for runtime-installed tools/<name>/ (bundles that ship a top-level
+# tools/ subdir end up here after atomic_install). Only `ping` is tracked.
+tools/*
+!tools/ping/
+!tools/skill-installer/

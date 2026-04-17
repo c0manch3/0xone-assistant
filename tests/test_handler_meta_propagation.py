@@ -29,8 +29,10 @@ class _FakeBridge:
         chat_id: int,
         user_text: str,
         history: list[dict[str, Any]],
+        *,
+        system_notes: list[str] | None = None,
     ) -> AsyncIterator[Any]:
-        del chat_id, user_text, history
+        del chat_id, user_text, history, system_notes
         for item in self._items:
             yield item
 
