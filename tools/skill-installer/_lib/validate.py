@@ -127,13 +127,21 @@ def sha256_of_tree(root: Path) -> str:
 # --- Bundle-level validation ------------------------------------------------
 
 
-def _reject_symlinks(bundle: Path) -> None:
-    """Raise `ValidationError` on the first symlink found anywhere under `bundle`.
+def _reject_unsafe_paths(bundle: Path) -> None:
+    """Raise on the first symlink OR hardlink found anywhere under `bundle`.
 
     Symlinks are rejected unconditionally — even links pointing at a file
     inside the bundle. Anthropic bundles do not use symlinks (verified
     empirically in spike S1.c); a bundle that introduces one is either
     malformed or malicious, and we do not need a policy carve-out.
+
+    Hardlinks are rejected too (review must-fix #4): `Path.is_symlink`
+    returns False for a hardlink to (e.g.) `/etc/passwd`, and the
+    path-traversal check `p.resolve().is_relative_to(bundle)` passes
+    trivially because `resolve()` of a hardlink yields the path itself
+    (hardlinks have no symbolic redirect to follow). The only reliable
+    signal is `stat().st_nlink > 1` — any regular file with more than one
+    hard link is suspicious in a freshly-extracted skill bundle.
     """
     for p in bundle.rglob("*"):
         # `Path.is_symlink` uses lstat under the hood — it does not follow.
@@ -142,7 +150,19 @@ def _reject_symlinks(bundle: Path) -> None:
                 target = os.readlink(p)
             except OSError:
                 target = "<unreadable>"
-            raise ValidationError(f"symlink not allowed: {p.relative_to(bundle)} -> {target}")
+            raise ValidationError(
+                f"symlink not allowed: {p.relative_to(bundle)} -> {target}"
+            )
+        if not p.is_file():
+            continue
+        try:
+            st = p.stat()
+        except OSError as exc:
+            raise ValidationError(f"cannot stat {p.relative_to(bundle)}: {exc}") from exc
+        if st.st_nlink > 1:
+            raise ValidationError(
+                f"hardlink not allowed: {p.relative_to(bundle)} (nlink={st.st_nlink})"
+            )
 
 
 def _reject_path_traversal(bundle: Path) -> None:
@@ -201,7 +221,7 @@ def validate_bundle(bundle: Path) -> dict[str, Any]:
     """Run all bundle-level checks; return a metadata `report` dict.
 
     Order matters:
-      1. symlinks          (H-3 double-safety also inside the hasher)
+      1. unsafe paths      (symlinks + hardlinks — must-fix #4)
       2. path-traversal    (defence-in-depth against lstat-skipping FS)
       3. limits            (file count + per-file + total size)
       4. AST parse         (every .py inside the bundle)
@@ -211,7 +231,7 @@ def validate_bundle(bundle: Path) -> dict[str, Any]:
     """
     if not bundle.is_dir():
         raise ValidationError(f"bundle root is not a directory: {bundle}")
-    _reject_symlinks(bundle)
+    _reject_unsafe_paths(bundle)
     _reject_path_traversal(bundle)
     file_count, total_size = _enforce_limits(bundle)
     _ast_parse_python_files(bundle)

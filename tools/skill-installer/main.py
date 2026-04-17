@@ -92,19 +92,29 @@ def _sentinel_path() -> Path:
 
 
 def _canonicalize_url(url: str) -> str:
-    """Drop fragment AND query; case-fold scheme/host; strip `www.`.
+    """Drop fragment AND query; case-fold scheme/host; strip `www.` +
+    drop default ports (review fix #12).
 
     B-2: query strings cause cache-entry duplication (`?utm_source=`) and
     can accidentally persist tokens (`?token=ABC`) to disk. GitHub's
     tree/contents URLs we support carry every meaningful bit in the path;
     query never matters. A future URL shape that genuinely needs a query
     parameter would add it to an explicit whitelist.
+
+    Default-port normalisation: `https://github.com:443/x/y` is the same
+    resource as `https://github.com/x/y`; without collapsing them we'd
+    duplicate cache entries and force a second TOCTOU check on every
+    user who happens to paste a URL with the port.
     """
     s = urlparse(url.strip())
     scheme = s.scheme.lower()
-    netloc = s.netloc.lower()
-    if netloc.startswith("www."):
-        netloc = netloc[4:]
+    host = (s.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    port = s.port
+    default_ports = {"http": 80, "https": 443}
+    is_default = port is None or port == default_ports.get(scheme)
+    netloc = host if is_default else f"{host}:{port}"
     path = s.path.rstrip("/") or "/"
     return f"{scheme}://{netloc}{path}"
 
@@ -186,6 +196,12 @@ def cmd_install(args: argparse.Namespace) -> int:
     bundle_dir = cdir / "bundle"
     verify_dir = cdir / "verify"
 
+    # Review fix #6: only rmtree the cache entry in outcomes where another
+    # attempt would be wrong anyway — successful install (entry is spent)
+    # or TOCTOU (bundle on source changed, cache is stale). Transient
+    # network / install errors keep the cache so retry doesn't re-spend
+    # the 60 req/h anonymous GitHub quota.
+    cleanup_cache = False
     with _cache_lock(cdir):
         if verify_dir.exists():
             shutil.rmtree(verify_dir)
@@ -206,6 +222,7 @@ def cmd_install(args: argparse.Namespace) -> int:
                     sys.stderr.write(line + "\n")
                 if len(diff) > 50:
                     sys.stderr.write(f"... and {len(diff) - 50} more lines\n")
+                cleanup_cache = True  # stale cache — force a fresh preview
                 return EXIT_TOCTOU
             try:
                 report = validate_bundle(verify_dir)
@@ -226,21 +243,31 @@ def cmd_install(args: argparse.Namespace) -> int:
                 )
                 + "\n"
             )
+            cleanup_cache = True  # success — cache entry is spent
         finally:
-            # Always cleanup the cache entry — it's single-use now.
-            shutil.rmtree(cdir, ignore_errors=True)
+            # `verify/` is always disposable.
+            shutil.rmtree(verify_dir, ignore_errors=True)
+            if cleanup_cache:
+                shutil.rmtree(cdir, ignore_errors=True)
     return EXIT_OK
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    """Phase-3 placeholder: returns `{"status": "unknown"}`.
+    """Report whether a skill is installed in the project.
 
-    The async `uv sync` progress-polling scaffolding is out of scope for
-    the first installer wave (Q8). We ship the subcommand shape so the
-    skill-installer SKILL.md's "status" example stays honest; real
-    polling is a follow-up.
+    Review fix #8: the phase-3 stub always said `"unknown"`, which lies
+    to callers (the SKILL.md tells the model to use this subcommand).
+    The async-`uv sync` progress story is still out of scope (Q8), but
+    the file-existence answer is cheap and truthful — extending to
+    sync-in-progress polling is a drop-in later.
     """
-    sys.stdout.write(json.dumps({"name": args.name, "status": "unknown"}) + "\n")
+    name = args.name
+    if "/" in name or name.startswith("."):
+        sys.stderr.write(f"refusing suspicious skill name: {name!r}\n")
+        return EXIT_USAGE
+    skill_md = _project_root() / "skills" / name / "SKILL.md"
+    status = "installed" if skill_md.is_file() else "not-installed"
+    sys.stdout.write(json.dumps({"name": name, "status": status}) + "\n")
     return EXIT_OK
 
 

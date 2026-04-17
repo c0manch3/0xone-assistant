@@ -92,7 +92,14 @@ def test_ssrf_gate_runs_before_dispatch(tmp_path: Path, monkeypatch: pytest.Monk
     assert gate_called["n"] == 1
 
 
-def test_parse_gh_json_skips_leading_warnings() -> None:
-    # fetch.py has its own _parse_gh_json — exercise the warning-line skip.
-    out = 'warning: gh is out of date\n{"type": "file"}\n'
-    assert fetch_mod._parse_gh_json(out) == {"type": "file"}
+def test_fetch_bundle_rejects_dotdot_in_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review fix #9: the regex allows `..` as a full segment; the explicit
+    # `_reject_dotdot_segments` must catch it before dispatch.
+    monkeypatch.setattr(fetch_mod, "classify_url_sync", lambda url, **kw: None)
+    with pytest.raises(fetch_mod.FetchError, match="not allowed"):
+        fetch_mod.fetch_bundle(
+            "https://github.com/anthropics/../secret",
+            tmp_path / "dest",
+        )

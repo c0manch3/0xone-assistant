@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import signal
 import sys
 import time
 from collections.abc import Coroutine
+from pathlib import Path
 from typing import Any
 
 import aiosqlite
@@ -28,6 +30,8 @@ AUTH_PREFLIGHT_FAIL_EXIT = 3
 _TMP_TTL_S = 3600  # 1 hour — aborted fetches
 _INSTALLER_CACHE_TTL_S = 7 * 86400  # 7 days — preview -> install window
 _BOOTSTRAP_TIMEOUT_S = 120.0
+_BOOTSTRAP_NOTIFY_COOLDOWN_S = 7 * 86400  # re-notify if marker older than 7 d
+_STOP_DRAIN_TIMEOUT_S = 5.0  # review fix #10
 
 
 async def _preflight_claude_cli(log: structlog.stdlib.BoundLogger) -> None:
@@ -173,7 +177,7 @@ class Daemon:
             )
         except FileNotFoundError as exc:
             self._log.warning("skill_creator_bootstrap_exception", error=repr(exc))
-            await self._bootstrap_notify_failure()
+            await self._bootstrap_notify_failure(rc=-1, reason="exception")
             return
 
         try:
@@ -185,7 +189,7 @@ class Daemon:
                 "skill_creator_bootstrap_timeout",
                 timeout_s=_BOOTSTRAP_TIMEOUT_S,
             )
-            await self._bootstrap_notify_failure()
+            await self._bootstrap_notify_failure(rc=-2, reason="timeout")
             return
 
         stderr_bytes = b""
@@ -200,36 +204,94 @@ class Daemon:
                 rc=rc,
                 stderr=stderr_bytes.decode("utf-8", "replace")[:500],
             )
-            await self._bootstrap_notify_failure()
+            await self._bootstrap_notify_failure(rc=rc, reason="failed")
             return
+        # Success — drop the stale notification marker so a future regression
+        # is allowed to notify again (review fix #11 auto-reset semantics).
+        self._bootstrap_clear_notify_marker()
         self._log.info("skill_creator_bootstrap_ok")
 
-    async def _bootstrap_notify_failure(self) -> None:
-        """Send a one-shot Telegram message to the owner on bootstrap failure.
+    # ------------------------------------------------------------------
+    # Review fix #7 + #11: the marker stores `{"rc", "reason", "ts"}` so we
+    # can decide whether to re-notify. Creation uses `O_CREAT | O_EXCL` to
+    # close a parallel-start race where two daemons would both find the
+    # marker absent and both send the Telegram message.
 
-        Tracked by a file marker so restarts don't resend. Never raises
-        upstream — a failing notification is far less important than the
-        underlying bootstrap failure we're already logging.
+    def _bootstrap_marker_path(self) -> Path:
+        return self._settings.data_dir / "run" / ".bootstrap_notified"
+
+    def _bootstrap_clear_notify_marker(self) -> None:
+        marker = self._bootstrap_marker_path()
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError as exc:  # pragma: no cover -- best-effort cleanup
+            self._log.warning("bootstrap_marker_clear_failed", error=repr(exc))
+
+    def _should_notify_bootstrap(self, rc: int) -> bool:
+        """Re-notify if the marker is absent, older than the cooldown, or
+        points at a different failure code (rc change = new condition)."""
+        marker = self._bootstrap_marker_path()
+        if not marker.exists():
+            return True
+        try:
+            data = json.loads(marker.read_text(encoding="utf-8"))
+            last_ts = float(data.get("ts_epoch", 0.0))
+            last_rc_raw = data.get("rc")
+            last_rc = int(last_rc_raw) if last_rc_raw is not None else None
+        except (OSError, ValueError, TypeError):
+            # Corrupt marker: treat as absent so we re-notify and rewrite.
+            return True
+        if time.time() - last_ts > _BOOTSTRAP_NOTIFY_COOLDOWN_S:
+            return True
+        return bool(last_rc != rc)
+
+    async def _bootstrap_notify_failure(self, *, rc: int, reason: str) -> None:
+        """Send a Telegram message to the owner on bootstrap failure.
+
+        Gated by a JSON marker that records `rc`/`reason`/`ts_epoch` so:
+        * Parallel daemons can't both send (O_EXCL on marker creation).
+        * Persistent failure doesn't re-spam on every restart.
+        * A rc-change OR a >7d-old marker unlocks a new notification.
         """
-        marker = self._settings.data_dir / "run" / ".bootstrap_notified"
-        if marker.exists():
-            return
         if self._adapter is None:
             return
+        if not self._should_notify_bootstrap(rc):
+            return
+        marker = self._bootstrap_marker_path()
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(
+                str(marker),
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_TRUNC,
+                0o644,
+            )
+        except FileExistsError:
+            # Another process beat us to the marker in the split second
+            # between `_should_notify_bootstrap` and `os.open`. Honour
+            # its decision — don't double-notify.
+            return
+        payload = {
+            "rc": rc,
+            "reason": reason,
+            "ts_epoch": time.time(),
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        try:
+            os.write(fd, json.dumps(payload).encode("utf-8"))
+        finally:
+            os.close(fd)
+
         msg = (
             "Автобутстрап skill-creator не удался — marketplace-установка "
-            "временно недоступна. Проверь `gh auth status` и логи."
+            f"временно недоступна (rc={rc}, reason={reason}). "
+            "Проверь `gh auth status` и логи."
         )
         try:
             await self._adapter.send_text(self._settings.owner_chat_id, msg)
         except Exception as exc:
+            # Marker already written: we'd retry on the next rc-change or
+            # after the cooldown expires. Either is acceptable.
             self._log.warning("bootstrap_notify_failed", error=repr(exc))
-            return
-        try:
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.touch()
-        except OSError as exc:
-            self._log.warning("bootstrap_marker_write_failed", error=repr(exc))
 
     # ------------------------------------------------------------------
 
@@ -279,10 +341,28 @@ class Daemon:
             except Exception:
                 self._log.warning("stop_step_failed", step="adapter", exc_info=True)
         if self._bg_tasks:
-            self._log.info("daemon_waiting_bg_tasks", count=len(self._bg_tasks))
-            # return_exceptions keeps one rogue task from propagating and
-            # masking the others; each task already logs its own failures.
-            await asyncio.gather(*self._bg_tasks, return_exceptions=True)
+            # Review fix #10: wrap the drain in a 5-second timeout so a
+            # hung bg-task (e.g. DNS resolution deadlocked inside the
+            # bootstrap subprocess) cannot block daemon shutdown forever.
+            # On timeout we cancel the remaining tasks and await them a
+            # second time; the second gather is bounded by the cancel
+            # response time, not the task's natural duration.
+            self._log.info("daemon_draining_bg_tasks", count=len(self._bg_tasks))
+            pending = list(self._bg_tasks)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True),
+                    timeout=_STOP_DRAIN_TIMEOUT_S,
+                )
+            except TimeoutError:
+                self._log.warning(
+                    "daemon_bg_drain_timeout",
+                    count=len([t for t in pending if not t.done()]),
+                )
+                for t in pending:
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
         if self._conn is not None:
             try:
                 await self._conn.close()

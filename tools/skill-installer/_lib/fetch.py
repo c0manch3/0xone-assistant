@@ -5,36 +5,45 @@ Stdlib-only. Supported URL shapes:
 * `https://github.com/<owner>/<repo>(.git)?`  → `git clone --depth=1` into dest.
 * `git@github.com:<owner>/<repo>.git`          → same.
 * `https://github.com/<owner>/<repo>/tree/<ref>/<path>` → partial fetch of the
-  referenced subtree via `gh api /repos/<owner>/<repo>/contents/<path>?ref=<ref>`
-  + recursive walk, downloading each file to dest. Falls back to
-  `git clone --depth=1 <repo>` + `mv <repo>/<path> dest` when `gh` is absent.
-* `https://gist.github.com/<user>/<id>`        → fetch raw tarball via
-  `gh api /gists/<id>` (TODO phase-3.5; omitted from v1).
+  referenced subtree. Primary path is **tarball** via
+  `gh api /repos/<owner>/<repo>/tarball/<ref>` → stdlib `tarfile` safe
+  extract (Python 3.12 `filter="data"`) → keep only the `<path>` subtree.
+  A single `gh api` call replaces what used to be 1-per-directory + 1
+  per-file, dodging the 60 req/hour anonymous cap.
 * `https://raw.githubusercontent.com/.../SKILL.md` → write to `<dest>/SKILL.md`
   via stdlib `urllib.request` (after SSRF gate).
 
 Every fetch path (a) passes the URL through `classify_url_sync` before any
-network I/O, (b) respects `FETCH_TIMEOUT`, and (c) strips `.git/` after
-git-clone so the tree-hash is stable across clones of the same commit.
+network I/O, (b) respects `FETCH_TIMEOUT`, and (c) re-runs the SSRF gate on
+every redirect target via `_SafeRedirectHandler` (defence against
+`302 Location: http://169.254.169.254/...` metadata exfil).
 """
 
 from __future__ import annotations
 
-import base64
-import json
+import io
 import re
 import shutil
 import subprocess
+import tarfile
 import urllib.request
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+from urllib.request import HTTPRedirectHandler, Request
 
 from ._net_mirror import classify_url_sync
 
 FETCH_TIMEOUT = 30.0
+_TARBALL_TIMEOUT = 60.0  # larger — bundles up to 10 MB + tar overhead
 _HTTP_USER_AGENT = "0xone-assistant-skill-installer/0.1"
 
 # URL-shape regexes ----------------------------------------------------------
+#
+# Must-fix #9: `[A-Za-z0-9_.-]+` permits `.` and `..` as full segments. The
+# regex alone can't distinguish "foo.bar" (valid) from ".." (not), so every
+# code-path that derives a git/repo URL from user input *also* runs
+# `_reject_dotdot_segments(urlparse(url).path)` below.
 
 _GIT_REPO_HTTPS_RE = re.compile(
     r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?(?:\.git)?/?$"
@@ -43,9 +52,59 @@ _GIT_REPO_SSH_RE = re.compile(r"^git@github\.com:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+
 _GITHUB_TREE_RE = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/tree/([^/]+)/(.+?)/?$")
 _RAW_SKILL_MD_RE = re.compile(r"^https://raw\.githubusercontent\.com/[^\s]+/SKILL\.md$")
 
+_DEFAULT_REFS: frozenset[str] = frozenset({"main", "master"})
+
 
 class FetchError(Exception):
     """Raised when a fetch fails (network, parsing, or denied-by-SSRF)."""
+
+
+# --- urllib safe-redirect opener (must-fix #1) ------------------------------
+
+
+class _SafeRedirectHandler(HTTPRedirectHandler):
+    """Re-classify every redirect target through the SSRF gate.
+
+    urllib follows up to 10 redirects by default without re-validating the
+    target. An attacker-controlled legitimate-looking URL could 302 to
+    `http://169.254.169.254/...` and exfil cloud metadata. This handler
+    rejects any redirect to a non-https URL or to a host that fails the
+    SSRF classification.
+    """
+
+    def redirect_request(  # type: ignore[override]
+        self,
+        req: Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> Request | None:
+        if not newurl.startswith("https://"):
+            raise FetchError(f"redirect to non-https blocked: {newurl!r}")
+        verdict = classify_url_sync(newurl)
+        if verdict is not None:
+            raise FetchError(f"SSRF gate (redirect): {verdict}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_opener: urllib.request.OpenerDirector = urllib.request.build_opener(
+    _SafeRedirectHandler()
+)
+
+
+def _urlopen_safe(url: str, *, timeout: float) -> Any:
+    """Wrap urlopen through the SSRF-redirect opener + User-Agent header."""
+    req = Request(url, headers={"User-Agent": _HTTP_USER_AGENT})
+    return _opener.open(req, timeout=timeout)
+
+
+def _reject_dotdot_segments(path: str) -> None:
+    """Must-fix #9: forbid `.` / `..` segments in a parsed URL path."""
+    for seg in path.split("/"):
+        if seg in (".", ".."):
+            raise FetchError(f"URL path segment not allowed: {seg!r}")
 
 
 # --- Top-level dispatch -----------------------------------------------------
@@ -65,6 +124,7 @@ def fetch_bundle(url: str, dest: Path) -> None:
         ssrf = classify_url_sync(url)
         if ssrf is not None:
             raise FetchError(f"SSRF gate: {ssrf}")
+        _reject_dotdot_segments(urlparse(url).path)
 
     if _RAW_SKILL_MD_RE.match(url):
         _fetch_raw_skill_md(url, dest)
@@ -108,10 +168,16 @@ def _git_clone(url: str, dest: Path) -> None:
 
 
 def _fetch_github_tree(match: re.Match[str], dest: Path) -> None:
-    """Walk /repos/<owner>/<repo>/contents/<path>?ref=<ref> via `gh api`.
+    """Fetch a subtree of a GitHub repo via the tarball endpoint.
 
-    Preferred path for small Anthropic-marketplace-style bundles. Falls back
-    to a full shallow clone + subtree extraction if `gh` is absent.
+    Must-fix #5: replaces the previous recursive-contents walk that hit
+    the 60 req/h anonymous cap (skill-creator = 83 files = 84+ calls).
+    One `gh api /tarball/<ref>` call returns the whole repo snapshot;
+    stdlib `tarfile` safely extracts only the requested subpath.
+
+    Must-fix #3: when `gh` is absent, a non-default ref (`tree/v2.0/...`)
+    MUST fail loudly — the old fallback silently cloned `main`, giving a
+    supply-chain downgrade (user saw "v2.0" content, got main).
     """
     owner, repo, ref, path = (
         match.group(1),
@@ -120,125 +186,110 @@ def _fetch_github_tree(match: re.Match[str], dest: Path) -> None:
         match.group(4).rstrip("/"),
     )
     if shutil.which("gh") is None:
-        _fetch_github_tree_fallback(owner, repo, ref, path, dest)
+        if ref not in _DEFAULT_REFS:
+            raise FetchError(
+                f"non-default ref {ref!r} requires `gh` on PATH; "
+                "install https://cli.github.com/"
+            )
+        _fetch_github_tree_fallback(owner, repo, path, dest)
         return
     dest.mkdir(parents=True)
     try:
-        _walk_gh_contents(owner, repo, ref, path, dest, rel=Path("."))
+        _fetch_via_tarball(owner, repo, ref, path, dest)
     except Exception:
         shutil.rmtree(dest, ignore_errors=True)
         raise
 
 
-def _walk_gh_contents(owner: str, repo: str, ref: str, path: str, dest: Path, *, rel: Path) -> None:
-    """Recursively download directory `path` from the repo into `dest/rel`."""
-    entries = _gh_api_contents(owner, repo, f"{path}", ref)
-    if isinstance(entries, dict) and entries.get("type") == "file":
-        # Single-file path: the `tree/.../SKILL.md` case.
-        _write_gh_file_entry(entries, dest / rel)
-        return
-    if not isinstance(entries, list):
-        raise FetchError(f"unexpected gh contents shape: {type(entries).__name__}")
-    (dest / rel).mkdir(parents=True, exist_ok=True)
-    for entry in entries:
-        name = str(entry.get("name") or "")
-        kind = str(entry.get("type") or "")
-        if not name or "/" in name or name.startswith(".."):
-            raise FetchError(f"suspicious entry name: {name!r}")
-        sub_rel = rel / name
-        if kind == "dir":
-            sub_path = f"{path}/{name}"
-            _walk_gh_contents(owner, repo, ref, sub_path, dest, rel=sub_rel)
-        elif kind == "file":
-            _write_gh_file_entry(entry, dest / sub_rel)
-        elif kind == "symlink":
-            raise FetchError(f"symlink in remote tree not allowed: {sub_rel}")
-        else:
-            # `submodule` and anything else → skip with explicit error.
-            raise FetchError(f"unsupported entry type {kind!r} at {sub_rel}")
+def _fetch_via_tarball(
+    owner: str, repo: str, ref: str, path: str, dest: Path
+) -> None:
+    """Download `/repos/<owner>/<repo>/tarball/<ref>` and extract `<path>`.
 
-
-def _write_gh_file_entry(entry: dict[str, Any], dest_file: Path) -> None:
-    """Decode and write a single `gh api` file entry to `dest_file`."""
-    encoding = entry.get("encoding")
-    content = entry.get("content")
-    if encoding == "base64" and isinstance(content, str):
-        dest_file.parent.mkdir(parents=True, exist_ok=True)
-        dest_file.write_bytes(base64.b64decode(content))
-        return
-    # Large files have empty content + `download_url`; fall back to urllib.
-    download_url = entry.get("download_url")
-    if isinstance(download_url, str):
-        ssrf = classify_url_sync(download_url)
-        if ssrf is not None:
-            raise FetchError(f"SSRF gate (download_url): {ssrf}")
-        dest_file.parent.mkdir(parents=True, exist_ok=True)
-        data = _http_get_bytes(download_url)
-        dest_file.write_bytes(data)
-        return
-    raise FetchError(f"cannot materialise file entry: {entry.get('path')!r}")
-
-
-def _gh_api_contents(owner: str, repo: str, path: str, ref: str) -> Any:
-    """Thin wrapper around `gh api /repos/.../contents/...?ref=...`.
-
-    Tolerates the `gh` rc=0-on-404 behaviour (spike S2.d) by parsing the
-    stdout and detecting the `{message, status}` error envelope.
+    `gh api /repos/.../tarball/...` returns binary tar.gz on stdout. We
+    keep the child tree at `<owner>-<repo>-<sha>/<path>/…` and strip the
+    top two directory levels so `dest/` contains the skill root directly.
+    Uses Python 3.12's `tarfile.extractall(..., filter="data")` — safely
+    rejects absolute paths, `..`, symlinks, hardlinks, and device files.
     """
-    endpoint = f"/repos/{owner}/{repo}/contents/{path}?ref={ref}"
+    endpoint = f"/repos/{owner}/{repo}/tarball/{ref}"
+    # `gh api` writes binary to stdout for tarball endpoints — use bytes,
+    # not text=, to preserve gzip integrity.
     try:
         proc = subprocess.run(
             ["gh", "api", endpoint],
             check=False,
             capture_output=True,
-            text=True,
-            timeout=FETCH_TIMEOUT,
+            timeout=_TARBALL_TIMEOUT,
         )
     except FileNotFoundError as exc:
         raise FetchError("gh binary not found on PATH") from exc
     except subprocess.TimeoutExpired as exc:
-        raise FetchError(f"gh api timed out after {FETCH_TIMEOUT}s") from exc
+        raise FetchError(
+            f"gh api tarball timed out after {_TARBALL_TIMEOUT}s"
+        ) from exc
     if proc.returncode != 0:
-        raise FetchError(f"gh api rc={proc.returncode}: {proc.stderr[:300] if proc.stderr else ''}")
-    payload = _parse_gh_json(proc.stdout)
-    if isinstance(payload, dict) and "message" in payload and "status" in payload:
-        raise FetchError(f"GitHub API error {payload['status']}: {payload['message']}")
-    return payload
+        stderr_s = proc.stderr.decode("utf-8", "replace")[:300] if proc.stderr else ""
+        raise FetchError(f"gh api tarball rc={proc.returncode}: {stderr_s}")
+    if not proc.stdout:
+        raise FetchError("gh api tarball: empty stdout")
 
-
-def _parse_gh_json(stdout: str) -> Any:
-    """`gh api` occasionally prepends warning/notice lines to the JSON body.
-
-    Scan line by line for the first line starting with `{` or `[`; that's
-    the payload. Fall back to the whole stdout if the first line is the
-    payload (typical `gh` output).
-    """
-    if not stdout.strip():
-        raise FetchError("gh api: empty stdout")
-    for line in stdout.splitlines():
-        stripped = line.strip()
-        if stripped.startswith(("{", "[")):
-            try:
-                return json.loads(stripped)
-            except json.JSONDecodeError:
-                # Not a complete JSON on that line — fall through to whole-body.
-                break
+    # Extract into a staging dir, then move the specific subtree into dest.
+    staging = dest.parent / f".{dest.name}.tar-stage"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
     try:
-        return json.loads(stdout)
-    except json.JSONDecodeError as exc:
-        raise FetchError(f"gh api returned non-JSON: {stdout[:200]!r}: {exc}") from exc
+        with tarfile.open(fileobj=io.BytesIO(proc.stdout), mode="r:gz") as tf:
+            # `filter="data"` is the secure preset shipped in Python 3.12:
+            # blocks absolute paths, `..`, device files, symlinks, hardlinks.
+            # Extracting the whole archive into a scratch dir keeps the
+            # code clean — the archive is bounded (Anthropic skill-creator
+            # is 5.5 MB per S1.c), and we only keep the subtree we want.
+            tf.extractall(staging, filter="data")
+
+        # Top-level dir is `<owner>-<repo>-<short-sha>/`. Find it.
+        top_entries = [p for p in staging.iterdir() if p.is_dir()]
+        if len(top_entries) != 1:
+            raise FetchError(
+                f"tarball root shape unexpected (entries={len(top_entries)})"
+            )
+        top = top_entries[0]
+
+        # Normalise the subpath and reject traversal defensively, even
+        # though the regex caught the URL-form.
+        path_parts = [seg for seg in path.split("/") if seg]
+        for seg in path_parts:
+            if seg in (".", ".."):
+                raise FetchError(f"subpath segment not allowed: {seg!r}")
+
+        source = top.joinpath(*path_parts) if path_parts else top
+        try:
+            source_resolved = source.resolve()
+            top_resolved = top.resolve()
+        except OSError as exc:
+            raise FetchError(f"resolve failed for extracted subpath: {exc}") from exc
+        if not source_resolved.is_relative_to(top_resolved):
+            raise FetchError(f"subpath escapes tarball root: {path!r}")
+        if not source.is_dir():
+            raise FetchError(f"subpath {path!r} not found in tarball")
+
+        # shutil.move atomic on same FS. dest was just mkdir'd empty.
+        shutil.rmtree(dest)
+        shutil.move(str(source), str(dest))
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
-def _fetch_github_tree_fallback(owner: str, repo: str, ref: str, path: str, dest: Path) -> None:
-    """Shallow-clone the whole repo and extract the subtree at `path`."""
+def _fetch_github_tree_fallback(
+    owner: str, repo: str, path: str, dest: Path
+) -> None:
+    """Shallow-clone default branch + extract subtree. Only used when `gh`
+    is absent AND the ref is `main` / `master` (see must-fix #3)."""
     tmp_clone = dest.parent / f".{dest.name}.clone"
     if tmp_clone.exists():
         shutil.rmtree(tmp_clone)
     _git_clone(f"https://github.com/{owner}/{repo}", tmp_clone)
-    if ref != "main" and ref != "master":
-        # We cloned the default branch — warn rather than silently diverge.
-        # Full ref checkout would require re-fetching; out of scope for phase 3.
-        pass
     sub = tmp_clone / path
     if not sub.is_dir():
         shutil.rmtree(tmp_clone, ignore_errors=True)
@@ -255,11 +306,16 @@ def _fetch_raw_skill_md(url: str, dest: Path) -> None:
 
 
 def _http_get_bytes(url: str) -> bytes:
-    """Stdlib HTTPS GET with timeout + User-Agent header."""
-    req = urllib.request.Request(url, headers={"User-Agent": _HTTP_USER_AGENT})
-    # urlopen respects the timeout param; the urllib docs explicitly cover this.
+    """Stdlib HTTPS GET with timeout + User-Agent header.
+
+    Redirects are followed through `_SafeRedirectHandler`, which re-runs
+    the SSRF gate on every `Location:` (must-fix #1).
+    """
     try:
-        with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as resp:
-            return resp.read()
+        with _urlopen_safe(url, timeout=FETCH_TIMEOUT) as resp:
+            data: bytes = resp.read()
+            return data
+    except FetchError:
+        raise
     except (OSError, ValueError) as exc:
         raise FetchError(f"HTTP GET failed: {url!r}: {exc}") from exc

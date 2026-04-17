@@ -132,9 +132,24 @@ _GH_API_SAFE_ENDPOINT_RE = re.compile(
     r"(\?[^\s]*)?$"
 )
 
-# Flags that turn `gh api` into a write request. Blocked at argv level — we
-# do NOT rely on remote-side authz (spike S2.e: the CLI still fires the
-# request and only the server returns 403, which leaks intent).
+# Flags that turn `gh api` into a write request, or that let the model
+# redirect the call to an attacker host / override the method via a header.
+# Blocked at argv level — we do NOT rely on remote-side authz (spike S2.e:
+# the CLI still fires the request and only the server returns 403, which
+# leaks intent).
+#
+# Phase-3 fix-pack additions (review #2):
+#   -H / --header    : an attacker can bypass the -X block with
+#                      `-H "X-HTTP-Method-Override: DELETE"`, and can also
+#                      smuggle Authorization / custom auth headers.
+#   --hostname       : points the CLI at an attacker-controlled GHES
+#                      instance (`--hostname evil.example.com /repos/x/y`).
+#   --cache          : persists responses on disk. Not a SSRF/method-bypass
+#                      vector on its own, but it muddies TOCTOU detection
+#                      (stale cache could hide an upstream swap between
+#                      preview and install).
+#   -p / --preview   : opts into GitHub preview APIs that are not in our
+#                      endpoint whitelist (dependency-graph, packages, ...).
 _GH_FORBIDDEN_FLAGS: frozenset[str] = frozenset(
     {
         "-X",
@@ -145,6 +160,12 @@ _GH_FORBIDDEN_FLAGS: frozenset[str] = frozenset(
         "-f",
         "--raw-field",
         "--input",
+        "-H",
+        "--header",
+        "--hostname",
+        "--cache",
+        "-p",
+        "--preview",
     }
 )
 
