@@ -20,12 +20,82 @@ from assistant.bridge.hooks import make_posttool_hooks, make_pretool_hooks
 from assistant.bridge.skills import (
     build_manifest,
     invalidate_manifest_cache,
+    parse_skill,
     touch_skills_dir,
 )
 from assistant.config import Settings
 from assistant.logger import get_logger
 
 log = get_logger("bridge.claude")
+
+# Phase 4 Q8: the global tool baseline. `_effective_allowed_tools` unions
+# installed skills' `allowed_tools` declarations and intersects with this
+# set. Narrowing is the only safe direction — a skill cannot extend the
+# baseline. See `_effective_allowed_tools` docstring for spike-verified
+# limits (S-A.2: options.allowed_tools is ADVISORY on hosts with a
+# permissive `~/.claude/settings.json::permissions.allow`).
+_GLOBAL_BASELINE: frozenset[str] = frozenset(
+    {"Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch"}
+)
+
+
+def _effective_allowed_tools(manifest_entries: list[dict[str, Any]]) -> list[str]:
+    """Compute the effective `allowed_tools` set for a turn (Q8).
+
+    Semantics (detailed-plan Q8; spike-verified):
+      * Empty manifest (no skills installed) → baseline (fallback).
+      * For each skill's `allowed_tools`:
+          - `None` (missing/malformed frontmatter) contributes the WHOLE
+            baseline (permissive default). Emits a WARN log so operators
+            notice the union collapsed because of an unnamed skill.
+          - `[]` (honest lockdown) contributes nothing — but another
+            permissive skill will re-expand the union, so Q8 says
+            "safe-only restrict" not "absolute sandbox".
+          - non-empty list → intersected with baseline; out-of-baseline
+            tokens are dropped silently (the manifest-builder already
+            logs them in phase 3).
+      * Final set = union ∩ baseline, sorted.
+
+    Spike S-A.3 found that SDK 0.1.59 exposes NO per-skill attribution
+    on PreToolUse hooks — this union is a static per-turn set, not a
+    per-tool-call partition. Defence-in-depth is phase-2/3 hooks
+    (bash-argv-allowlist, file-path-guard, WebFetch SSRF).
+
+    S1 HONEST LIMITATION: spike S-A.2 observed `options.allowed_tools`
+    is advisory on hosts where `~/.claude/settings.json::permissions.allow`
+    is permissive — the user setting overrides the programmatic option
+    and grants full tool access regardless of what this function returns.
+    We still return the narrowed list because (a) strict-env hosts (CI,
+    service account with empty permissions.allow) DO honour it and
+    (b) it is the contract the SDK documents.
+    """
+    if not manifest_entries:
+        return sorted(_GLOBAL_BASELINE)
+
+    union: set[str] = set()
+    collapsed_by: list[str] = []
+    for entry in manifest_entries:
+        tools = entry.get("allowed_tools")
+        if tools is None:
+            union |= set(_GLOBAL_BASELINE)
+            name = entry.get("name") or "<unnamed>"
+            collapsed_by.append(str(name))
+        elif not tools:
+            # []: honest lockdown on this skill; no contribution.
+            continue
+        elif isinstance(tools, list):
+            union |= {str(t) for t in tools if str(t) in _GLOBAL_BASELINE}
+
+    if collapsed_by:
+        log.warning(
+            "allowed_tools_union_collapsed_to_baseline",
+            skills=collapsed_by,
+        )
+
+    # If every skill declared `[]`, the union is empty — author intent is
+    # "no tools". Pass an empty list to the SDK; the single-all-[]-manifest
+    # scenario is unlikely in practice (ping/installer need Bash).
+    return sorted(union) if union else []
 
 
 class ClaudeBridgeError(RuntimeError):
@@ -83,6 +153,23 @@ class ClaudeBridge:
     def _build_options(self, *, system_prompt: str) -> ClaudeAgentOptions:
         pr = self._settings.project_root
         dd = self._settings.data_dir
+
+        # Q8: compute `allowed_tools` from the installed-skills manifest.
+        # Same FS scan as `build_manifest`; both cheap under mtime-cache.
+        entries: list[dict[str, Any]] = []
+        skills_dir = pr / "skills"
+        if skills_dir.exists():
+            for skill_md in sorted(skills_dir.glob("*/SKILL.md")):
+                entry = parse_skill(skill_md)
+                if entry:
+                    entries.append(entry)
+        allowed_tools = _effective_allowed_tools(entries)
+        log.info(
+            "allowed_tools_computed",
+            allowed=allowed_tools,
+            skill_count=len(entries),
+        )
+
         hooks: dict[Any, Any] = {
             "PreToolUse": make_pretool_hooks(pr),
             "PostToolUse": make_posttool_hooks(pr, dd),
@@ -95,7 +182,7 @@ class ClaudeBridge:
             cwd=str(pr),
             setting_sources=["project"],
             max_turns=self._settings.claude.max_turns,
-            allowed_tools=["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch"],
+            allowed_tools=allowed_tools,
             hooks=hooks,
             system_prompt=system_prompt,
             **thinking_kwargs,
@@ -127,6 +214,18 @@ class ClaudeBridge:
             sentinel.unlink()
         log.info("skills_cache_invalidated_via_sentinel")
 
+    @staticmethod
+    def _escape_format_literal(s: str) -> str:
+        """Escape `{`/`}` so `str.format` does not interpret them as fields.
+
+        G6: `skills_manifest` and `vault_dir` flow through from user-authored
+        SKILL.md descriptions and config env, both of which may contain
+        literal braces (`"uses {foo}"` is valid markdown). Without escaping
+        the template interpolation raises `KeyError: 'foo'` or — worse —
+        silently substitutes with a format-arg-named coincidence.
+        """
+        return s.replace("{", "{{").replace("}", "}}")
+
     def _render_system_prompt(self) -> str:
         self._check_skills_sentinel()
         template_path = (
@@ -136,8 +235,9 @@ class ClaudeBridge:
         manifest = build_manifest(self._settings.project_root / "skills")
         log.info("manifest_rebuilt")
         return template.format(
-            project_root=str(self._settings.project_root),
-            skills_manifest=manifest,
+            project_root=self._escape_format_literal(str(self._settings.project_root)),
+            vault_dir=self._escape_format_literal(str(self._settings.vault_dir)),
+            skills_manifest=self._escape_format_literal(manifest),
         )
 
     # ------------------------------------------------------------------
