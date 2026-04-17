@@ -1,0 +1,20 @@
+{
+  "merge_block_found_in_source": true,
+  "merge_block_excerpt": "content_blocks: list[dict[str, str]] = [\n                    {\"type\": \"text\", \"text\": user_text},\n                ]\n                for note in system_notes:\n                    content_blocks.append",
+  "order_preserving_behavior": true,
+  "test_blocks": [
+    {
+      "type": "text",
+      "text": "HELLO"
+    },
+    {
+      "type": "text",
+      "text": "[system-note: NOTE_A_scheduler]"
+    },
+    {
+      "type": "text",
+      "text": "[system-note: NOTE_B_url]"
+    }
+  ],
+  "verdict": "Order is preserved \u2014 caller controls order by constructing the list as [scheduler_note, url_note] before invoking ask()."
+}
