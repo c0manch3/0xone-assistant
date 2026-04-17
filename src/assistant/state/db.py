@@ -4,7 +4,7 @@ from pathlib import Path
 
 import aiosqlite
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Phase 1 initial schema. Kept inline for the v0 → v1 transition.
 SCHEMA_V1_SQL = """
@@ -62,6 +62,20 @@ async def _apply_v2(conn: aiosqlite.Connection) -> None:
         await conn.execute("PRAGMA foreign_keys = ON")
 
 
+async def _apply_v3(conn: aiosqlite.Connection) -> None:
+    """Phase 5: schedules + triggers tables. Pure additive — no destructive
+    operations on existing tables, so FK-pragma bookkeeping is not required."""
+    sql = (_MIGRATIONS_DIR / "0003_scheduler.sql").read_text(encoding="utf-8")
+    try:
+        await conn.execute("BEGIN IMMEDIATE")
+        await conn.executescript(sql)
+        await conn.execute("PRAGMA user_version = 3")
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+
+
 async def apply_schema(conn: aiosqlite.Connection) -> None:
     """Apply migrations atomically up to SCHEMA_VERSION. Idempotent."""
     async with conn.execute("PRAGMA user_version") as cur:
@@ -74,3 +88,6 @@ async def apply_schema(conn: aiosqlite.Connection) -> None:
     if current < 2:
         await _apply_v2(conn)
         current = 2
+    if current < 3:
+        await _apply_v3(conn)
+        current = 3
