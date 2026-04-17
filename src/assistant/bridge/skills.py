@@ -7,18 +7,37 @@ from typing import Any
 
 import yaml
 
+from assistant.logger import get_logger
+
+log = get_logger("bridge.skills")
+
 _FRONT_RE = re.compile(r"^---\n(.*?)\n---", re.DOTALL)
 
 
-def _normalize_allowed_tools(raw: Any) -> list[str]:
-    """Accept either a string `Bash` or a list `[Bash, Read]` in frontmatter."""
+def _normalize_allowed_tools(raw: Any) -> list[str] | None:
+    """Three-way classification of the `allowed-tools` frontmatter value.
+
+    Phase 3 (B-1): the loader must distinguish three author intents:
+
+    * field missing / `None` / malformed  → `None` (sentinel "permissive default");
+      `_build_options` picks the global baseline and logs `skill_permissive_default`.
+    * scalar string (`allowed-tools: Bash`) → `["Bash"]`.
+    * list (`allowed-tools: [Bash, Read]`)  → `[str(x) for x in raw]`;
+      **empty list `[]`** is a legitimate (though phase-3-unenforced) lockdown.
+
+    The return type is `list[str] | None`; phase 4 will merge per-skill sets
+    into `_build_options`. Phase 3 itself only log-differentiates between
+    the "missing" (warn `skill_permissive_default`) and "empty list"
+    (warn `skill_lockdown_not_enforced`) cases — the SDK still sees the
+    global baseline either way.
+    """
     if raw is None:
-        return []
+        return None
     if isinstance(raw, str):
         return [raw]
     if isinstance(raw, list):
         return [str(item) for item in raw]
-    return []
+    return None
 
 
 def parse_skill(path: Path) -> dict[str, Any]:
@@ -30,6 +49,9 @@ def parse_skill(path: Path) -> dict[str, Any]:
     meta_raw = yaml.safe_load(match.group(1)) or {}
     if not isinstance(meta_raw, dict):
         return {}
+    # Note: `meta_raw.get("allowed-tools")` returns None both when the key is
+    # absent AND when the key is explicitly `allowed-tools:` (null). Both
+    # cases map to the permissive sentinel — that's the intended semantics.
     return {
         "name": str(meta_raw.get("name", path.parent.name)),
         "description": str(meta_raw.get("description", "")).strip(),
@@ -80,6 +102,22 @@ def build_manifest(skills_dir: Path) -> str:
         desc = meta.get("description", "")
         if not desc:
             continue
+        # Phase-3 B-6 telemetry. Phase 3 uses the global baseline for every
+        # skill regardless of frontmatter; we emit log events so operators
+        # can see author intent and so phase 4 can safely start gating.
+        tools = meta.get("allowed_tools")
+        if tools is None:
+            log.warning(
+                "skill_permissive_default",
+                skill_name=meta["name"],
+                reason="allowed-tools missing in SKILL.md",
+            )
+        elif tools == []:
+            log.warning(
+                "skill_lockdown_not_enforced",
+                skill_name=meta["name"],
+                reason="phase 3 uses global baseline; per-skill gating arrives in phase 4",
+            )
         entries.append(f"- **{meta['name']}** — {desc}")
 
     manifest = "\n".join(entries) if entries else "(no skills registered yet)"

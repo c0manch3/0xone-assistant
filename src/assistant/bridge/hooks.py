@@ -1,6 +1,7 @@
-"""PreToolUse hook builders for ClaudeBridge.
+"""PreToolUse + PostToolUse hook builders for ClaudeBridge.
 
-Three guards register against `ClaudeAgentOptions.hooks["PreToolUse"]`:
+Three PreToolUse guards register against
+`ClaudeAgentOptions.hooks["PreToolUse"]`:
 
 * `make_bash_hook(project_root)` — strict argv-based allowlist with
   shell-metacharacter rejection. Slip-guard regex is kept ONLY as a last-ditch
@@ -11,20 +12,22 @@ Three guards register against `ClaudeAgentOptions.hooks["PreToolUse"]`:
 * `make_webfetch_hook()` — full SSRF defence: hostname is parsed via
   `urllib.parse`, classified through `ipaddress`, and DNS-resolved (with a
   3-second timeout) so that any A/AAAA pointing at a private/loopback/
-  link-local/reserved range is denied.
+  link-local/reserved range is denied. Delegates to `bridge/net.py`.
 
-All three return the canonical PreToolUse hook reply shape — `{}` (allow) or
-`_deny(reason)` (deny). Reasoning is logged via the structured logger so
-operators can audit decisions.
+Phase 3 adds a PostToolUse matcher (`make_posttool_hooks`) that touches
+`<data_dir>/run/skills.dirty` whenever Write/Edit lands inside `skills/` or
+`tools/` — the sentinel drives hot-reload of the manifest cache.
+
+All return the canonical SDK hook reply shape — `{}` (allow / no-op) or
+`_deny(reason)` (PreToolUse deny). Reasoning is logged via the structured
+logger so operators can audit decisions.
 """
 
 from __future__ import annotations
 
-import asyncio
 import ipaddress
 import re
 import shlex
-import socket
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlparse
@@ -37,6 +40,12 @@ from claude_agent_sdk.types import (
     SyncHookJSONOutput,
 )
 
+from assistant.bridge.net import (
+    classify_url as _classify_url_via_net,
+)
+from assistant.bridge.net import (
+    is_private_address as _net_is_private_address,
+)
 from assistant.logger import get_logger
 
 log = get_logger("bridge.hooks")
@@ -73,7 +82,8 @@ _SHELL_METACHARS: tuple[str, ...] = (
     "\x00",
 )
 
-# argv[0] -> validator that returns deny-reason or None.
+# argv[0] -> validator is routed via the match statement in
+# `_validate_bash_argv`. The dict is kept as the allowlist membership gate.
 _BASH_PROGRAMS: dict[str, str] = {
     "python": "python",
     "uv": "uv",
@@ -82,11 +92,20 @@ _BASH_PROGRAMS: dict[str, str] = {
     "pwd": "pwd",
     "cat": "cat",
     "echo": "echo",
+    "gh": "gh",  # phase 3: read-only `gh api` / `gh auth status` only
 }
+
+# H-1 (phase 3): both `tools/` and `skills/` are valid roots for `python` /
+# `uv run` scripts. Anthropic's `skill-creator` bundle ships `scripts/*.py`
+# under `skills/skill-creator/scripts/` that the model is expected to invoke
+# directly. Without this prefix, the bootstrap path fails with "python
+# script must live under tools/". See plan/phase3/implementation.md §2.9.
+_PYTHON_ALLOWED_PREFIXES: tuple[str, ...] = ("tools/", "skills/")
+_UV_RUN_ALLOWED_PREFIXES: tuple[str, ...] = ("tools/", "skills/")
 
 # Strictly safe `git` subcommands. We refuse arbitrary args (no `-c`,
 # `--upload-pack`, custom `--format=`, etc.) -- only known harmless flags.
-_GIT_ALLOWED_SUBCMDS: frozenset[str] = frozenset({"status", "log", "diff"})
+_GIT_ALLOWED_SUBCMDS: frozenset[str] = frozenset({"status", "log", "diff", "clone"})
 
 # Dangerous git flags. Several of these allow arbitrary command spawning via
 # git's plumbing options (`-c core.sshCommand=...`, `--upload-pack=...`).
@@ -96,6 +115,37 @@ _GIT_FORBIDDEN_FLAGS: tuple[str, ...] = (
     "--upload-pack",
     "--receive-pack",
     "--ext-program",  # synthetic name; covered defensively below
+)
+
+# phase 3: `gh` CLI read-only. Only two subcommands, tightly framed.
+_GH_ALLOWED_SUBCMDS: frozenset[str] = frozenset({"api", "auth"})
+_GH_AUTH_ALLOWED_SUBSUB: frozenset[str] = frozenset({"status"})
+
+# Endpoints the model is allowed to hit via `gh api`. Must stay read-only —
+# `/repos/<owner>/<repo>/contents[...]` and `/repos/<owner>/<repo>/tarball[...]`
+# are the only shapes the skill-installer actually needs for marketplace flow.
+# Query strings are tolerated (`?ref=main` etc.) but must not contain
+# whitespace. Any other endpoint (`/graphql`, `/user`, `/search/...`) — deny.
+_GH_API_SAFE_ENDPOINT_RE = re.compile(
+    r"^/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/"
+    r"(contents(/[^?\s]*)?|tarball(/[^?\s]*)?)"
+    r"(\?[^\s]*)?$"
+)
+
+# Flags that turn `gh api` into a write request. Blocked at argv level — we
+# do NOT rely on remote-side authz (spike S2.e: the CLI still fires the
+# request and only the server returns 403, which leaks intent).
+_GH_FORBIDDEN_FLAGS: frozenset[str] = frozenset(
+    {
+        "-X",
+        "--method",
+        "--method-override",
+        "-F",
+        "--field",
+        "-f",
+        "--raw-field",
+        "--input",
+    }
 )
 
 # Files that must NEVER be readable via `cat`, even if technically inside
@@ -172,40 +222,155 @@ def _validate_python_invocation(argv: list[str], project_root: Path) -> str | No
     script_path = Path(script)
     if _has_dotdot(script_path.parts):
         return "script path must not contain '..'"
-    if not script.startswith("tools/") and not script_path.is_absolute():
-        return "python script must live under tools/"
+    if not script_path.is_absolute() and not any(
+        script.startswith(p) for p in _PYTHON_ALLOWED_PREFIXES
+    ):
+        return (
+            f"python script must live under one of {list(_PYTHON_ALLOWED_PREFIXES)}; "
+            f"got {script!r}"
+        )
     if not _path_safely_inside(project_root / script_path, project_root):
         return "python script escapes project_root"
     return None
 
 
-def _validate_uv_invocation(argv: list[str], project_root: Path) -> str | None:
-    # Only `uv run tools/<x>` is allowed. Forbid `uv run --with`, `uv pip`, etc.
-    if len(argv) < 3 or argv[1] != "run":
-        return "only `uv run tools/...` form is allowed"
+def _validate_uv_run(argv: list[str], project_root: Path) -> str | None:
+    # `uv run <path>` — no flags, path must live under an allowed prefix.
+    if len(argv) < 3:
+        return "uv run requires a script argument"
     script = argv[2]
     if script.startswith("-"):
         return "uv run flags are not allowed (must be a path)"
     script_path = Path(script)
     if _has_dotdot(script_path.parts):
         return "script path must not contain '..'"
-    if not script.startswith("tools/"):
-        return "uv run target must live under tools/"
+    if not any(script.startswith(p) for p in _UV_RUN_ALLOWED_PREFIXES):
+        return (
+            f"uv run target must live under one of {list(_UV_RUN_ALLOWED_PREFIXES)}; "
+            f"got {script!r}"
+        )
     if not _path_safely_inside(project_root / script_path, project_root):
         return "uv run script escapes project_root"
     return None
 
 
-def _validate_git_invocation(argv: list[str]) -> str | None:
+def _validate_uv_sync(argv: list[str], project_root: Path) -> str | None:
+    # `uv sync --directory tools/<name>` OR `uv sync --directory=tools/<name>`.
+    # Rationale: Bash hook cannot observe `cd` (metachars rejected), so the
+    # only way to scope `uv sync` is the explicit `--directory` flag.
+    directory: str | None = None
+    i = 2
+    while i < len(argv):
+        token = argv[i]
+        if token == "--directory":
+            if i + 1 >= len(argv):
+                return "uv sync --directory requires a value"
+            directory = argv[i + 1]
+            i += 2
+            continue
+        if token.startswith("--directory="):
+            directory = token.split("=", 1)[1]
+            i += 1
+            continue
+        return f"uv sync flag {token!r} is not allowed"
+    if directory is None:
+        return "uv sync requires --directory=tools/<name>"
+    dir_path = Path(directory)
+    if _has_dotdot(dir_path.parts):
+        return "uv sync --directory must not contain '..'"
+    if not directory.startswith("tools/"):
+        return "uv sync --directory must live under tools/"
+    if not _path_safely_inside(project_root / dir_path, project_root / "tools"):
+        return "uv sync --directory escapes tools/"
+    return None
+
+
+def _validate_uv_invocation(argv: list[str], project_root: Path) -> str | None:
+    if len(argv) < 2:
+        return "uv requires a subcommand"
+    sub = argv[1]
+    if sub == "run":
+        return _validate_uv_run(argv, project_root)
+    if sub == "sync":
+        return _validate_uv_sync(argv, project_root)
+    return f"uv subcommand '{sub}' is not allowed"
+
+
+def _validate_git_clone(argv: list[str], project_root: Path) -> str | None:
+    # Shape: `git clone --depth=1 <https-url> <dest>`.
+    # Deliberately strict — no LFS, no recurse-submodules, no config override.
+    if len(argv) != 5:
+        return "git clone must be `git clone --depth=1 <url> <dest>`"
+    if argv[2] != "--depth=1":
+        return "only `git clone --depth=1 ...` is allowed"
+    url = argv[3]
+    if not (url.startswith("https://") or url.startswith("git@github.com:")):
+        return "git clone: only https:// or git@github.com: URLs are allowed"
+    if url.startswith("https://"):
+        parsed = urlparse(url)
+        hostname = (parsed.hostname or "").strip()
+        if not hostname:
+            return "git clone: URL has no hostname"
+        try:
+            ip_literal = ipaddress.ip_address(hostname)
+        except ValueError:
+            ip_literal = None
+        if ip_literal is not None and _net_is_private_address(ip_literal):
+            return (
+                f"git clone: URL hostname {hostname!r} is a non-public IP literal"
+            )
+    dest = argv[4]
+    dest_path = Path(dest)
+    if _has_dotdot(dest_path.parts):
+        return "git clone dest must not contain '..'"
+    candidate = dest_path if dest_path.is_absolute() else project_root / dest_path
+    if not _path_safely_inside(candidate, project_root):
+        return "git clone dest escapes project_root"
+    return None
+
+
+def _validate_git_invocation(argv: list[str], project_root: Path) -> str | None:
     if len(argv) < 2:
         return "git requires a subcommand"
     sub = argv[1]
     if sub not in _GIT_ALLOWED_SUBCMDS:
-        return f"git subcommand '{sub}' is not in allowlist {sorted(_GIT_ALLOWED_SUBCMDS)}"
+        return (
+            f"git subcommand '{sub}' is not in allowlist {sorted(_GIT_ALLOWED_SUBCMDS)}"
+        )
+    # Scan args for option-injection regardless of subcommand. `clone` also
+    # needs its positional layout validated below.
     for arg in argv[2:]:
         for forbidden in _GIT_FORBIDDEN_FLAGS:
             if arg == forbidden or arg.startswith(forbidden + "="):
                 return f"git flag '{arg}' is not allowed (option-injection risk)"
+    if sub == "clone":
+        return _validate_git_clone(argv, project_root)
+    return None
+
+
+def _validate_gh_invocation(argv: list[str]) -> str | None:
+    if len(argv) < 2:
+        return "gh requires a subcommand"
+    sub = argv[1]
+    if sub not in _GH_ALLOWED_SUBCMDS:
+        return f"gh subcommand '{sub}' not allowed"
+    if sub == "auth":
+        if len(argv) == 3 and argv[2] in _GH_AUTH_ALLOWED_SUBSUB:
+            return None
+        return "only `gh auth status` is allowed"
+    # sub == "api"
+    # Reject write-flags BEFORE looking at the endpoint — a request must
+    # never leave the host with `-X POST`.
+    for flag in argv[2:]:
+        if flag in _GH_FORBIDDEN_FLAGS:
+            return f"gh api: flag {flag} not allowed (read-only)"
+        if any(flag.startswith(f + "=") for f in _GH_FORBIDDEN_FLAGS):
+            return f"gh api: flag {flag.split('=', 1)[0]} not allowed (read-only)"
+    endpoint = next((a for a in argv[2:] if a.startswith("/")), None)
+    if not endpoint:
+        return "gh api requires an endpoint path starting with '/'"
+    if not _GH_API_SAFE_ENDPOINT_RE.match(endpoint):
+        return f"gh api: endpoint {endpoint!r} not in read-only whitelist"
     return None
 
 
@@ -275,7 +440,9 @@ def _validate_bash_argv(argv: list[str], project_root: Path) -> str | None:
         case "uv":
             return _validate_uv_invocation(argv, project_root)
         case "git":
-            return _validate_git_invocation(argv)
+            return _validate_git_invocation(argv, project_root)
+        case "gh":
+            return _validate_gh_invocation(argv)
         case "cat":
             return _validate_cat_invocation(argv, project_root)
         case "ls":
@@ -414,78 +581,23 @@ def make_file_hook(project_root: Path) -> HookFn:
 
 
 # -----------------------------------------------------------------------------
-# WebFetch: full SSRF defence with DNS resolution.
+# WebFetch: SSRF defence — delegates to `bridge/net.py` for the shared helpers.
 # -----------------------------------------------------------------------------
 
 
-def _is_private_address(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    return (
-        addr.is_private
-        or addr.is_loopback
-        or addr.is_link_local
-        or addr.is_reserved
-        or addr.is_multicast
-        or addr.is_unspecified
-    )
-
-
-async def _resolve_hostname(
-    hostname: str, *, deadline_s: float
-) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
-    """Resolve `hostname` to a list of IPs via the loop's resolver.
-
-    Raises `socket.gaierror` on failure and `TimeoutError` on hang. The
-    parameter is named `deadline_s` (not `timeout`) so ruff's ASYNC109 rule
-    does not nag -- we use `asyncio.timeout()` internally as requested.
-    """
-    loop = asyncio.get_running_loop()
-    async with asyncio.timeout(deadline_s):
-        infos = await loop.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
-    out: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
-    for family, _socktype, _proto, _canon, sockaddr in infos:
-        ip_str = sockaddr[0]
-        if family == socket.AF_INET6:
-            # Strip zone-id if present (e.g. `fe80::1%eth0`).
-            ip_str = ip_str.split("%", 1)[0]
-        out.append(ipaddress.ip_address(ip_str))
-    return out
+# Keep the private aliases so phase-2 tests / downstream importers that rely on
+# them continue to work. The canonical implementation lives in `bridge/net.py`
+# under a public name; re-export here.
+_is_private_address = _net_is_private_address
 
 
 async def classify_url(url: str, *, dns_timeout: float = 3.0) -> str | None:
-    """Public for tests: deny-reason iff URL targets a non-public destination."""
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        return f"malformed URL: {url!r}"
-    if parsed.scheme not in {"http", "https"}:
-        return f"only http(s) is allowed; got scheme {parsed.scheme!r}"
-    hostname = (parsed.hostname or "").strip()
-    if not hostname:
-        return "URL has no hostname"
+    """Public for tests: deny-reason iff URL targets a non-public destination.
 
-    # Direct IP literal?
-    try:
-        ip_literal = ipaddress.ip_address(hostname)
-    except ValueError:
-        ip_literal = None
-    if ip_literal is not None:
-        if _is_private_address(ip_literal):
-            return f"IP literal targets non-public range: {ip_literal}"
-        return None
-
-    # Hostname -> DNS resolution. Refuse on any failure (safer default).
-    try:
-        addrs = await _resolve_hostname(hostname, deadline_s=dns_timeout)
-    except TimeoutError:
-        return f"DNS lookup for {hostname!r} timed out"
-    except (socket.gaierror, OSError) as exc:
-        return f"cannot resolve host {hostname!r}: {exc}"
-    if not addrs:
-        return f"DNS returned no addresses for {hostname!r}"
-    for addr in addrs:
-        if _is_private_address(addr):
-            return f"hostname {hostname!r} resolves to non-public address {addr} (SSRF defence)"
-    return None
+    Thin delegate to `bridge/net.py::classify_url` — the logic lives once,
+    inside the mirrored SSRF block, so the installer mirror stays honest.
+    """
+    return await _classify_url_via_net(url, dns_timeout=dns_timeout)
 
 
 def make_webfetch_hook(*, dns_timeout: float = 3.0) -> HookFn:
@@ -541,4 +653,100 @@ def make_pretool_hooks(project_root: Path) -> list[Any]:
         HookMatcher(matcher="Bash", hooks=[make_bash_hook(project_root)]),
         *[HookMatcher(matcher=t, hooks=[make_file_hook(project_root)]) for t in FILE_TOOLS],
         HookMatcher(matcher="WebFetch", hooks=[make_webfetch_hook()]),
+    ]
+
+
+# -----------------------------------------------------------------------------
+# PostToolUse: hot-reload sentinel for Write/Edit inside skills/ or tools/.
+# -----------------------------------------------------------------------------
+
+
+def _is_inside_skills_or_tools(raw_path: str, project_root: Path) -> bool:
+    """True iff `raw_path` resolves beneath `<project_root>/skills/` or
+    `<project_root>/tools/`. Any `..` or unresolvable path → False.
+
+    Phase-3 §2.2 correction vs detailed-plan: the substring check
+    `"/skills/" in path` would match `/tmp/evil/skills/x` even when
+    project_root is elsewhere. `Path.is_relative_to` against a resolved
+    root is the only honest test.
+    """
+    if not raw_path:
+        return False
+    try:
+        target = Path(raw_path)
+    except ValueError:
+        return False
+    if _has_dotdot(target.parts):
+        return False
+    try:
+        abs_path = (
+            target.resolve() if target.is_absolute() else (project_root / target).resolve()
+        )
+    except (OSError, ValueError):
+        return False
+    try:
+        root = project_root.resolve()
+    except (OSError, ValueError):
+        return False
+    for sub in ("skills", "tools"):
+        base = root / sub
+        try:
+            if abs_path.is_relative_to(base):
+                return True
+        except ValueError:  # pragma: no cover -- different anchor on POSIX is impossible
+            continue
+    return False
+
+
+def make_posttool_sentinel_hook(project_root: Path, data_dir: Path) -> HookFn:
+    """Build the Write/Edit PostToolUse hook that touches the hot-reload sentinel.
+
+    PostToolUse cannot deny — the tool has already run. We only observe
+    side effects: if the target lived under `skills/` or `tools/`, touch
+    `<data_dir>/run/skills.dirty` so the next `ClaudeBridge._render_system_prompt`
+    call will invalidate the manifest cache.
+
+    Any `OSError` is swallowed (logged) — a broken sentinel must not
+    propagate into the model's tool-result stream.
+    """
+    sentinel = data_dir / "run" / "skills.dirty"
+
+    async def posttool_hook(
+        input_data: HookInput,
+        tool_use_id: str | None,
+        ctx: HookContext,
+    ) -> AsyncHookJSONOutput | SyncHookJSONOutput:
+        del tool_use_id, ctx
+        raw: dict[str, Any] = cast(dict[str, Any], input_data)
+        tool_input = raw.get("tool_input") or {}
+        file_path = str(tool_input.get("file_path") or "")
+        if _is_inside_skills_or_tools(file_path, project_root):
+            try:
+                sentinel.parent.mkdir(parents=True, exist_ok=True)
+                sentinel.touch()
+                log.info(
+                    "posttool_sentinel_touched",
+                    tool_name=raw.get("tool_name"),
+                    file_path=file_path[:200],
+                )
+            except OSError as exc:
+                log.warning("posttool_sentinel_touch_failed", error=repr(exc))
+        return cast(SyncHookJSONOutput, {})
+
+    return posttool_hook
+
+
+def make_posttool_hooks(project_root: Path, data_dir: Path) -> list[Any]:
+    """Return the phase-3 PostToolUse `HookMatcher` list.
+
+    Two matchers (Write + Edit), sharing the same underlying callback. Any
+    tool landing inside `skills/` or `tools/` triggers a sentinel touch —
+    the next bridge turn sees the new manifest without a daemon restart.
+    """
+    from claude_agent_sdk import HookMatcher
+
+    hook = make_posttool_sentinel_hook(project_root, data_dir)
+    return [
+        HookMatcher(matcher="Write", hooks=[hook]),
+        HookMatcher(matcher="Edit", hooks=[hook]),
     ]

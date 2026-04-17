@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-import assistant.bridge.hooks as hooks_module
+import assistant.bridge.net as net_module
 from assistant.bridge.hooks import classify_url
 
 
@@ -82,14 +82,14 @@ async def test_ssrf_deny_scheme(url: str) -> None:
 async def test_ssrf_deny_hostname_resolves_private(monkeypatch: pytest.MonkeyPatch) -> None:
     # `localhost.attacker.com` would have slipped past the substring check
     # in the v1 hook. With DNS classification, only the resolved IP matters.
-    monkeypatch.setattr(hooks_module, "_resolve_hostname", _resolver_returning(["10.0.0.5"]))
+    monkeypatch.setattr(net_module, "resolve_hostname", _resolver_returning(["10.0.0.5"]))
     reason = await classify_url("https://localhost.attacker.com/path")
     assert reason is not None
     assert "10.0.0.5" in reason or "non-public" in reason
 
 
 async def test_ssrf_deny_hostname_resolves_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(hooks_module, "_resolve_hostname", _resolver_returning(["127.0.0.1"]))
+    monkeypatch.setattr(net_module, "resolve_hostname", _resolver_returning(["127.0.0.1"]))
     reason = await classify_url("https://example.com/")
     assert reason is not None
     assert "non-public" in reason or "127.0.0.1" in reason
@@ -102,8 +102,8 @@ async def test_ssrf_allow_public_hostname(monkeypatch: pytest.MonkeyPatch) -> No
     # `socket.AF_INET6` for an IPv6 public IP, plus an IPv4 — both should
     # classify as public and the URL should be allowed.
     monkeypatch.setattr(
-        hooks_module,
-        "_resolve_hostname",
+        net_module,
+        "resolve_hostname",
         _resolver_returning(["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"]),
     )
     reason = await classify_url("https://example.com/")
@@ -123,7 +123,7 @@ async def test_ssrf_deny_on_dns_failure(monkeypatch: pytest.MonkeyPatch) -> None
         del host, deadline_s
         raise socket.gaierror("simulated DNS failure")
 
-    monkeypatch.setattr(hooks_module, "_resolve_hostname", _failing)
+    monkeypatch.setattr(net_module, "resolve_hostname", _failing)
     reason = await classify_url("https://does-not-exist.invalid/")
     assert reason is not None
     assert "resolve" in reason
@@ -134,7 +134,7 @@ async def test_ssrf_deny_on_dns_timeout(monkeypatch: pytest.MonkeyPatch) -> None
         del host, deadline_s
         raise TimeoutError
 
-    monkeypatch.setattr(hooks_module, "_resolve_hostname", _timing_out)
+    monkeypatch.setattr(net_module, "resolve_hostname", _timing_out)
     reason = await classify_url("https://slow-dns.example.com/")
     assert reason is not None
     assert "timed out" in reason or "timeout" in reason.lower()
