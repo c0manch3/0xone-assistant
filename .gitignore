@@ -6,6 +6,7 @@ data/
 *.db
 *.db-wal
 *.db-shm
+*.lock
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
@@ -25,7 +26,9 @@ skills/*
 !skills/skill-installer/
 
 # Same for runtime-installed tools/<name>/ (bundles that ship a top-level
-# tools/ subdir end up here after atomic_install). Only `ping` is tracked.
+# tools/ subdir end up here after atomic_install). Only `ping` and
+# `skill-installer` (phase 3) and `memory` (phase 4) are tracked.
 tools/*
 !tools/ping/
 !tools/skill-installer/
+!tools/memory/
