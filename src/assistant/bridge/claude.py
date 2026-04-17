@@ -174,8 +174,12 @@ class ClaudeBridge:
             system_notes=len(system_notes or []),
         )
 
+        truncate = self._settings.memory.history_tool_result_truncate_chars
+
         async def prompt_stream() -> AsyncIterator[dict[str, Any]]:
-            for envelope in history_to_user_envelopes(history, chat_id):
+            for envelope in history_to_user_envelopes(
+                history, chat_id, tool_result_truncate=truncate
+            ):
                 yield envelope
             if system_notes:
                 # Mixed-block content: original text + one text-block per note.

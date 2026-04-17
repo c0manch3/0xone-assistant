@@ -46,6 +46,30 @@ class ClaudeSettings(BaseSettings):
     effort: str = "medium"  # 'low'|'medium'|'high'|'max'
 
 
+class MemorySettings(BaseSettings):
+    """Memory / vault knobs. OAuth-agnostic; no secrets.
+
+    Phase 4 (Q1/Q3/Q4/Q9/Q10): vault lives at `<data_dir>/vault/` by default
+    (XDG), FTS5 index sits in `<data_dir>/memory-index.db`, porter+unicode61
+    tokenizer handles Russian+English. Synthetic history truncation caps
+    the per-tool-result snippet that is injected into the next turn as a
+    system-note so the model knows what happened without replaying the
+    full tool_result block (phase 2 replay was never implemented — Q1).
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="MEMORY_",
+        env_file=(str(_user_env_file()), ".env"),
+        extra="ignore",
+    )
+
+    vault_dir: Path | None = None  # None → data_dir / "vault"
+    index_db_path: Path | None = None  # None → data_dir / "memory-index.db"
+    fts_tokenizer: str = "porter unicode61 remove_diacritics 2"
+    history_tool_result_truncate_chars: int = 2000
+    max_body_bytes: int = 1_048_576  # 1 MB — S4 guard on single note body
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=(str(_user_env_file()), ".env"),
@@ -58,10 +82,19 @@ class Settings(BaseSettings):
     project_root: Path = Field(default_factory=_default_project_root)
     data_dir: Path = Field(default_factory=_default_data_dir)
     claude: ClaudeSettings = Field(default_factory=ClaudeSettings)
+    memory: MemorySettings = Field(default_factory=MemorySettings)
 
     @property
     def db_path(self) -> Path:
         return self.data_dir / "assistant.db"
+
+    @property
+    def vault_dir(self) -> Path:
+        return self.memory.vault_dir or (self.data_dir / "vault")
+
+    @property
+    def memory_index_path(self) -> Path:
+        return self.memory.index_db_path or (self.data_dir / "memory-index.db")
 
 
 @lru_cache(maxsize=1)
