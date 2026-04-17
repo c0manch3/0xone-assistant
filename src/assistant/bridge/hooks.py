@@ -101,6 +101,18 @@ _BASH_PROGRAMS: dict[str, str] = {
 # directly. Without this prefix, the bootstrap path fails with "python
 # script must live under tools/". See plan/phase3/implementation.md §2.9.
 _PYTHON_ALLOWED_PREFIXES: tuple[str, ...] = ("tools/", "skills/")
+
+# Phase 5: `python tools/schedule/main.py <sub>` additionally goes through a
+# structural validator (`_validate_schedule_argv`) so the model can't
+# accidentally run write-requests against sibling tables or pass unsafe flags.
+# The generic `_validate_python_invocation` still runs BEFORE this check —
+# the schedule-specific rules stack on top of the path allowlist.
+_SCHEDULE_SUBCMDS: frozenset[str] = frozenset({"add", "list", "rm", "enable", "disable", "history"})
+# Upper bounds for free-form string values. Structural validation of `--tz`
+# (IANA shape) is the CLI's job — we only enforce length here, per wave-2
+# B-W2-4 (regex would lose legitimate names like `Etc/GMT+3`).
+_SCHEDULE_PROMPT_MAX_BYTES = 2048
+_SCHEDULE_TZ_MAX_CHARS = 64
 _UV_RUN_ALLOWED_PREFIXES: tuple[str, ...] = ("tools/", "skills/")
 
 # Strictly safe `git` subcommands. We refuse arbitrary args (no `-c`,
@@ -251,7 +263,90 @@ def _validate_python_invocation(argv: list[str], project_root: Path) -> str | No
         )
     if not _path_safely_inside(project_root / script_path, project_root):
         return "python script escapes project_root"
+    # Phase 5: additional structural validator for the schedule CLI. Any
+    # other `python tools/<foo>/main.py` call passes through unchanged.
+    if script == "tools/schedule/main.py":
+        return _validate_schedule_argv(argv[2:])
     return None
+
+
+def _validate_schedule_argv(args: list[str]) -> str | None:
+    """Phase 5 bash hook gate for `python tools/schedule/main.py ...`.
+
+    Runs on the arguments AFTER the script path, i.e. `[<subcmd>, *rest]`.
+    Wave-2 additions: reject duplicate flags (B-W2-5), enforce 1-positional
+    on `rm/enable/disable`, only length-check `--tz` (stdlib is sole
+    authority on IANA shape; see wave-2 B-W2-4).
+    """
+    if not args:
+        return "schedule CLI requires a subcommand"
+    sub = args[0]
+    if sub not in _SCHEDULE_SUBCMDS:
+        return f"schedule subcommand {sub!r} not allowed"
+
+    remaining = args[1:]
+
+    if sub == "add":
+        allowed_flags = {"--cron", "--prompt", "--tz"}
+        seen: set[str] = set()
+        i = 0
+        while i < len(remaining):
+            tok = remaining[i]
+            if tok not in allowed_flags:
+                return f"schedule add: flag {tok!r} not allowed"
+            if tok in seen:
+                return f"schedule add: duplicate flag {tok!r}"
+            seen.add(tok)
+            if i + 1 >= len(remaining):
+                return f"schedule add: flag {tok} requires a value"
+            val = remaining[i + 1]
+            if tok == "--prompt" and len(val.encode("utf-8")) > _SCHEDULE_PROMPT_MAX_BYTES:
+                return f"schedule add: --prompt exceeds {_SCHEDULE_PROMPT_MAX_BYTES} bytes"
+            if tok == "--tz" and len(val) > _SCHEDULE_TZ_MAX_CHARS:
+                return f"schedule add: --tz exceeds {_SCHEDULE_TZ_MAX_CHARS} chars"
+            i += 2
+        return None
+
+    if sub == "list":
+        seen = set()
+        for tok in remaining:
+            if tok != "--enabled-only":
+                return f"schedule list: unknown flag {tok!r}"
+            if tok in seen:
+                return f"schedule list: duplicate flag {tok!r}"
+            seen.add(tok)
+        return None
+
+    if sub in ("rm", "enable", "disable"):
+        if len(remaining) != 1:
+            return f"schedule {sub}: exactly one positional ID required"
+        try:
+            int(remaining[0])
+        except ValueError:
+            return f"schedule {sub}: ID must be integer"
+        return None
+
+    if sub == "history":
+        allowed = {"--schedule-id", "--limit"}
+        seen = set()
+        i = 0
+        while i < len(remaining):
+            tok = remaining[i]
+            if tok not in allowed:
+                return f"schedule history: flag {tok!r} not allowed"
+            if tok in seen:
+                return f"schedule history: duplicate flag {tok!r}"
+            seen.add(tok)
+            if i + 1 >= len(remaining):
+                return f"schedule history: flag {tok} needs a value"
+            try:
+                int(remaining[i + 1])
+            except ValueError:
+                return f"schedule history: {tok} requires integer"
+            i += 2
+        return None
+
+    return f"schedule subcommand {sub!r} missing validator"
 
 
 def _validate_uv_run(argv: list[str], project_root: Path) -> str | None:
