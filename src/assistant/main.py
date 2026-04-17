@@ -427,10 +427,20 @@ class Daemon:
                     return
             except OSError:
                 pass
+        # Fix-pack HIGH #6: reserve the cooldown BEFORE the network call.
+        # If send_text fails (timeout, flood-wait, crash mid-send), the
+        # marker is already written — a quick restart won't re-fire the
+        # same "пропущено N напоминаний" recap. A delivery failure from
+        # the cooldown's perspective is indistinguishable from a
+        # successful delivery that the operator happened to miss, and
+        # both are better-handled by the periodic resend pathway.
         try:
-            await self._adapter.send_text(self._settings.owner_chat_id, msg)
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.touch()
+        except OSError:
+            self._log.warning("scheduler_marker_touch_failed", exc_info=True)
+        try:
+            await self._adapter.send_text(self._settings.owner_chat_id, msg)
         except Exception:
             self._log.warning("scheduler_notify_failed", exc_info=True)
 
@@ -710,6 +720,28 @@ class Daemon:
                     if not t.done():
                         t.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
+
+        # Step 2.5 — fix-pack HIGH #5: drain the dispatcher's shielded
+        # `mark_pending_retry` tasks BEFORE closing the DB connection.
+        # A shielded coroutine survives its owner task's cancellation
+        # but the outer awaiter gets CancelledError; without this
+        # drain those shields could still be executing their UPDATE
+        # when `conn.close()` runs below, racing a `ProgrammingError:
+        # Cannot operate on a closed database`.
+        if self._scheduler_dispatcher is not None:
+            updates = list(self._scheduler_dispatcher.pending_updates())
+            if updates:
+                self._log.info("daemon_draining_shield_updates", count=len(updates))
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*updates, return_exceptions=True),
+                        timeout=2.0,
+                    )
+                except TimeoutError:
+                    self._log.warning(
+                        "daemon_shield_drain_timeout",
+                        count=len([t for t in updates if not t.done()]),
+                    )
 
         # Step 3.
         if self._adapter is not None:

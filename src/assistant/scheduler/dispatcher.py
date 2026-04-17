@@ -100,6 +100,14 @@ class SchedulerDispatcher:
         self._inflight: set[int] = set()
         self._recent_acked: deque[int] = deque(maxlen=_LRU_SIZE)
         self._last_tick_at: float = 0.0
+        # Fix-pack HIGH #5: track shielded `mark_pending_retry` tasks
+        # that fire on shutdown-cancellation. Without this, an
+        # orphaned shield-task can still be executing the DB UPDATE
+        # when `Daemon.stop()` closes the aiosqlite connection — the
+        # UPDATE then races a `ProgrammingError: Cannot operate on a
+        # closed database`. `Daemon.stop()` awaits `pending_updates()`
+        # with a short timeout between bg-drain and conn.close.
+        self._pending_updates: set[asyncio.Task[Any]] = set()
 
     # ------------------------------------------------------------------
 
@@ -107,6 +115,12 @@ class SchedulerDispatcher:
         """Snapshot (copy) of the current `_inflight` ids. Consumed by
         `SchedulerLoop` to exclude from `revert_stuck_sent`."""
         return self._inflight.copy()
+
+    def pending_updates(self) -> set[asyncio.Task[Any]]:
+        """Snapshot of outstanding shielded DB-update tasks (fix-pack
+        HIGH #5). `Daemon.stop()` awaits this set with a short timeout
+        before closing the aiosqlite connection."""
+        return self._pending_updates.copy()
 
     def last_tick_at(self) -> float:
         return self._last_tick_at
@@ -204,10 +218,17 @@ class SchedulerDispatcher:
                     self._recent_acked.append(t.trigger_id)
             except asyncio.CancelledError:
                 # WAVE-2 B-W2-3: shield the UPDATE so shutdown-cancellation
-                # doesn't cancel the DB round-trip itself.
-                await asyncio.shield(
-                    self._store.mark_pending_retry(t.trigger_id, last_error="shutdown_cancelled")
+                # doesn't cancel the DB round-trip itself. Fix-pack HIGH #5:
+                # wrap the shielded coroutine in an explicit Task and track
+                # it on `_pending_updates` so `Daemon.stop()` can await
+                # completion before closing the DB connection.
+                update_task: asyncio.Task[Any] = asyncio.create_task(
+                    self._store.mark_pending_retry(t.trigger_id, last_error="shutdown_cancelled"),
+                    name=f"mark_pending_retry-{t.trigger_id}",
                 )
+                self._pending_updates.add(update_task)
+                update_task.add_done_callback(self._pending_updates.discard)
+                await asyncio.shield(update_task)
                 raise
             except Exception as exc:
                 attempts = await self._store.mark_pending_retry(
