@@ -117,8 +117,11 @@ class TelegramAdapter(MessengerAdapter):
         if not full:
             log.info("empty_reply_skipped", chat_id=message.chat.id)
             return
-        for part in split_for_telegram(full):
-            await self._bot.send_message(chat_id=message.chat.id, text=part)
+        # Fix-pack CRITICAL #2: route through `send_text` so the
+        # `TelegramRetryAfter` retry loop (wave-2 G-W2-1) covers user
+        # replies, not just scheduler deliveries. Avoids the duplicate
+        # split-and-send body that previously raised on any 429.
+        await self.send_text(message.chat.id, full)
 
     async def _on_non_text(self, message: Message) -> None:
         log.info("non_text_rejected", content_type=message.content_type)
