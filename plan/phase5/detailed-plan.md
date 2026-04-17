@@ -710,11 +710,11 @@ async def run(self) -> None:
 1. Out-of-process daemon — phase 8.
 2. Retry failed Claude-turn — manual; ack гасит.
 3. Dead-letter admin panel — phase 8.
-4. Web UI для списка schedules — phase 8.
+4. CLI stdlib-import pattern консолидация (`_memlib` + scheduler CLI) — **moved to phase 6** (wave-2 G-W2-9). Phase 5 CLI использует тот же `sys.path.append(str(_ROOT / "src"))` что и memory CLI; зиро urgency, bundling с phase-6 когда добавляются новые tools/ entries.
 5. Pause/resume через ENV `SCHEDULER_ENABLED=0` — без API.
 6. Backfill после long suspend — дропаем missed, есть catchup recap message.
 7. Prometheus metrics — phase 8.
-8. History replay UX с total snippet cap (phase-4 debt #7) — делаем в phase 5: `HISTORY_MAX_SNIPPET_TOTAL_BYTES=16384` в `bridge/history.py` (+20 LOC). Прямой follow-up.
+8. History replay total snippet cap (phase-4 debt #7) — **moved to phase 6** (wave-2 G-W2-8). Scope creep: threading mutable budget через `_render_tool_summary` требует корректных правок 3+ call-sites и testing под cross-turn scenarios; в phase 5 scheduler-injected turns сейчас имеют тот же history-envelope pipeline что и user-turns (B4 не меняет контракт), так что риск OOM не повышается относительно phase 4.
 9. Obsidian FS watcher (phase-4 debt #3) — phase 8.
 10. Out-of-process разрез: phase 5 платит `ScheduledTrigger` dataclass как boundary; phase 8 заменит in-process queue на UDS server с JSON-encoding этого же dataclass'а.
 

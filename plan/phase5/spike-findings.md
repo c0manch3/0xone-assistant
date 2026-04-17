@@ -366,16 +366,78 @@ For completeness, implementation.md test file should also include:
 
 ---
 
+## S-10 — `zoneinfo.ZoneInfo` authority probe (wave-2 fix-pack)
+
+**Script:** `spikes/phase5_s10_zoneinfo_authority.py`
+**Report:** `spikes/phase5_s10_report.json`
+
+### Context
+
+Wave-2 devil B-W2-4: CLI in §3.9 defines `_TZ_RE = r"^[A-Za-z_]+(/[A-Za-z_]+(/[A-Za-z_]+)?)?$"`
+but never uses it — AND the regex would reject legitimate IANA names
+that contain `+` (e.g. `Etc/GMT+3`, `Etc/GMT-12`). The fix is to drop
+the regex entirely and rely on `ZoneInfo(name)` as authoritative.
+
+### Method
+
+Call `ZoneInfo(name)` on 9 candidate names spanning legitimate IANA
+identifiers (with and without `/` separator), one path-injection
+attempt, out-of-range Etc zones, empty string, and plausible-but-fake
+names. Classify outcomes.
+
+### Results (darwin, Python 3.12.13)
+
+```
+UTC                              → accepted
+Europe/Berlin                    → accepted
+Etc/GMT+3                        → accepted       ← regex would REJECT (has '+')
+CST6CDT                          → accepted       ← single-segment IANA
+America/Argentina/Buenos_Aires   → accepted       ← 3-segment IANA
+../../etc/passwd                 → ValueError     ← NOT ZoneInfoNotFoundError
+Etc/GMT+99                       → ZoneInfoNotFoundError
+(empty string)                   → ValueError     ← NOT ZoneInfoNotFoundError
+Europe/NotACity                  → ZoneInfoNotFoundError
+```
+
+### Verdict
+
+**`zoneinfo` is authoritative.** Regex would LOSE legitimate names
+(`Etc/GMT+3` is the canonical fixed-offset zone for UTC-3; `+` sign is
+reversed per POSIX `Etc/` convention).
+
+### Implementation delta
+
+- Drop `_TZ_RE` from `tools/schedule/main.py`.
+- In `cmd_add`: wrap `ZoneInfo(args.tz)` in `try/except (ZoneInfoNotFoundError, ValueError)`.
+  Both error types occur in practice (ValueError on injection / empty string;
+  ZoneInfoNotFoundError on fake names).
+- In `bridge/hooks.py::_validate_schedule_argv`: for `--tz VALUE`, only
+  enforce `len(VALUE) <= 64`, ASCII printable, no shell metachars (the
+  latter is caught globally by the hook's existing shell-char deny list).
+  Structural shape is CLI's job.
+
+### Why this is safer than regex
+
+A tightly-scoped regex cannot keep up with IANA additions (e.g. 2024's
+`America/Ciudad_Juarez`). The stdlib resolver walks `TZPATH` / the
+Python-bundled tzdata — authoritative by construction. Injection risk
+is zero: `ZoneInfo` refuses non-normalized paths (`ValueError` above) and
+never opens arbitrary files; it reads from `sys.prefix/share/zoneinfo`
+or OS `/usr/share/zoneinfo` only.
+
+---
+
 ## Summary of design changes triggered by spikes
 
 | Spike | Plan text | Required change to implementation.md |
 |-------|-----------|----------------------------------------|
 | S-1 | §1.11 shared conn | No change; confirm in pitfalls. |
-| S-2 | §5.4 dispatcher → send_text | No change. |
+| S-2 | §5.4 dispatcher → send_text | No change; but wave-2: add `TelegramRetryAfter` retry inside adapter (G-W2-1). |
 | S-3 | §2.2 DST handling | Provide concrete `is_existing_local_minute` recipe; document UTC-minute iteration as natural skip. |
 | S-4 | §1.13 flock | No change; add case-5 same-process-same-path edge case to invariants (§16 invariant #1 already covers it). |
 | S-5 | §5.5 shutdown | **Use `stop_event + wait_for(get, timeout)` pattern; DO NOT `put_nowait(POISON)`.** This is the main concrete guidance for the coder. |
 | S-6 | §5.4 IncomingMessage meta | Concrete delta: add `meta: dict[str, Any] \| None = None`; add handler origin branch (new code). |
 | S-7 | §1.6 note order | Caller responsibility; add unit-test asserting order. |
 | S-8 | §5.3 atomicity | Confirmed; startup dispatcher JOIN read for consistency. |
-| S-9 | §9.1 fixtures | Use the table above as `test_scheduler_cron_semantics.py` fixture. |
+| S-9 | §9.1 fixtures | **Wave-2 expanded to 22 valid + 5 invalid cases** (Feb-31, Feb-29 leap/non-leap, `*/7` non-even step, DOW=7 reject, 3-DOW list, biz-hours combo). Use `spikes/phase5_s9_cron_fixtures.json` directly. |
+| S-10 | §3.9 tz validation | Drop `_TZ_RE`; `ZoneInfo(...)` + `(ZoneInfoNotFoundError, ValueError)` catch is sole authority. |
