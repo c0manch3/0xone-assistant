@@ -33,24 +33,41 @@ def _probe_lock_semantics(lock_path: Path) -> bool:
     (the second `LOCK_EX|LOCK_NB` acquire silently succeeds). On those
     FSes concurrent `memory write` from two chats (phase-5 scheduler +
     owner) would race at the SQLite layer and risk index corruption.
+
+    B-CRIT-2: if another memory CLI already holds the lock when the
+    probe runs (legitimate concurrent write), `fd1` acquire raises
+    `BlockingIOError`. That is PROOF that flock works — we return True
+    and do NOT attempt a second acquire. Without this branch the
+    exception bubbled out of `_ensure_index` and broke the exit-code
+    contract (rc=1 from an uncaught exception instead of rc=0 / rc=5).
     """
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd1 = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-    fd2 = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        fcntl.flock(fd1, fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
-            fcntl.flock(fd2, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return False  # Both acquired exclusive — flock is a no-op.
+            fcntl.flock(fd1, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            # Another process holds the lock → flock is real here.
             return True
+        # We now hold fd1 exclusively; check whether a second independent
+        # FD can ALSO acquire exclusive — that is the hallmark of a
+        # no-op filesystem.
+        fd2 = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            try:
+                fcntl.flock(fd2, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            # Both acquired exclusive → advisory-no-op FS.
+            return False
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd2, fcntl.LOCK_UN)
+            os.close(fd2)
     finally:
         with contextlib.suppress(OSError):
             fcntl.flock(fd1, fcntl.LOCK_UN)
-        with contextlib.suppress(OSError):
-            fcntl.flock(fd2, fcntl.LOCK_UN)
         os.close(fd1)
-        os.close(fd2)
 
 
 def _ensure_lock_semantics_once(index_db: Path) -> None:
