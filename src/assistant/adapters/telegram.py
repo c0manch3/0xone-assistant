@@ -7,6 +7,7 @@ from typing import Any
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.types import Message, TelegramObject, Update
 from aiogram.utils.chat_action import ChatActionSender
 
@@ -17,6 +18,11 @@ from assistant.logger import get_logger
 log = get_logger("adapters.telegram")
 
 TELEGRAM_LIMIT = 4096
+# Wave-2 G-W2-1: retry a `TelegramRetryAfter` up to this many times per
+# message part before giving up. 2 retries x typical 3 s rate-limit window
+# is a full 6-second buffer — good enough for bursts from scheduler + user
+# overlapping without turning into a turn-burn.
+TELEGRAM_RETRY_AFTER_MAX_ATTEMPTS = 2
 
 
 def split_for_telegram(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
@@ -138,5 +144,34 @@ class TelegramAdapter(MessengerAdapter):
             await self._polling_task
 
     async def send_text(self, chat_id: int, text: str) -> None:
+        """Send `text` to Telegram, splitting into 4096-char chunks.
+
+        WAVE-2 G-W2-1: catch `TelegramRetryAfter` per-chunk, sleep the
+        server-advised `retry_after + 1` seconds, retry up to
+        `TELEGRAM_RETRY_AFTER_MAX_ATTEMPTS` times. Without this wrapper,
+        a 429 from the Telegram API propagates out of `send_text` and
+        into the scheduler dispatcher's `except Exception` branch, which
+        would mark the trigger `pending_retry` and burn a Claude turn on
+        the next materialisation.
+        """
         for part in split_for_telegram(text):
-            await self._bot.send_message(chat_id=chat_id, text=part)
+            for attempt in range(TELEGRAM_RETRY_AFTER_MAX_ATTEMPTS + 1):
+                try:
+                    await self._bot.send_message(chat_id=chat_id, text=part)
+                    break
+                except TelegramRetryAfter as exc:
+                    if attempt >= TELEGRAM_RETRY_AFTER_MAX_ATTEMPTS:
+                        log.warning(
+                            "telegram_retry_after_exhausted",
+                            chat_id=chat_id,
+                            retry_after=exc.retry_after,
+                            attempts=attempt + 1,
+                        )
+                        raise
+                    log.info(
+                        "telegram_retry_after",
+                        chat_id=chat_id,
+                        retry_after=exc.retry_after,
+                        attempt=attempt + 1,
+                    )
+                    await asyncio.sleep(exc.retry_after + 1)
