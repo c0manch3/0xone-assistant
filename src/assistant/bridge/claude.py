@@ -10,6 +10,8 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ResultMessage,
     SystemMessage,
+    ToolResultBlock,
+    UserMessage,
     query,
 )
 
@@ -215,8 +217,31 @@ class ClaudeBridge:
                             continue
                         if isinstance(message, AssistantMessage):
                             for block in message.content:
-                                log.debug("block_received", type=type(block).__name__)
+                                log.debug(
+                                    "block_received",
+                                    type=type(block).__name__,
+                                    enclosing="AssistantMessage",
+                                )
                                 yield block
+                            continue
+                        if isinstance(message, UserMessage):
+                            # Phase 4 (spike S-B.2 fix): surface ToolResultBlocks
+                            # so ConversationStore persists them. Phase 2/3 silently
+                            # dropped every tool_result because this branch was a
+                            # no-op; without it synthetic history-summary (Q1) has
+                            # nothing to summarise. Plain-str content (SDK echo of
+                            # our own envelope) is skipped — already persisted as
+                            # the original user row by the handler.
+                            content = message.content
+                            if isinstance(content, list):
+                                for block in content:
+                                    if isinstance(block, ToolResultBlock):
+                                        log.debug(
+                                            "block_received",
+                                            type=type(block).__name__,
+                                            enclosing="UserMessage",
+                                        )
+                                        yield block
                             continue
                         if isinstance(message, ResultMessage):
                             log.info(
@@ -228,7 +253,7 @@ class ClaudeBridge:
                             )
                             yield message
                             return
-                        # SystemMessage(other), RateLimitEvent, UserMessage -- skip.
+                        # SystemMessage(other), RateLimitEvent -- skip.
             except TimeoutError as exc:
                 log.warning(
                     "timeout",
