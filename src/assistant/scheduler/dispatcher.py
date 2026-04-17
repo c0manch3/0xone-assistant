@@ -111,6 +111,13 @@ class SchedulerDispatcher:
     def stop(self) -> None:
         self._stop.set()
 
+    def stop_event(self) -> asyncio.Event:
+        """Public accessor for the stop event (fix-pack CRITICAL #5).
+
+        Mirrors `SchedulerLoop.stop_event()` so the daemon's shutdown /
+        health-check paths don't need to reach into `_stop`."""
+        return self._stop
+
     # ------------------------------------------------------------------
 
     async def run(self) -> None:

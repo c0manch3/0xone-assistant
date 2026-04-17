@@ -88,6 +88,14 @@ class SchedulerLoop:
     def stop(self) -> None:
         self._stop.set()
 
+    def stop_event(self) -> asyncio.Event:
+        """Public accessor for the stop event (fix-pack CRITICAL #5).
+
+        Lets callers (Daemon health-check, tests) cooperatively wait on
+        shutdown without reaching into `_stop` — a private-name access
+        pattern that is fragile against future refactors."""
+        return self._stop
+
     def last_tick_at(self) -> float:
         return self._last_tick_at
 
@@ -266,6 +274,14 @@ class SchedulerLoop:
         if trigger_id is None:
             # Raced with another process / already materialised.
             return
+
+        # Fix-pack CRITICAL #4: heartbeat BEFORE the blocking put. If the
+        # dispatcher is holding an inflight slot for the full Claude
+        # timeout (300 s) while another schedule fires, `queue.put` blocks
+        # — leaving `_last_tick_at` frozen and the health-check reading
+        # the loop as dead. Updating here reflects "iterating and alive";
+        # backpressure on the queue is not a liveness failure.
+        self._last_tick_at = asyncio.get_running_loop().time()
 
         await self._queue.put(
             ScheduledTrigger(

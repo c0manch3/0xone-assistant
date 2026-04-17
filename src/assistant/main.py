@@ -99,6 +99,11 @@ class Daemon:
         self._pid_fd: int | None = None
         self._scheduler_loop: SchedulerLoop | None = None
         self._scheduler_dispatcher: SchedulerDispatcher | None = None
+        # Fix-pack CRITICAL #3: per-instance latch so the bypass=True
+        # heartbeat notify fires at most once per stall episode. Resets
+        # when both loop + dispatcher heartbeats become fresh again
+        # (HIGH #7 extends the staleness check to both).
+        self._heartbeat_notified: bool = False
 
     # ------------------------------------------------------------------
 
@@ -448,14 +453,22 @@ class Daemon:
         )
 
     async def _scheduler_health_check_bg(self) -> None:
-        """Heartbeat watchdog (wave-2 G-W2-10).
+        """Heartbeat watchdog (wave-2 G-W2-10 + fix-pack CRITICAL #3/#4/#5,
+        HIGH #7).
 
-        Checks every `check_interval_s` (60 s) that
-        `SchedulerLoop.last_tick_at()` is not older than
+        Checks every `check_interval_s` (60 s) that BOTH
+        `SchedulerLoop.last_tick_at()` AND
+        `SchedulerDispatcher.last_tick_at()` are fresher than
         `tick_interval_s * heartbeat_stale_multiplier` (150 s default).
-        If it is, we assume the producer has died silently and send a
+        If EITHER is stale we assume a silent death and send a
         BYPASS-cooldown Telegram notice — the owner must know *now*,
         not 24 h later.
+
+        Fix-pack CRITICAL #3 latch: `bypass=True` defeats the marker
+        cooldown, so we track `_heartbeat_notified` per Daemon instance
+        and send at most ONE notify per stall episode. The latch resets
+        when both heartbeats catch up past the previous stale window,
+        allowing a future stall to re-notify.
         """
         check_interval_s = 60.0
         stale_mult = self._settings.scheduler.heartbeat_stale_multiplier
@@ -465,15 +478,12 @@ class Daemon:
         marker = self._settings.data_dir / "run" / ".scheduler_loop_notified"
         while True:
             try:
-                # Cooperative pacing: if the scheduler loop's stop event is
-                # set, exit the watchdog promptly (within ~100 ms) instead of
-                # sleeping the full check interval and relying on the drain
-                # timeout's cancel. Without this, every `Daemon.stop()` eats
-                # the full `_STOP_DRAIN_TIMEOUT_S` just to reap this task.
+                # Cooperative pacing: use the public `stop_event()`
+                # accessor (fix-pack CRITICAL #5) instead of `_stop`.
                 if self._scheduler_loop is not None:
                     try:
                         await asyncio.wait_for(
-                            self._scheduler_loop._stop.wait(),
+                            self._scheduler_loop.stop_event().wait(),
                             timeout=check_interval_s,
                         )
                     except TimeoutError:
@@ -485,22 +495,55 @@ class Daemon:
                 if self._scheduler_loop is None:
                     continue
                 now_loop = asyncio.get_running_loop().time()
-                last = self._scheduler_loop.last_tick_at()
-                if last == 0.0:
+                loop_last = self._scheduler_loop.last_tick_at()
+                disp_last = (
+                    self._scheduler_dispatcher.last_tick_at()
+                    if self._scheduler_dispatcher is not None
+                    else 0.0
+                )
+                # Boot window — ignore zeros (tasks haven't ticked yet).
+                if loop_last == 0.0:
                     continue
-                age = now_loop - last
-                if age > stale_threshold_s:
+                loop_age = now_loop - loop_last
+                # Consider dispatcher stale only if it has ticked at least
+                # once; a freshly-booted dispatcher may legitimately not
+                # have drained anything yet.
+                disp_age = now_loop - disp_last if disp_last > 0.0 else 0.0
+                stale = loop_age > stale_threshold_s or disp_age > stale_threshold_s
+
+                if stale:
                     self._log.error(
                         "scheduler_heartbeat_stale",
-                        age_s=age,
+                        loop_age_s=loop_age,
+                        dispatcher_age_s=disp_age,
                         threshold_s=stale_threshold_s,
                     )
-                    await self._notify_with_marker(
-                        marker,
-                        cooldown_s=self._settings.scheduler.loop_crash_cooldown_s,
-                        msg=(f"scheduler loop heartbeat stale ({int(age)}s since last tick)"),
-                        bypass=True,
-                    )
+                    if not self._heartbeat_notified:
+                        self._heartbeat_notified = True
+                        await self._notify_with_marker(
+                            marker,
+                            cooldown_s=self._settings.scheduler.loop_crash_cooldown_s,
+                            msg=(
+                                f"scheduler loop heartbeat stale ({int(loop_age)}s since last tick)"
+                            ),
+                            bypass=True,
+                        )
+                    else:
+                        self._log.info(
+                            "scheduler_heartbeat_still_stale",
+                            loop_age_s=loop_age,
+                            dispatcher_age_s=disp_age,
+                        )
+                else:
+                    # Latch reset: both heartbeats are fresh. The `not
+                    # stale` branch already proves `loop_age <= threshold`
+                    # AND (disp_age <= threshold OR disp_last == 0), so
+                    # the producer/consumer has made progress since the
+                    # stall was detected. Reset the latch so a future
+                    # stall re-notifies.
+                    if self._heartbeat_notified:
+                        self._heartbeat_notified = False
+                        self._log.info("scheduler_heartbeat_recovered")
             except asyncio.CancelledError:
                 raise
             except Exception:
