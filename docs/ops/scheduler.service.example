@@ -1,0 +1,26 @@
+# Phase 5 template — NOT wired by default. Copy to
+# ~/.config/systemd/user/0xone-assistant.service (customise the paths!)
+# and activate with `systemctl --user daemon-reload && systemctl --user
+# enable --now 0xone-assistant.service`.
+#
+# Phase 8 will own the out-of-process discussion; today the daemon is
+# in-process and lives inside one Python event loop.
+
+[Unit]
+Description=0xone-assistant Claude-Code bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Documents/0xone-assistant
+ExecStart=/usr/bin/env uv run --directory %h/Documents/0xone-assistant python -m assistant
+Restart=on-failure
+RestartSec=10
+# Give the process room to drain bg-tasks + scheduler delivery.
+TimeoutStopSec=15
+
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

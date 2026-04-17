@@ -283,6 +283,12 @@ class ClaudeBridge:
         blocks. The notes never touch `ConversationStore` — the handler
         writes the raw `user_text` unchanged, so history stays honest.
         Phase 3 uses this for the URL-detector nudge (S-4).
+
+        Order is preserved: entries are appended in the supplied sequence
+        (spike S-7 verification). Phase-5 convention for scheduler-initiated
+        turns is `[scheduler_note, url_note]` — the scheduler context comes
+        first so the model reads "owner is not active" before acting on any
+        URL hint.
         """
         opts = self._build_options(system_prompt=self._render_system_prompt())
         log.info(

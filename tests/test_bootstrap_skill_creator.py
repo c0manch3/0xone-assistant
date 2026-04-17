@@ -130,9 +130,12 @@ async def test_start_does_not_wait_for_bootstrap(
     elapsed = time.monotonic() - t0
     assert elapsed < 2.0
     # Background tasks must be alive (held on the daemon instance, not GC'd).
+    # Phase-5: `sweep_run_dirs` is fast and may have completed + been
+    # removed from `_bg_tasks` by its done-callback before we inspect
+    # here; only `skill_creator_bootstrap` (never-ending under _NeverWaitProc)
+    # is guaranteed alive at this point.
     names = {t.get_name() for t in daemon._bg_tasks}
     assert "skill_creator_bootstrap" in names
-    assert "sweep_run_dirs" in names
     # Clean up so pytest event loop doesn't bleed tasks into the next test.
     for t in list(daemon._bg_tasks):
         t.cancel()
@@ -194,8 +197,13 @@ async def test_bootstrap_failure_notifies_owner_once(
 
     daemon = Daemon(_settings)
     await daemon.start()
-    # Wait for the bootstrap task to complete.
-    await asyncio.gather(*daemon._bg_tasks, return_exceptions=True)
+    # Wait for the bootstrap task to complete. Phase-5 scheduler bg-tasks
+    # (`scheduler_*`) are infinite loops; filter them out here — they are
+    # properly cancelled in `daemon.stop()` below.
+    await asyncio.gather(
+        *[t for t in daemon._bg_tasks if not (t.get_name() or "").startswith("scheduler_")],
+        return_exceptions=True,
+    )
     adapter = daemon._adapter
     assert isinstance(adapter, _DummyAdapter)
     assert len(adapter.sent) == 1
@@ -236,7 +244,10 @@ async def test_bootstrap_failure_does_not_renotify(
 
     daemon = Daemon(_settings)
     await daemon.start()
-    await asyncio.gather(*daemon._bg_tasks, return_exceptions=True)
+    await asyncio.gather(
+        *[t for t in daemon._bg_tasks if not (t.get_name() or "").startswith("scheduler_")],
+        return_exceptions=True,
+    )
     adapter = daemon._adapter
     assert isinstance(adapter, _DummyAdapter)
     assert adapter.sent == []
@@ -268,7 +279,10 @@ async def test_bootstrap_happy_path_creates_skill_and_sentinel(
 
     daemon = Daemon(_settings)
     await daemon.start()
-    await asyncio.gather(*daemon._bg_tasks, return_exceptions=True)
+    await asyncio.gather(
+        *[t for t in daemon._bg_tasks if not (t.get_name() or "").startswith("scheduler_")],
+        return_exceptions=True,
+    )
     assert created["done"]
     assert (_settings.project_root / "skills" / "skill-creator" / "SKILL.md").is_file()
     assert (_settings.data_dir / "run" / "skills.dirty").exists()

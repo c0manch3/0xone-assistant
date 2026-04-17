@@ -187,10 +187,7 @@ def cmd_add(args: argparse.Namespace) -> int:
 def cmd_list(args: argparse.Namespace) -> int:
     conn = _connect()
     try:
-        sql = (
-            "SELECT id, cron, prompt, tz, enabled, created_at, last_fire_at "
-            "FROM schedules"
-        )
+        sql = "SELECT id, cron, prompt, tz, enabled, created_at, last_fire_at FROM schedules"
         if args.enabled_only:
             sql += " WHERE enabled=1"
         sql += " ORDER BY id ASC"

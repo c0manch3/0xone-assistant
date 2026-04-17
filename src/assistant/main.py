@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import os
 import shutil
@@ -20,6 +21,9 @@ from assistant.bridge.claude import ClaudeBridge
 from assistant.config import Settings, get_settings
 from assistant.handlers.message import ClaudeHandler
 from assistant.logger import get_logger, setup_logging
+from assistant.scheduler.dispatcher import ScheduledTrigger, SchedulerDispatcher
+from assistant.scheduler.loop import SchedulerLoop
+from assistant.scheduler.store import SchedulerStore
 from assistant.state.conversations import ConversationStore
 from assistant.state.db import apply_schema, connect
 from assistant.state.turns import TurnStore
@@ -90,6 +94,11 @@ class Daemon:
         # keeps refs alive (CPython GCs floating tasks without warnings) and
         # lets `Daemon.stop()` drain them.
         self._bg_tasks: set[asyncio.Task[None]] = set()
+        # Phase 5 state — populated in start(), consumed in stop() and the
+        # health-check background task.
+        self._pid_fd: int | None = None
+        self._scheduler_loop: SchedulerLoop | None = None
+        self._scheduler_dispatcher: SchedulerDispatcher | None = None
 
     # ------------------------------------------------------------------
 
@@ -359,7 +368,151 @@ class Daemon:
                 path=str(stage_dir),
             )
 
+    def _acquire_pid_lock_or_exit(self) -> None:
+        """Advisory flock on `<data_dir>/run/daemon.pid` (plan §1.13 / spike S-4).
+
+        On `BlockingIOError` (another daemon holds the lock) we log
+        `daemon_already_running` and `sys.exit(0)` — phase-5 B1 blocker
+        fix: guarantees single-daemon for the rest of `start()` so
+        `sweep_pending` and `clean_slate_sent` can't compete with another
+        process's in-flight scheduler turn.
+
+        fd kept on `self._pid_fd` until process exit. Mode 0o600 per
+        wave-2 N-W2-5 — the file contains only `${pid}\\n` today but
+        staying restrictive costs nothing and defends against curious
+        file-watchers.
+        """
+        pid_dir = self._settings.data_dir / "run"
+        pid_dir.mkdir(parents=True, exist_ok=True)
+        pid_path = pid_dir / "daemon.pid"
+        fd = os.open(str(pid_path), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self._log.warning("daemon_already_running", pid_path=str(pid_path))
+            os.close(fd)
+            sys.exit(0)
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+        self._pid_fd = fd
+
+    async def _notify_with_marker(
+        self,
+        marker: Path,
+        cooldown_s: int,
+        msg: str,
+        *,
+        bypass: bool = False,
+    ) -> None:
+        """Marker-file-gated Telegram notice. Mirrors `_bootstrap_notify_failure`
+        structurally; separated because scheduler failures have their own
+        wave-2 N-W2-4 cooldowns (loop-crash vs catchup-recap).
+
+        `bypass=True` skips the cooldown — used by the heartbeat
+        health-check (wave-2 G-W2-10) to surface silent loop death
+        immediately, since a loop that dies and the notify is on cooldown
+        would otherwise leave the operator completely in the dark.
+        """
+        if self._adapter is None:
+            return
+        if not bypass and marker.exists():
+            try:
+                age = time.time() - marker.stat().st_mtime
+                if age < cooldown_s:
+                    return
+            except OSError:
+                pass
+        try:
+            await self._adapter.send_text(self._settings.owner_chat_id, msg)
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.touch()
+        except Exception:
+            self._log.warning("scheduler_notify_failed", exc_info=True)
+
+    async def _scheduler_loop_notify(self, msg: str) -> None:
+        marker = self._settings.data_dir / "run" / ".scheduler_loop_notified"
+        await self._notify_with_marker(
+            marker,
+            cooldown_s=self._settings.scheduler.loop_crash_cooldown_s,
+            msg=msg,
+        )
+
+    async def _scheduler_catchup_recap(self, missed: int) -> None:
+        """One Russian-language Telegram message (GAP #16). Fires once at
+        boot if `count_catchup_misses` sums to > 0."""
+        marker = self._settings.data_dir / "run" / ".scheduler_catchup_recap"
+        await self._notify_with_marker(
+            marker,
+            cooldown_s=self._settings.scheduler.catchup_recap_cooldown_s,
+            msg=f"пока система спала, пропущено {missed} напоминаний.",
+        )
+
+    async def _scheduler_health_check_bg(self) -> None:
+        """Heartbeat watchdog (wave-2 G-W2-10).
+
+        Checks every `check_interval_s` (60 s) that
+        `SchedulerLoop.last_tick_at()` is not older than
+        `tick_interval_s * heartbeat_stale_multiplier` (150 s default).
+        If it is, we assume the producer has died silently and send a
+        BYPASS-cooldown Telegram notice — the owner must know *now*,
+        not 24 h later.
+        """
+        check_interval_s = 60.0
+        stale_mult = self._settings.scheduler.heartbeat_stale_multiplier
+        tick_s = self._settings.scheduler.tick_interval_s
+        stale_threshold_s = tick_s * stale_mult
+
+        marker = self._settings.data_dir / "run" / ".scheduler_loop_notified"
+        while True:
+            try:
+                # Cooperative pacing: if the scheduler loop's stop event is
+                # set, exit the watchdog promptly (within ~100 ms) instead of
+                # sleeping the full check interval and relying on the drain
+                # timeout's cancel. Without this, every `Daemon.stop()` eats
+                # the full `_STOP_DRAIN_TIMEOUT_S` just to reap this task.
+                if self._scheduler_loop is not None:
+                    try:
+                        await asyncio.wait_for(
+                            self._scheduler_loop._stop.wait(),
+                            timeout=check_interval_s,
+                        )
+                    except TimeoutError:
+                        pass
+                    else:
+                        return
+                else:
+                    await asyncio.sleep(check_interval_s)
+                if self._scheduler_loop is None:
+                    continue
+                now_loop = asyncio.get_running_loop().time()
+                last = self._scheduler_loop.last_tick_at()
+                if last == 0.0:
+                    continue
+                age = now_loop - last
+                if age > stale_threshold_s:
+                    self._log.error(
+                        "scheduler_heartbeat_stale",
+                        age_s=age,
+                        threshold_s=stale_threshold_s,
+                    )
+                    await self._notify_with_marker(
+                        marker,
+                        cooldown_s=self._settings.scheduler.loop_crash_cooldown_s,
+                        msg=(f"scheduler loop heartbeat stale ({int(age)}s since last tick)"),
+                        bypass=True,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self._log.warning("scheduler_health_check_failed", exc_info=True)
+
     async def start(self) -> None:
+        # Phase 5 B1: pidfile mutex FIRST — before any DB operation.
+        # Second daemon exits 0 here and never runs `sweep_pending` /
+        # `clean_slate_sent`, so in-flight turns from the first daemon
+        # stay intact.
+        self._acquire_pid_lock_or_exit()
+
         await _preflight_claude_cli(self._log)
         ensure_skills_symlink(self._settings.project_root)
 
@@ -371,12 +524,23 @@ class Daemon:
 
         conv = ConversationStore(self._conn)
         turns = TurnStore(self._conn, lock=conv.lock)
+        # Wave-2 N-W2-1 verified: ConversationStore.lock property exists
+        # (state/conversations.py:25-27). Scheduler shares the same writer
+        # lock — spike S-1 confirmed p99 is 3.4 ms.
+        sched_store = SchedulerStore(self._conn, lock=conv.lock)
 
         # A previous process may have crashed mid-turn; promote any orphan
         # 'pending' rows to 'interrupted' so they're excluded from history.
         swept = await turns.sweep_pending()
         if swept:
             self._log.warning("startup_swept_pending_turns", count=swept)
+
+        # Plan §8.2: BEFORE the dispatcher starts accepting, revert every
+        # `status='sent'` trigger to `pending`. _inflight is empty at this
+        # point, so any 'sent' row is provably orphaned from a prior crash.
+        reverted = await sched_store.clean_slate_sent()
+        if reverted:
+            self._log.info("scheduler_clean_slate_revert", count=reverted)
 
         if shutil.which("gh") is None:
             self._log.warning(
@@ -391,27 +555,87 @@ class Daemon:
         self._adapter.set_handler(handler)
         await self._adapter.start()
 
+        # Scheduler wiring (plan §8.1). Loop and dispatcher share a bounded
+        # in-process queue; blocking put() gives natural backpressure.
+        queue: asyncio.Queue[ScheduledTrigger] = asyncio.Queue(
+            maxsize=self._settings.scheduler.dispatcher_queue_size
+        )
+        dispatcher = SchedulerDispatcher(
+            queue=queue,
+            store=sched_store,
+            handler=handler,
+            adapter=self._adapter,
+            owner_chat_id=self._settings.owner_chat_id,
+            settings=self._settings,
+        )
+        loop_ = SchedulerLoop(
+            queue=queue,
+            store=sched_store,
+            dispatcher=dispatcher,
+            settings=self._settings,
+            notify_fn=self._scheduler_loop_notify,
+        )
+        self._scheduler_dispatcher = dispatcher
+        self._scheduler_loop = loop_
+        self._spawn_bg(dispatcher.run(), name="scheduler_dispatcher")
+        self._spawn_bg(loop_.run(), name="scheduler_loop")
+        # Wave-2 G-W2-10: heartbeat watchdog.
+        self._spawn_bg(self._scheduler_health_check_bg(), name="scheduler_health")
+
         # Fire-and-forget housekeeping. `Daemon.start()` must not wait on
         # GitHub or `uv sync`; bootstrap has its own 120 s timeout internally.
         self._spawn_bg(self._sweep_run_dirs(), name="sweep_run_dirs")
         self._spawn_bg(self._bootstrap_skill_creator_bg(), name="skill_creator_bootstrap")
 
+        # GAP #16 / wave-2 G-W2-4: one-shot "missed N reminders" recap.
+        # Counted BEFORE the first tick so the recap number is stable
+        # (subsequent ticks may immediately materialise fires inside the
+        # catchup window, which is a separate concern).
+        try:
+            missed = await loop_.count_catchup_misses()
+        except Exception:
+            self._log.warning("scheduler_catchup_count_failed", exc_info=True)
+            missed = 0
+        if missed > 0:
+            self._spawn_bg(
+                self._scheduler_catchup_recap(missed),
+                name="scheduler_catchup_recap",
+            )
+
         self._log.info("daemon_started", owner=self._settings.owner_chat_id)
 
     async def stop(self) -> None:
+        """Shutdown sequence (wave-2 B-W2-2 corrected order).
+
+        1. Signal scheduler loop + dispatcher (non-blocking Event.set()) so
+           the drain in step 2 can progress.
+        2. Drain bg-tasks. In-flight scheduler delivery (up to and including
+           the final `adapter.send_text`) completes HERE. Cancelled tasks
+           hit the dispatcher's shielded `mark_pending_retry` branch
+           (wave-2 B-W2-3) so the DB retry ledger stays honest.
+        3. Stop adapter — MUST run AFTER bg-tasks drain. Stopping earlier
+           would close the aiogram session while the dispatcher is still
+           trying to send, burning a Claude turn on the next boot's
+           re-materialisation.
+        4. Close DB.
+        5. Release pidfile flock.
+        """
         self._log.info("daemon_stopping")
-        if self._adapter is not None:
+
+        # Step 1.
+        if self._scheduler_loop is not None:
             try:
-                await self._adapter.stop()
+                self._scheduler_loop.stop()
             except Exception:
-                self._log.warning("stop_step_failed", step="adapter", exc_info=True)
+                self._log.warning("stop_step_failed", step="scheduler_loop", exc_info=True)
+        if self._scheduler_dispatcher is not None:
+            try:
+                self._scheduler_dispatcher.stop()
+            except Exception:
+                self._log.warning("stop_step_failed", step="scheduler_dispatcher", exc_info=True)
+
+        # Step 2.
         if self._bg_tasks:
-            # Review fix #10: wrap the drain in a 5-second timeout so a
-            # hung bg-task (e.g. DNS resolution deadlocked inside the
-            # bootstrap subprocess) cannot block daemon shutdown forever.
-            # On timeout we cancel the remaining tasks and await them a
-            # second time; the second gather is bounded by the cancel
-            # response time, not the task's natural duration.
             self._log.info("daemon_draining_bg_tasks", count=len(self._bg_tasks))
             pending = list(self._bg_tasks)
             try:
@@ -428,11 +652,29 @@ class Daemon:
                     if not t.done():
                         t.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
+
+        # Step 3.
+        if self._adapter is not None:
+            try:
+                await self._adapter.stop()
+            except Exception:
+                self._log.warning("stop_step_failed", step="adapter", exc_info=True)
+
+        # Step 4.
         if self._conn is not None:
             try:
                 await self._conn.close()
             except Exception:
                 self._log.warning("stop_step_failed", step="db", exc_info=True)
+
+        # Step 5.
+        if self._pid_fd is not None:
+            import contextlib
+
+            with contextlib.suppress(OSError):
+                os.close(self._pid_fd)
+            self._pid_fd = None
+
         self._log.info("daemon_stopped")
 
 

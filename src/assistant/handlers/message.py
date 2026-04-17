@@ -165,23 +165,45 @@ class ClaudeHandler:
         history = await self._conv.load_recent(msg.chat_id, self._settings.claude.history_limit)
         # Current turn is still 'pending' -> excluded from load_recent's filter.
 
+        # Phase-5 scheduler-origin branch + URL detector combine into one
+        # ordered `system_notes` list. Order is load-bearing (spike S-7 /
+        # plan §1.6): scheduler context FIRST so the model reads
+        # "autonomous turn" before any URL-install suggestion.
+        notes: list[str] = []
+        if msg.origin == "scheduler":
+            trigger_id: int | None = None
+            if msg.meta is not None:
+                raw_trigger = msg.meta.get("trigger_id")
+                if isinstance(raw_trigger, int):
+                    trigger_id = raw_trigger
+            notes.append(
+                f"autonomous turn from scheduler id={trigger_id}; "
+                "owner is not active; do not ask clarifying questions, "
+                "answer proactively and finish."
+            )
+            log.info(
+                "scheduler_turn_started",
+                turn_id=turn_id,
+                chat_id=msg.chat_id,
+                trigger_id=trigger_id,
+            )
+
         urls = _detect_urls(msg.text)
-        system_notes: list[str] | None = None
         if urls:
-            system_notes = [
-                (
-                    f"user message contains URL(s): {urls!r}. "
-                    "If the user appears to want a skill installed, run "
-                    "`python tools/skill-installer/main.py preview <URL>` "
-                    "first; otherwise reply as usual."
-                )
-            ]
+            notes.append(
+                f"user message contains URL(s): {urls!r}. "
+                "If the user appears to want a skill installed, run "
+                "`python tools/skill-installer/main.py preview <URL>` "
+                "first; otherwise reply as usual."
+            )
             log.info(
                 "url_detected",
                 chat_id=msg.chat_id,
                 turn_id=turn_id,
                 urls=urls,
             )
+
+        system_notes: list[str] | None = notes or None
 
         completed = False
         meta: dict[str, Any] = {}

@@ -270,9 +270,15 @@ async def test_o_excl_race_between_parallel_checks(
 
 
 async def _drain(d: Daemon) -> None:
-    """Await all fire-and-forget tasks to settle."""
+    """Await the bootstrap / sweep bg-tasks to settle.
+
+    Phase 5 added never-ending scheduler bg-tasks (`scheduler_loop`,
+    `scheduler_dispatcher`, `scheduler_health`) which would block this
+    helper forever. Filter them out — this test's job is to verify the
+    bootstrap marker rotation only.
+    """
     import asyncio as _asyncio
 
-    pending = list(d._bg_tasks)
+    pending = [t for t in d._bg_tasks if not (t.get_name() or "").startswith("scheduler_")]
     if pending:
         await _asyncio.gather(*pending, return_exceptions=True)
