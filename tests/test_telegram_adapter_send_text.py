@@ -97,6 +97,32 @@ async def test_send_text_exhausts_retries_and_propagates(
     assert TELEGRAM_RETRY_AFTER_MAX_ATTEMPTS == 2
 
 
+async def test_send_text_cap_over_limit_raises_immediately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fix-pack HIGH #3: server advises retry_after > TELEGRAM_MAX_RETRY_AFTER_S
+    → send_text does NOT sleep that long and re-raises immediately."""
+    adapter = TelegramAdapter(_settings(tmp_path))
+    slept: list[float] = []
+
+    async def always_retry_huge(**kwargs: Any) -> Any:
+        del kwargs
+        raise TelegramRetryAfter(method=None, message="slow", retry_after=300)  # type: ignore[arg-type]
+
+    async def fake_sleep(duration: float) -> None:
+        slept.append(duration)
+
+    monkeypatch.setattr(adapter._bot, "send_message", always_retry_huge)
+    monkeypatch.setattr("assistant.adapters.telegram.asyncio.sleep", fake_sleep)
+    # Force a low cap so the 300 s advisory blows past it.
+    monkeypatch.setattr("assistant.adapters.telegram.TELEGRAM_MAX_RETRY_AFTER_S", 30)
+
+    with pytest.raises(TelegramRetryAfter):
+        await adapter.send_text(42, "hello")
+    # Crucially: we never slept — the cap short-circuited BEFORE any sleep.
+    assert slept == []
+
+
 async def test_send_text_splits_and_retries_per_chunk(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -442,6 +442,20 @@ class Daemon:
             msg=msg,
         )
 
+    async def _scheduler_dispatcher_notify(self, msg: str) -> None:
+        """Fix-pack HIGH #4: sibling marker for dispatcher fatal crashes.
+
+        We keep the marker distinct from the loop notify so a repeated
+        dispatcher crash cooldown doesn't mask a fresh loop crash (and
+        vice-versa). Both share the same cooldown setting.
+        """
+        marker = self._settings.data_dir / "run" / ".scheduler_dispatcher_notified"
+        await self._notify_with_marker(
+            marker,
+            cooldown_s=self._settings.scheduler.loop_crash_cooldown_s,
+            msg=msg,
+        )
+
     async def _scheduler_catchup_recap(self, missed: int) -> None:
         """One Russian-language Telegram message (GAP #16). Fires once at
         boot if `count_catchup_misses` sums to > 0."""
@@ -610,6 +624,7 @@ class Daemon:
             adapter=self._adapter,
             owner_chat_id=self._settings.owner_chat_id,
             settings=self._settings,
+            notify_fn=self._scheduler_dispatcher_notify,
         )
         loop_ = SchedulerLoop(
             queue=queue,

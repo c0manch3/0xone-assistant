@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -23,6 +24,32 @@ TELEGRAM_LIMIT = 4096
 # is a full 6-second buffer — good enough for bursts from scheduler + user
 # overlapping without turning into a turn-burn.
 TELEGRAM_RETRY_AFTER_MAX_ATTEMPTS = 2
+
+
+def _load_max_retry_after_s() -> int:
+    """Fix-pack HIGH #3: cap the server-advised `retry_after` value.
+
+    A Telegram 429 can technically request minutes or hours of backoff.
+    Sleeping that long inside `send_text` would block the scheduler
+    dispatcher (which awaits the send synchronously) and starve the
+    entire bot on a flood-wait burst. The cap defaults to 30 s; a
+    server advisory above the cap raises `TelegramRetryAfter` out of
+    `send_text` so the caller (scheduler: mark_pending_retry; user
+    path: the handler's except) gets to decide the recovery.
+
+    Overridable via `TELEGRAM_MAX_RETRY_AFTER_S` for integration
+    testing where the cap needs tightening (e.g. sub-second bursts).
+    """
+    raw = os.environ.get("TELEGRAM_MAX_RETRY_AFTER_S", "30")
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("telegram_max_retry_after_s_invalid", raw=raw)
+        return 30
+    return max(1, value)
+
+
+TELEGRAM_MAX_RETRY_AFTER_S: int = _load_max_retry_after_s()
 
 
 def split_for_telegram(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
@@ -156,13 +183,28 @@ class TelegramAdapter(MessengerAdapter):
         into the scheduler dispatcher's `except Exception` branch, which
         would mark the trigger `pending_retry` and burn a Claude turn on
         the next materialisation.
+
+        Fix-pack HIGH #3: if Telegram advises a retry-after BEYOND
+        `TELEGRAM_MAX_RETRY_AFTER_S`, we do NOT sleep and re-raise the
+        exception so the caller decides. Scheduler dispatcher's
+        mark_pending_retry path then owns the delivery-later choice;
+        the user _on_text path lets the handler surface the error.
         """
+        max_retry_after_s = TELEGRAM_MAX_RETRY_AFTER_S
         for part in split_for_telegram(text):
             for attempt in range(TELEGRAM_RETRY_AFTER_MAX_ATTEMPTS + 1):
                 try:
                     await self._bot.send_message(chat_id=chat_id, text=part)
                     break
                 except TelegramRetryAfter as exc:
+                    if exc.retry_after > max_retry_after_s:
+                        log.warning(
+                            "telegram_retry_after_over_cap",
+                            chat_id=chat_id,
+                            retry_after=exc.retry_after,
+                            cap_s=max_retry_after_s,
+                        )
+                        raise
                     if attempt >= TELEGRAM_RETRY_AFTER_MAX_ATTEMPTS:
                         log.warning(
                             "telegram_retry_after_exhausted",

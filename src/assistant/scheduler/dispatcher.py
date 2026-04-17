@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -86,6 +87,7 @@ class SchedulerDispatcher:
         adapter: MessengerAdapter,
         owner_chat_id: int,
         settings: Settings,
+        notify_fn: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self._queue = queue
         self._store = store
@@ -93,6 +95,7 @@ class SchedulerDispatcher:
         self._adapter = adapter
         self._owner = owner_chat_id
         self._settings = settings
+        self._notify = notify_fn
         self._stop = asyncio.Event()
         self._inflight: set[int] = set()
         self._recent_acked: deque[int] = deque(maxlen=_LRU_SIZE)
@@ -126,6 +129,14 @@ class SchedulerDispatcher:
         Uses `wait_for(get, timeout=0.5)` so stop() wakes the consumer via
         timeout within at most 500 ms. No poison pill — avoids the
         QueueFull pathology from spike S-5.
+
+        Fix-pack HIGH #4: the outer body is wrapped in the same
+        try/except-fatal + notify pattern as `SchedulerLoop.run` so a
+        fatal crash on the consumer side surfaces to Telegram with a
+        distinct `scheduler_dispatcher_fatal` reason. Without this
+        handler a silent dispatcher crash is only visible through the
+        heartbeat watchdog's stale-timer (CRITICAL #3), several minutes
+        later.
         """
         log.info("scheduler_dispatcher_started")
         try:
@@ -139,6 +150,18 @@ class SchedulerDispatcher:
                     await self._deliver(trigger)
                 finally:
                     self._last_tick_at = asyncio.get_running_loop().time()
+        except asyncio.CancelledError:
+            # Ordinary shutdown path (Daemon.stop drain timeout hits).
+            # Do NOT notify; the supervisor knows we're stopping.
+            raise
+        except Exception as exc:
+            log.error("scheduler_dispatcher_fatal", error=repr(exc), exc_info=True)
+            if self._notify is not None:
+                try:
+                    await self._notify(f"scheduler dispatcher crashed: {exc!r}")
+                except Exception:
+                    log.warning("scheduler_dispatcher_notify_failed", exc_info=True)
+            raise
         finally:
             log.info("scheduler_dispatcher_stopped")
 
