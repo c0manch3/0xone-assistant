@@ -78,15 +78,19 @@ def _manifest_mtime(skills_dir: Path) -> float:
 def build_manifest(skills_dir: Path) -> str:
     """Return a markdown-list manifest of discovered skills, mtime-cached.
 
-    Phase-3 skill-installer SHOULD:
+    Phase-3 invalidation contract — the skill-installer:
 
-    1. Write/replace `<skills_dir>/<name>/SKILL.md` via atomic rename.
-    2. Call `os.utime(skills_dir, None)` so a containing-dir mtime bump
-       guarantees invalidation even on filesystems with second-level
-       granularity (HFS+, FAT32) or where a child mtime change does not
-       propagate to the parent.
-    3. Call `invalidate_manifest_cache()` for an immediate refresh; otherwise
-       the next request rebuilds lazily once the mtime check fires.
+    1. Writes/replaces `<skills_dir>/<name>/SKILL.md` via atomic rename.
+    2. Touches `<data_dir>/run/skills.dirty`; the bridge's
+       `_check_skills_sentinel` calls `invalidate_manifest_cache()` and
+       `touch_skills_dir(skills_dir)` on the next turn.
+    3. The `touch_skills_dir` bump is load-bearing on filesystems with
+       second-level `stat.st_mtime` granularity (HFS+, FAT32) or where a
+       child mtime change does not propagate to the parent.
+
+    PostToolUse Write/Edit under `skills/` or `tools/` also touches the
+    sentinel — the model never has to invoke the installer's own
+    invalidation flow explicitly.
     """
     if not skills_dir.exists():
         return "(skills directory not found)"

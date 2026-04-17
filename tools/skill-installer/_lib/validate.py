@@ -150,9 +150,7 @@ def _reject_unsafe_paths(bundle: Path) -> None:
                 target = os.readlink(p)
             except OSError:
                 target = "<unreadable>"
-            raise ValidationError(
-                f"symlink not allowed: {p.relative_to(bundle)} -> {target}"
-            )
+            raise ValidationError(f"symlink not allowed: {p.relative_to(bundle)} -> {target}")
         if not p.is_file():
             continue
         try:

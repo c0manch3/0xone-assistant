@@ -61,6 +61,23 @@ DENY_MATRIX = [
     ("gh secret set FOO", "subcommand 'secret'"),
     ("gh auth login", "only `gh auth status`"),
     ("gh auth logout", "only `gh auth status`"),
+    # Review fix-pack #2: method-override headers + host redirect + cache +
+    # preview API opt-in must all be rejected at argv level.
+    (
+        'gh api -H "X-HTTP-Method-Override: DELETE" /repos/x/y/contents/skills',
+        "flag -H",
+    ),
+    (
+        'gh api --header "Authorization: Bearer X" /repos/x/y/contents/skills',
+        "flag --header",
+    ),
+    (
+        "gh api --hostname evil.example.com /repos/x/y/contents/skills",
+        "flag --hostname",
+    ),
+    ("gh api --cache 3600 /repos/x/y/contents/skills", "flag --cache"),
+    ("gh api -p /repos/x/y/contents/skills", "flag -p"),
+    ("gh api --preview /repos/x/y/contents/skills", "flag --preview"),
 ]
 
 

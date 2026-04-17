@@ -228,8 +228,20 @@ class Daemon:
             self._log.warning("bootstrap_marker_clear_failed", error=repr(exc))
 
     def _should_notify_bootstrap(self, rc: int) -> bool:
-        """Re-notify if the marker is absent, older than the cooldown, or
-        points at a different failure code (rc change = new condition)."""
+        """Decide whether a fresh Telegram notification should go out.
+
+        Returns True and unlinks the existing marker (so the subsequent
+        O_EXCL create succeeds) when the marker is stale:
+          * absent                       — first failure,
+          * older than _BOOTSTRAP_NOTIFY_COOLDOWN_S (7 d), OR
+          * records a different rc        — regression / new condition.
+        Returns False when the marker is fresh *and* the rc matches — a
+        predictable repeat that we already told the operator about.
+
+        The race guard stays honest: a parallel daemon between our unlink
+        and our caller's `O_EXCL` will cause `FileExistsError` there,
+        which the caller swallows (another process already notified).
+        """
         marker = self._bootstrap_marker_path()
         if not marker.exists():
             return True
@@ -239,11 +251,15 @@ class Daemon:
             last_rc_raw = data.get("rc")
             last_rc = int(last_rc_raw) if last_rc_raw is not None else None
         except (OSError, ValueError, TypeError):
-            # Corrupt marker: treat as absent so we re-notify and rewrite.
+            # Corrupt marker: drop it so we can rewrite cleanly.
+            marker.unlink(missing_ok=True)
             return True
-        if time.time() - last_ts > _BOOTSTRAP_NOTIFY_COOLDOWN_S:
+        stale = time.time() - last_ts > _BOOTSTRAP_NOTIFY_COOLDOWN_S or last_rc != rc
+        if stale:
+            # Make way for the O_EXCL create in _bootstrap_notify_failure.
+            marker.unlink(missing_ok=True)
             return True
-        return bool(last_rc != rc)
+        return False
 
     async def _bootstrap_notify_failure(self, *, rc: int, reason: str) -> None:
         """Send a Telegram message to the owner on bootstrap failure.

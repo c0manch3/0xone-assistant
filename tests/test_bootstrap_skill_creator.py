@@ -123,9 +123,12 @@ async def test_start_does_not_wait_for_bootstrap(
 
     daemon = Daemon(_settings)
     t0 = time.monotonic()
-    await asyncio.wait_for(daemon.start(), timeout=0.5)
+    # Review fix #14: 0.5 s is brittle under CI load — 2.0 s still proves
+    # we did not block on the 60-s `.wait()` (a 30x safety margin against
+    # the "never hit" mock).
+    await asyncio.wait_for(daemon.start(), timeout=2.0)
     elapsed = time.monotonic() - t0
-    assert elapsed < 0.5
+    assert elapsed < 2.0
     # Background tasks must be alive (held on the daemon instance, not GC'd).
     names = {t.get_name() for t in daemon._bg_tasks}
     assert "skill_creator_bootstrap" in names
@@ -206,9 +209,24 @@ async def test_bootstrap_failure_notifies_owner_once(
 async def test_bootstrap_failure_does_not_renotify(
     _settings: Settings, _wired: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Pre-create the marker — the next failure must NOT message again.
+    """Pre-seed a valid, current-rc marker; the next failure with the same
+    rc must NOT message again (review fix #11 rotation semantics).
+    """
+    import json as _json
+    import time as _time
+
     (_settings.data_dir / "run").mkdir(parents=True)
-    (_settings.data_dir / "run" / ".bootstrap_notified").touch()
+    (_settings.data_dir / "run" / ".bootstrap_notified").write_text(
+        _json.dumps(
+            {
+                "rc": 1,
+                "reason": "failed",
+                "ts_epoch": _time.time(),
+                "ts": "2026-04-17T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
 
     async def _spawn(*a: Any, **kw: Any) -> _QuickProc:
         return _QuickProc(rc=1, stderr=b"still broken")
@@ -222,4 +240,36 @@ async def test_bootstrap_failure_does_not_renotify(
     adapter = daemon._adapter
     assert isinstance(adapter, _DummyAdapter)
     assert adapter.sent == []
+    await daemon.stop()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_happy_path_creates_skill_and_sentinel(
+    _settings: Settings, _wired: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review fix #17: after a successful bootstrap the
+    `skills/skill-creator/` directory appears and the hot-reload sentinel
+    is touched (the installer writes it as its last step on success)."""
+    created = {"done": False}
+
+    async def _spawn(*a: Any, **kw: Any) -> _QuickProc:
+        # Simulate the installer's side effects: drop a skill dir + sentinel.
+        (_settings.project_root / "skills" / "skill-creator").mkdir()
+        (_settings.project_root / "skills" / "skill-creator" / "SKILL.md").write_text(
+            "---\nname: skill-creator\ndescription: ok\n---\n", encoding="utf-8"
+        )
+        (_settings.data_dir / "run").mkdir(parents=True, exist_ok=True)
+        (_settings.data_dir / "run" / "skills.dirty").touch()
+        created["done"] = True
+        return _QuickProc(rc=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+    monkeypatch.setattr(shutil, "which", lambda name: "/fake/gh")
+
+    daemon = Daemon(_settings)
+    await daemon.start()
+    await asyncio.gather(*daemon._bg_tasks, return_exceptions=True)
+    assert created["done"]
+    assert (_settings.project_root / "skills" / "skill-creator" / "SKILL.md").is_file()
+    assert (_settings.data_dir / "run" / "skills.dirty").exists()
     await daemon.stop()

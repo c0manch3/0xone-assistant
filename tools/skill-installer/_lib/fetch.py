@@ -89,9 +89,7 @@ class _SafeRedirectHandler(HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-_opener: urllib.request.OpenerDirector = urllib.request.build_opener(
-    _SafeRedirectHandler()
-)
+_opener: urllib.request.OpenerDirector = urllib.request.build_opener(_SafeRedirectHandler())
 
 
 def _urlopen_safe(url: str, *, timeout: float) -> Any:
@@ -188,8 +186,7 @@ def _fetch_github_tree(match: re.Match[str], dest: Path) -> None:
     if shutil.which("gh") is None:
         if ref not in _DEFAULT_REFS:
             raise FetchError(
-                f"non-default ref {ref!r} requires `gh` on PATH; "
-                "install https://cli.github.com/"
+                f"non-default ref {ref!r} requires `gh` on PATH; install https://cli.github.com/"
             )
         _fetch_github_tree_fallback(owner, repo, path, dest)
         return
@@ -201,9 +198,7 @@ def _fetch_github_tree(match: re.Match[str], dest: Path) -> None:
         raise
 
 
-def _fetch_via_tarball(
-    owner: str, repo: str, ref: str, path: str, dest: Path
-) -> None:
+def _fetch_via_tarball(owner: str, repo: str, ref: str, path: str, dest: Path) -> None:
     """Download `/repos/<owner>/<repo>/tarball/<ref>` and extract `<path>`.
 
     `gh api /repos/.../tarball/...` returns binary tar.gz on stdout. We
@@ -225,9 +220,7 @@ def _fetch_via_tarball(
     except FileNotFoundError as exc:
         raise FetchError("gh binary not found on PATH") from exc
     except subprocess.TimeoutExpired as exc:
-        raise FetchError(
-            f"gh api tarball timed out after {_TARBALL_TIMEOUT}s"
-        ) from exc
+        raise FetchError(f"gh api tarball timed out after {_TARBALL_TIMEOUT}s") from exc
     if proc.returncode != 0:
         stderr_s = proc.stderr.decode("utf-8", "replace")[:300] if proc.stderr else ""
         raise FetchError(f"gh api tarball rc={proc.returncode}: {stderr_s}")
@@ -251,9 +244,7 @@ def _fetch_via_tarball(
         # Top-level dir is `<owner>-<repo>-<short-sha>/`. Find it.
         top_entries = [p for p in staging.iterdir() if p.is_dir()]
         if len(top_entries) != 1:
-            raise FetchError(
-                f"tarball root shape unexpected (entries={len(top_entries)})"
-            )
+            raise FetchError(f"tarball root shape unexpected (entries={len(top_entries)})")
         top = top_entries[0]
 
         # Normalise the subpath and reject traversal defensively, even
@@ -281,9 +272,7 @@ def _fetch_via_tarball(
         shutil.rmtree(staging, ignore_errors=True)
 
 
-def _fetch_github_tree_fallback(
-    owner: str, repo: str, path: str, dest: Path
-) -> None:
+def _fetch_github_tree_fallback(owner: str, repo: str, path: str, dest: Path) -> None:
     """Shallow-clone default branch + extract subtree. Only used when `gh`
     is absent AND the ref is `main` / `master` (see must-fix #3)."""
     tmp_clone = dest.parent / f".{dest.name}.clone"

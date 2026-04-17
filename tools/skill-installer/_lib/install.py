@@ -75,6 +75,13 @@ def diff_trees(old: Path, new: Path) -> list[str]:
     Used for the TOCTOU `exit 7` stderr — lets the operator see which
     files changed between the preview-time bundle and the install-time
     re-fetch without having to shell into `<data_dir>/run/installer-cache/`.
+
+    Memory bound: both trees have already passed `validate_bundle` which
+    enforces `MAX_FILES=100` + `MAX_SINGLE_FILE=2 MB`, so the pair never
+    reads more than ~400 MB in the worst case (both sides, both fully
+    loaded via `read_bytes` one file at a time). In practice Anthropic
+    bundles are ≤5.5 MB each (spike S1.c), so the real peak is <12 MB.
+    Callers additionally cap the rendered diff at 50 lines.
     """
 
     def _digest(p: Path) -> str:
