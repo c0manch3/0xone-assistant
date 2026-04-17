@@ -44,6 +44,15 @@ def render_preview(url: str, bundle: Path, bundle_sha: str, report: dict[str, An
     lines.append(f"bundle_sha:  {bundle_sha[:16]}...")
     lines.append(f"has_inner_tools: {report.get('has_inner_tools', False)}")
 
+    # B-CRIT-3: surface warnings before the install recipe so the
+    # operator sees them before any "да"/"yes" confirmation.
+    warnings = report.get("warnings") or []
+    if warnings:
+        lines.append("")
+        lines.append("⚠ warnings:")
+        for w in warnings:
+            lines.append(f"  - {w}")
+
     rel_paths = sorted(
         str(p.relative_to(bundle).as_posix())
         for p in bundle.rglob("*")

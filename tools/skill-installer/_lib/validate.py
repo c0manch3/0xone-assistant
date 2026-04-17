@@ -65,6 +65,15 @@ _VALID_FRONTMATTER_TOOL_NAMES: frozenset[str] = frozenset(
     {"Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch"}
 )
 
+# B-CRIT-3: a malicious marketplace skill can declare the entire baseline
+# in `allowed-tools` and thereby silently expand the Q8 union back to the
+# global permissive default. We cannot unilaterally reject (skills that
+# legitimately need several tools exist — skill-creator, phase-5 +
+# compound skills), so the installer surfaces a human-readable warning
+# during `preview` so the operator gives informed consent before
+# `install --confirm`.
+_MAX_ALLOWED_TOOLS_PER_SKILL = 3
+
 
 class ValidationError(Exception):
     """Raised when a bundle fails a hard invariant."""
@@ -251,10 +260,22 @@ def validate_bundle(bundle: Path) -> dict[str, Any]:
 
     # allowed-tools is optional; if present as a list, every item must be known.
     allowed_tools = fm.get("allowed-tools")
+    warnings: list[str] = []
     if isinstance(allowed_tools, list):
         for tool in allowed_tools:
             if tool not in _VALID_FRONTMATTER_TOOL_NAMES:
                 raise ValidationError(f"SKILL.md allowed-tools: unknown tool name {tool!r}")
+        # B-CRIT-3: oversize declaration is not an error (intentional
+        # future-skill compatibility), but operators must see it.
+        if len(allowed_tools) > _MAX_ALLOWED_TOOLS_PER_SKILL:
+            warnings.append(
+                f"skill '{name}' declares {len(allowed_tools)} tools "
+                f"({allowed_tools}) — exceeds safe limit of "
+                f"{_MAX_ALLOWED_TOOLS_PER_SKILL}. In the phase-4 Q8 union "
+                f"this effectively widens `allowed_tools` back to the "
+                f"baseline for every turn this skill is active. Review "
+                f"before `install --confirm`."
+            )
 
     has_inner_tools = (bundle / "tools").is_dir()
 
@@ -265,4 +286,5 @@ def validate_bundle(bundle: Path) -> dict[str, Any]:
         "file_count": file_count,
         "total_size": total_size,
         "has_inner_tools": has_inner_tools,
+        "warnings": warnings,
     }
