@@ -3,9 +3,9 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
-# Future-proof: phase-5 scheduler will inject "scheduler"-origin messages
+# Future-proof: phase-5 scheduler injects "scheduler"-origin messages
 # without a real Telegram message_id. Keeping the type tight via Literal
 # means mypy catches typos at the call site.
 Origin = Literal["telegram", "scheduler"]
@@ -17,6 +17,9 @@ class IncomingMessage:
     text: str
     message_id: int | None = None
     origin: Origin = "telegram"
+    # Phase 5: scheduler carries `{"trigger_id": int, "schedule_id": int}` here.
+    # Telegram-origin messages leave this None (backwards-compatible).
+    meta: dict[str, Any] | None = None
 
 
 Emit = Callable[[str], Awaitable[None]]

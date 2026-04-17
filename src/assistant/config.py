@@ -70,6 +70,39 @@ class MemorySettings(BaseSettings):
     max_body_bytes: int = 1_048_576  # 1 MB — S4 guard on single note body
 
 
+class SchedulerSettings(BaseSettings):
+    """Scheduler knobs (phase 5).
+
+    Every field is overridable via `SCHEDULER_<NAME>` env var. Defaults are
+    chosen for the in-process single-user configuration (plan §7 / wave-2
+    N-W2-4 split of the cooldowns).
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="SCHEDULER_",
+        env_file=(str(_user_env_file()), ".env"),
+        extra="ignore",
+    )
+
+    enabled: bool = True
+    tick_interval_s: int = 15
+    tz_default: str = "UTC"
+    catchup_window_s: int = 3600
+    dead_attempts_threshold: int = 5
+    # B2: `claude.timeout` (300) + 60 s. A scheduler-turn with memory ops
+    # can take 60-180 s; this MUST stay above the claude-turn timeout or
+    # the runtime sweep reverts an actively-delivering trigger.
+    sent_revert_timeout_s: int = 360
+    dispatcher_queue_size: int = 64
+    max_schedules: int = 64
+    # Wave-2 N-W2-4: separate cooldowns for distinct user-facing events.
+    loop_crash_cooldown_s: int = 86400  # 24 h for `scheduler_loop_fatal` notify
+    catchup_recap_cooldown_s: int = 3600  # 1 h for the "pending N missed" recap
+    # Wave-2 G-W2-10: heartbeat staleness threshold multiplier
+    # (tick_interval_s * heartbeat_stale_multiplier = stale threshold).
+    heartbeat_stale_multiplier: int = 10
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=(str(_user_env_file()), ".env"),
@@ -83,6 +116,7 @@ class Settings(BaseSettings):
     data_dir: Path = Field(default_factory=_default_data_dir)
     claude: ClaudeSettings = Field(default_factory=ClaudeSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
+    scheduler: SchedulerSettings = Field(default_factory=SchedulerSettings)
 
     @property
     def db_path(self) -> Path:
