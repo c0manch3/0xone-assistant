@@ -218,12 +218,11 @@ async def test_repeated_failures_marks_dead_with_notify(tmp_path: Path) -> None:
     )
     await _drain(disp, queue)
 
-    # Re-enqueue for second failure — dispatcher doesn't auto-retry; the
-    # loop would normally re-materialise, but we simulate the re-delivery
-    # by moving it to 'sent' again (queue consumer expects pending).
-    # Simpler: seed via a fresh put after resetting status back to 'pending'
-    # and re-running the dispatcher. The re-put simulates the loop's
-    # re-enqueue for retry.
+    # Re-enqueue for the second failure to exercise the threshold path.
+    # Production re-queue is done by `SchedulerLoop._reenqueue_pending_retries`
+    # (fix-pack CRITICAL #1); this unit test skips the producer loop and
+    # drives the dispatcher directly — see
+    # `tests/test_scheduler_retry_reenqueue.py` for the end-to-end case.
     await queue.put(
         ScheduledTrigger(
             trigger_id=trig,

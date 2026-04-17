@@ -17,6 +17,7 @@ runtime sweep does not punish a consumer that is mid-delivery.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -271,6 +272,58 @@ class SchedulerStore:
             )
             await self._conn.commit()
         return cur.rowcount or 0
+
+    async def list_pending_retries(
+        self, *, exclude_ids: Iterable[int], limit: int = 32
+    ) -> list[dict[str, Any]]:
+        """Fix-pack CRITICAL #1: return `pending` rows that a previous
+        `mark_pending_retry` left behind (status='pending' AND attempts>0),
+        excluding any id currently in the dispatcher's `_inflight` set.
+
+        The caller (producer loop) re-enqueues these onto the in-process
+        queue — without this pass a failed trigger would remain an
+        orphan in the DB until the next daemon reboot's `clean_slate_sent`.
+        The explicit `attempts > 0` gate keeps pristine rows
+        (`try_materialize_trigger` just inserted them; the producer's
+        cron-match path is the only thing that should enqueue those)
+        out of the retry pass — avoids a double-enqueue race.
+
+        `limit` is a soft cap so a pathological backlog (e.g. the
+        dispatcher was completely broken for hours) can't flood the
+        queue in a single tick. Subsequent sweep ticks pick up the rest.
+        """
+        excludes = {int(i) for i in exclude_ids}
+        if excludes:
+            placeholders = ",".join("?" for _ in excludes)
+            sql = (
+                "SELECT id, schedule_id, prompt, scheduled_for, attempts "
+                "FROM triggers "
+                "WHERE status='pending' AND attempts > 0 "
+                f"AND id NOT IN ({placeholders}) "
+                "ORDER BY scheduled_for ASC LIMIT ?"
+            )
+            params: tuple[Any, ...] = (*excludes, limit)
+        else:
+            sql = (
+                "SELECT id, schedule_id, prompt, scheduled_for, attempts "
+                "FROM triggers "
+                "WHERE status='pending' AND attempts > 0 "
+                "ORDER BY scheduled_for ASC LIMIT ?"
+            )
+            params = (limit,)
+        async with self._conn.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [
+            {
+                "id": int(r[0]),
+                "schedule_id": int(r[1]),
+                "prompt": str(r[2]),
+                "scheduled_for": str(r[3]),
+                "attempts": int(r[4]),
+                "status": "pending",
+            }
+            for r in rows
+        ]
 
     async def revert_stuck_sent(self, timeout_s: int, exclude_ids: set[int]) -> int:
         """Runtime sweep: revert `sent` rows older than `timeout_s` that are

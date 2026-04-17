@@ -59,6 +59,11 @@ class SchedulerLoop:
 
     # Run runtime sweep every 4th tick (15 s x 4 = 60 s) per wave-2 B-W2-1.
     _SWEEP_EVERY_N_TICKS = 4
+    # Fix-pack CRITICAL #1: the retry re-enqueue pass shares the same
+    # cadence. Faster ticks would re-queue a row the dispatcher is still
+    # staging (in the brief window between `mark_pending_retry` and the
+    # next trigger arriving at the consumer); 60 s is plenty of slack.
+    _RETRY_SWEEP_BATCH = 32
 
     def __init__(
         self,
@@ -129,10 +134,13 @@ class SchedulerLoop:
         for row in schedules:
             await self._maybe_materialize(row, now)
 
-        # Wave-2 B-W2-1: every 4th tick, runtime revert sweep.
+        # Wave-2 B-W2-1 + fix-pack CRITICAL #1: every 4th tick, run the
+        # runtime revert sweep AND the pending-retry re-enqueue pass.
+        # Both share the dispatcher's inflight() snapshot so the same
+        # row can't be touched twice.
         if self._tick_count % self._SWEEP_EVERY_N_TICKS == 0:
+            inflight = self._dispatcher.inflight()
             try:
-                inflight = self._dispatcher.inflight()
                 reverted = await self._store.revert_stuck_sent(
                     timeout_s=self._settings.scheduler.sent_revert_timeout_s,
                     exclude_ids=inflight,
@@ -141,6 +149,63 @@ class SchedulerLoop:
                     log.info("scheduler_revert_stuck_sent", count=reverted)
             except Exception:
                 log.warning("scheduler_revert_stuck_sent_failed", exc_info=True)
+            try:
+                await self._reenqueue_pending_retries(inflight)
+            except Exception:
+                log.warning("scheduler_retry_reenqueue_failed", exc_info=True)
+
+    # ------------------------------------------------------------------
+
+    async def _reenqueue_pending_retries(self, inflight: set[int]) -> None:
+        """Fix-pack CRITICAL #1: push rows previously marked
+        `pending_retry` (status='pending' AND attempts>0) back onto the
+        in-process queue so the dispatcher can make the next attempt.
+
+        We iterate `list_pending_retries` once per sweep; the caller's
+        outer try/except handles DB failures. Each `put_nowait` refuses
+        to block on a full queue — the sweep is retried on the next
+        cadence, so losing one pass is preferred over stalling the
+        producer loop (which would freeze the heartbeat).
+        """
+        rows = await self._store.list_pending_retries(
+            exclude_ids=inflight, limit=self._RETRY_SWEEP_BATCH
+        )
+        for row in rows:
+            try:
+                scheduled_for = from_iso_utc(str(row["scheduled_for"]))
+            except ValueError:
+                log.warning(
+                    "scheduler_retry_reenqueue_parse_failed",
+                    trigger_id=row["id"],
+                    scheduled_for=row["scheduled_for"],
+                )
+                continue
+            trigger = ScheduledTrigger(
+                trigger_id=int(row["id"]),
+                schedule_id=int(row["schedule_id"]),
+                prompt=str(row["prompt"]),
+                scheduled_for=scheduled_for,
+                # attempts is the count of PREVIOUS failures; next delivery
+                # is N+1 so the dead-letter threshold advances in lock-step
+                # with the dispatcher's `attempts >= threshold` gate.
+                attempt=int(row["attempts"]) + 1,
+            )
+            try:
+                self._queue.put_nowait(trigger)
+            except asyncio.QueueFull:
+                log.info(
+                    "scheduler_retry_reenqueue_backpressure",
+                    trigger_id=trigger.trigger_id,
+                    attempt=trigger.attempt,
+                )
+                # Stop early — the remaining rows wait for the next sweep.
+                return
+            log.info(
+                "scheduler_retry_reenqueued",
+                trigger_id=trigger.trigger_id,
+                schedule_id=trigger.schedule_id,
+                attempt=trigger.attempt,
+            )
 
     # ------------------------------------------------------------------
 
