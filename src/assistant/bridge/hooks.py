@@ -226,8 +226,7 @@ def _validate_python_invocation(argv: list[str], project_root: Path) -> str | No
         script.startswith(p) for p in _PYTHON_ALLOWED_PREFIXES
     ):
         return (
-            f"python script must live under one of {list(_PYTHON_ALLOWED_PREFIXES)}; "
-            f"got {script!r}"
+            f"python script must live under one of {list(_PYTHON_ALLOWED_PREFIXES)}; got {script!r}"
         )
     if not _path_safely_inside(project_root / script_path, project_root):
         return "python script escapes project_root"
@@ -246,8 +245,7 @@ def _validate_uv_run(argv: list[str], project_root: Path) -> str | None:
         return "script path must not contain '..'"
     if not any(script.startswith(p) for p in _UV_RUN_ALLOWED_PREFIXES):
         return (
-            f"uv run target must live under one of {list(_UV_RUN_ALLOWED_PREFIXES)}; "
-            f"got {script!r}"
+            f"uv run target must live under one of {list(_UV_RUN_ALLOWED_PREFIXES)}; got {script!r}"
         )
     if not _path_safely_inside(project_root / script_path, project_root):
         return "uv run script escapes project_root"
@@ -316,9 +314,7 @@ def _validate_git_clone(argv: list[str], project_root: Path) -> str | None:
         except ValueError:
             ip_literal = None
         if ip_literal is not None and _net_is_private_address(ip_literal):
-            return (
-                f"git clone: URL hostname {hostname!r} is a non-public IP literal"
-            )
+            return f"git clone: URL hostname {hostname!r} is a non-public IP literal"
     dest = argv[4]
     dest_path = Path(dest)
     if _has_dotdot(dest_path.parts):
@@ -334,9 +330,7 @@ def _validate_git_invocation(argv: list[str], project_root: Path) -> str | None:
         return "git requires a subcommand"
     sub = argv[1]
     if sub not in _GIT_ALLOWED_SUBCMDS:
-        return (
-            f"git subcommand '{sub}' is not in allowlist {sorted(_GIT_ALLOWED_SUBCMDS)}"
-        )
+        return f"git subcommand '{sub}' is not in allowlist {sorted(_GIT_ALLOWED_SUBCMDS)}"
     # Scan args for option-injection regardless of subcommand. `clone` also
     # needs its positional layout validated below.
     for arg in argv[2:]:
@@ -679,9 +673,7 @@ def _is_inside_skills_or_tools(raw_path: str, project_root: Path) -> bool:
     if _has_dotdot(target.parts):
         return False
     try:
-        abs_path = (
-            target.resolve() if target.is_absolute() else (project_root / target).resolve()
-        )
+        abs_path = target.resolve() if target.is_absolute() else (project_root / target).resolve()
     except (OSError, ValueError):
         return False
     try:

@@ -1,23 +1,15 @@
-"""Shared SSRF-classification helpers.
+"""SSRF helper mirror — kept byte-identical with src/assistant/bridge/net.py.
 
-This module hosts the *canonical* implementation of three tiny helpers:
+The installer is a separate entrypoint invoked via the phase-2 Bash
+allowlist with cwd=project_root; importing from src/assistant/bridge/ would
+require adding src/ to sys.path and coupling the installer to the main
+package layout. Mirror is ugly but local; a unit test
+(tests/test_ssrf_mirror_in_sync.py) asserts the block between the
+`SSRF_MIRROR_START` / `SSRF_MIRROR_END` sentinels in the source file is
+also present verbatim in this mirror.
 
-* `is_private_address` — one-liner classification of an `ipaddress` object.
-* `resolve_hostname`   — async DNS resolution with an `asyncio.timeout`.
-* `classify_url`       — combined URL validator: scheme check, DNS resolve,
-  private-range reject.
-
-The block between the `SSRF_MIRROR_START` / `SSRF_MIRROR_END` sentinels is
-mirrored **byte-for-byte** into `tools/skill-installer/_lib/_net_mirror.py`.
-The installer is a separate entrypoint (stdlib-only, see
-`plan/phase3/implementation.md §2.8`) that cannot import from the main
-package without coupling `sys.path` to it — duplicating the ~60 LOC block
-and asserting equality via a test is cheaper than plumbing an installable
-shared sub-package.
-
-If you edit anything between the sentinels you MUST also re-copy the block
-into `_net_mirror.py`. The test `tests/test_ssrf_mirror_in_sync.py`
-fails fast when the two drift.
+If you edit anything inside the sentinels you MUST also copy it into this
+file. Do NOT drift.
 """
 
 from __future__ import annotations
@@ -100,3 +92,13 @@ async def classify_url(url: str, *, dns_timeout: float = 3.0) -> str | None:
 
 
 # --- SSRF_MIRROR_END ---
+
+
+def classify_url_sync(url: str, *, dns_timeout: float = 3.0) -> str | None:
+    """Synchronous SSRF gate for urllib-based fetches inside the installer.
+
+    The installer is stdlib-only (B-4) and deliberately avoids pulling in
+    asyncio for simple HTTPS calls. This helper wraps the async
+    `classify_url` with a short-lived event loop per invocation.
+    """
+    return asyncio.run(classify_url(url, dns_timeout=dns_timeout))

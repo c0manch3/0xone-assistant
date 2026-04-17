@@ -55,18 +55,14 @@ def test_uv_run_skills_scripts_allowed(project_root: Path) -> None:
 def test_python_tools_still_allowed(project_root: Path) -> None:
     (project_root / "tools" / "ping").mkdir()
     (project_root / "tools" / "ping" / "main.py").write_text("", encoding="utf-8")
-    assert (
-        check_bash_command("python tools/ping/main.py", project_root) is None
-    )
+    assert check_bash_command("python tools/ping/main.py", project_root) is None
 
 
 # ---------------------------------------------------------------- DENY
 
 
 def test_python_skills_dotdot_denied(project_root: Path) -> None:
-    reason = check_bash_command(
-        "python skills/../../../etc/passwd", project_root
-    )
+    reason = check_bash_command("python skills/../../../etc/passwd", project_root)
     assert reason is not None
     assert "'..'" in reason
 

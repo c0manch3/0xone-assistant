@@ -22,27 +22,21 @@ def project_root(tmp_path: Path) -> Path:
 
 def test_git_clone_skills_allow(project_root: Path) -> None:
     assert (
-        check_bash_command(
-            "git clone --depth=1 https://github.com/x/y skills/y", project_root
-        )
+        check_bash_command("git clone --depth=1 https://github.com/x/y skills/y", project_root)
         is None
     )
 
 
 def test_git_clone_tools_allow(project_root: Path) -> None:
     assert (
-        check_bash_command(
-            "git clone --depth=1 https://github.com/x/y tools/y", project_root
-        )
+        check_bash_command("git clone --depth=1 https://github.com/x/y tools/y", project_root)
         is None
     )
 
 
 def test_git_clone_ssh_url_allow(project_root: Path) -> None:
     assert (
-        check_bash_command(
-            "git clone --depth=1 git@github.com:x/y.git skills/y", project_root
-        )
+        check_bash_command("git clone --depth=1 git@github.com:x/y.git skills/y", project_root)
         is None
     )
 
@@ -76,16 +70,12 @@ def test_git_clone_deny(cmd: str, needle: str, project_root: Path) -> None:
 
 def test_uv_sync_allow(project_root: Path) -> None:
     (project_root / "tools" / "foo").mkdir()
-    assert (
-        check_bash_command("uv sync --directory tools/foo", project_root) is None
-    )
+    assert check_bash_command("uv sync --directory tools/foo", project_root) is None
 
 
 def test_uv_sync_allow_equals_form(project_root: Path) -> None:
     (project_root / "tools" / "foo").mkdir()
-    assert (
-        check_bash_command("uv sync --directory=tools/foo", project_root) is None
-    )
+    assert check_bash_command("uv sync --directory=tools/foo", project_root) is None
 
 
 DENY_MATRIX_UV_SYNC = [
