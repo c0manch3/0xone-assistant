@@ -56,11 +56,17 @@ METACHAR_BYPASSES = [
     ("python tools/ping/main.py | nc -l 1", "|"),
     ("python tools/ping/main.py > /tmp/leak", ">"),
     ("python tools/ping/main.py < /etc/passwd", "<"),
-    ("echo $(whoami)", "$("),
-    ("echo ${HOME}", "${"),
+    ("echo $(whoami)", "$"),
+    ("echo ${HOME}", "$"),
     ("echo `id`", "`"),
     ("python tools/ping/main.py\nrm -rf /", "\n"),
     ("python tools/ping/main.py & disown", "&"),
+    # Fix-pack HIGH #2: bare `$FOO` env-var expansion through /bin/sh -c.
+    # Previously slipped past `_SHELL_METACHARS` (only `$(` / `${` caught).
+    ("echo $HOME", "$"),
+    ("echo $SSH_AUTH_SOCK", "$"),
+    ("echo $AWS_SECRET_ACCESS_KEY", "$"),
+    ("python tools/ping/main.py $PATH", "$"),
 ]
 
 

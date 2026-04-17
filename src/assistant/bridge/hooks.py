@@ -68,13 +68,19 @@ FILE_TOOLS: tuple[str, ...] = ("Read", "Write", "Edit", "Glob", "Grep")
 
 # Any of these in the raw command -> hard reject before tokenizing. We never
 # want to give the model the ability to chain, redirect, or substitute.
+#
+# Fix-pack HIGH #2: bare `$` (any dollar) is denied outright. Claude Code's
+# Bash tool runs the command via `/bin/sh -c`, so `echo $HOME $SSH_AUTH_SOCK`
+# expands envvars BEFORE the argv-allowlist ever sees them. `$(...)` and
+# `${...}` were already caught, but `$FOO` slipped through. Treating any `$`
+# as a deny is overkill for the single legitimate case (echo "$5" would not
+# have been allowed anyway), but it closes the env-var leak cleanly.
 _SHELL_METACHARS: tuple[str, ...] = (
     ";",
     "&",
     "|",
     "`",
-    "$(",
-    "${",
+    "$",  # catches $FOO / $(cmd) / ${VAR}
     ">",
     "<",
     "\n",
