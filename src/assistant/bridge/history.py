@@ -84,13 +84,25 @@ def _render_tool_summary(
 def _build_tool_name_map(rows: list[dict[str, Any]]) -> dict[str, str]:
     """Scan the WHOLE history; return `tool_use_id -> tool_name`.
 
-    B2 fix: the SDK emits `tool_use` in assistant turn N and the matching
-    `tool_result` in USER turn N+1. Phase 2's handler allocates one turn
-    per user message, so those rows live under DIFFERENT `turn_id`s in
-    ConversationStore. A per-turn lookup silently dropped every tool_result
-    whose partner tool_use was in a preceding turn — the resulting
-    synthetic note rendered "unknown" for every snippet. A global pass
-    restores the link.
+    Correction (review wave 3, should-fix #8): the previous docstring
+    claimed phase-2 `_run_turn` splits `tool_use` and `tool_result` into
+    different `turn_id`s. That is NOT how phase 2 actually stores them —
+    the handler allocates a single `turn_id` per user→assistant cycle
+    and every block from that cycle shares it.
+
+    The global (not per-turn) map is intentional future-proofing for
+    cases where that invariant changes:
+
+    * phase-5 scheduler may inject a memory-recall trigger as a fresh
+      turn whose user message depends on a `tool_result` from the
+      previous real turn;
+    * SDK `resume=session_id` experiments (U4-1) may redistribute blocks
+      across turns in ways phase 2 never did;
+    * the B2 regression test (`test_history_toolname_map_spans_turns`)
+      seeds the cross-turn split explicitly to exercise this path.
+
+    Building the map once across all rows keeps `history_to_user_envelopes`
+    correct regardless of how future phases partition the history.
     """
     m: dict[str, str] = {}
     for row in rows:

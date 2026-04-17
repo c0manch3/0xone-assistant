@@ -109,16 +109,29 @@ def serialize_note(frontmatter: dict[str, Any], body: str) -> str:
     return f"---\n{yaml_text}---\n\n{body}"
 
 
+_FENCE_RE = re.compile(r"^```")
+
+
 def sanitize_body(body: str) -> str:
     """S3: reject `---` at column 0 which would spoof the frontmatter fence.
 
-    Indent such lines by one space; users writing plain markdown horizontal
-    rules should prefer `***` or `___` anyway.
+    Review wave 3 (should-fix #6): be fence-aware so code blocks that
+    legitimately contain `---` at column 0 (a python docstring showing
+    YAML, a markdown doc about frontmatter, …) pass through untouched.
+    We still indent `---` lines that sit at column 0 in prose — those
+    are the ones that could close our frontmatter block.
+
+    Users writing plain markdown horizontal rules should prefer `***` or
+    `___` anyway; the sanitiser only protects the frontmatter invariant.
     """
     out: list[str] = []
+    in_fence = False
     for line in body.splitlines(keepends=True):
-        stripped = line.rstrip("\r\n")
-        if stripped == "---":
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if not in_fence and line.rstrip("\r\n") == "---":
             line = " " + line
         out.append(line)
     return "".join(out)

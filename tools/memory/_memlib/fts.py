@@ -335,26 +335,41 @@ def list_index(index_db: Path, area: str | None = None) -> list[dict[str, object
 
 def reindex_all(
     index_db: Path,
-    notes: list[tuple[str, str, list[str], str | None, str, str, str]],
+    notes: list[tuple[str, str, list[str], str | None, str, str, str]]
+    | Iterator[tuple[str, str, list[str], str | None, str, str, str]],
+    *,
+    chunk_size: int = 1000,
 ) -> int:
     """Wipe `notes` (FTS5 triggers cascade to `notes_fts`) and re-insert.
 
     `notes` tuples: `(rel_path, title, tags, area, body, created, updated)`.
     Returns the number of rows written. Caller holds `vault_lock` — we
     use `BEGIN IMMEDIATE` so concurrent readers can't see the empty gap.
+
+    Nice-to-have #11: process the stream in chunks of `chunk_size` rows
+    via `executemany` so a 10k-note vault no longer materialises the
+    whole payload in a single Python list. Callers that currently pass
+    a list keep working (iteration is still linear).
     """
     conn = _connect(index_db)
     try:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("DELETE FROM notes")
+        insert_sql = (
+            "INSERT INTO notes(path, title, tags, area, body, created, updated) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)"
+        )
         count = 0
+        batch: list[tuple[str, str, str, str, str, str, str]] = []
         for rel_path, title, tags, area, body, created, updated in notes:
-            conn.execute(
-                "INSERT INTO notes(path, title, tags, area, body, created, updated) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (rel_path, title, _tags_to_text(tags), area or "", body, created, updated),
-            )
-            count += 1
+            batch.append((rel_path, title, _tags_to_text(tags), area or "", body, created, updated))
+            if len(batch) >= chunk_size:
+                conn.executemany(insert_sql, batch)
+                count += len(batch)
+                batch.clear()
+        if batch:
+            conn.executemany(insert_sql, batch)
+            count += len(batch)
         conn.commit()
         return count
     except Exception:

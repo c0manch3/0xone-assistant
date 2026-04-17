@@ -29,8 +29,26 @@ def ensure_vault(vault_dir: Path) -> list[str]:
         mode = 0
     if mode & 0o077:
         warnings.append(f"vault_dir_permissions_too_open: path={vault_dir}, mode={oct(mode)}")
+
     tmp = vault_dir / ".tmp"
     tmp.mkdir(exist_ok=True, mode=0o700)
+    # Should-fix #9: `Path.mkdir(mode=...)` silently ignores the mode on
+    # an existing dir, so a stage dir created under a lax umask (or left
+    # over from phase 4 v1) could keep world-read/execute bits. The
+    # staging dir is ours alone — unlike the vault root where we respect
+    # operator intent — so chmod to 0o700 unconditionally. OSError from
+    # chmod is logged as a warning but does not fail init.
+    try:
+        tmp_mode = tmp.stat().st_mode & 0o777
+    except OSError:
+        tmp_mode = 0o700
+    if tmp_mode != 0o700:
+        try:
+            os.chmod(tmp, 0o700)
+        except OSError as exc:
+            warnings.append(
+                f"vault_tmp_chmod_failed: path={tmp}, mode={oct(tmp_mode)}, error={exc}"
+            )
     return warnings
 
 

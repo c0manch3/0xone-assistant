@@ -38,6 +38,12 @@ _GLOBAL_BASELINE: frozenset[str] = frozenset(
     {"Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch"}
 )
 
+# Should-fix #7 (review wave 3): dedupe the permissive-default WARN log so
+# every turn does not re-emit the same event. Cleared implicitly when the
+# collapsed-by set changes (e.g. a skill is installed / uninstalled and
+# the SKILL.md is rewritten).
+_LAST_COLLAPSED_WARN: frozenset[str] | None = None
+
 
 def _effective_allowed_tools(manifest_entries: list[dict[str, Any]]) -> list[str]:
     """Compute the effective `allowed_tools` set for a turn (Q8).
@@ -87,15 +93,28 @@ def _effective_allowed_tools(manifest_entries: list[dict[str, Any]]) -> list[str
             union |= {str(t) for t in tools if str(t) in _GLOBAL_BASELINE}
 
     if collapsed_by:
-        log.warning(
-            "allowed_tools_union_collapsed_to_baseline",
-            skills=collapsed_by,
-        )
+        # Should-fix #7: emit the WARN only when the set of offending
+        # skills changes. Steady-state phases (same permissive skill
+        # every turn) must not spam logs.
+        global _LAST_COLLAPSED_WARN
+        key = frozenset(collapsed_by)
+        if key != _LAST_COLLAPSED_WARN:
+            log.warning(
+                "allowed_tools_union_collapsed_to_baseline",
+                skills=collapsed_by,
+            )
+            _LAST_COLLAPSED_WARN = key
 
     # If every skill declared `[]`, the union is empty — author intent is
     # "no tools". Pass an empty list to the SDK; the single-all-[]-manifest
     # scenario is unlikely in practice (ping/installer need Bash).
     return sorted(union) if union else []
+
+
+def _reset_allowed_tools_warn_cache() -> None:
+    """Test hook: re-arm the permissive-default WARN de-duplication."""
+    global _LAST_COLLAPSED_WARN
+    _LAST_COLLAPSED_WARN = None
 
 
 class ClaudeBridgeError(RuntimeError):
@@ -346,6 +365,16 @@ class ClaudeBridge:
                                             enclosing="UserMessage",
                                         )
                                         yield block
+                                    else:
+                                        # Nice-to-have #10: surface any unexpected
+                                        # non-ToolResult member so phase-5+ drift
+                                        # (SDK starts yielding new block types
+                                        # inside UserMessage) is visible in logs
+                                        # instead of a silent swallow.
+                                        log.debug(
+                                            "usermessage_list_skip_nontoolresult",
+                                            type=type(block).__name__,
+                                        )
                             continue
                         if isinstance(message, ResultMessage):
                             log.info(
