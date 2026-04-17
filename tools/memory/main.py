@@ -51,7 +51,6 @@ from _memlib.paths import (  # noqa: E402
 )
 from _memlib.vault import (  # noqa: E402
     atomic_write,
-    delete_note,
     ensure_vault,
     list_notes,
     read_note,
@@ -168,6 +167,19 @@ def _fail(code: int, error: str, **extra: Any) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _quote_fts5_query(q: str) -> str:
+    """Wrap a user query in FTS5 phrase form and escape embedded quotes.
+
+    Default is phrase-form search so that `"A OR B"` is matched as a
+    literal three-word phrase rather than the OR operator. Operators
+    (`AND`, `OR`, `NEAR`, `*`, column syntax) require `--raw`. Review
+    wave 3: any query containing a hyphen or double quote blew up with
+    `OperationalError` (exit 5) because FTS5 parses `-` as a column
+    separator.
+    """
+    return '"' + q.replace('"', '""') + '"'
+
+
 def cmd_search(args: argparse.Namespace) -> int:
     vault = _resolve_vault_dir()
     index = _resolve_index_path()
@@ -181,8 +193,9 @@ def cmd_search(args: argparse.Namespace) -> int:
         return _fail(EXIT_IO, f"could not open index: {exc}")
 
     limit = args.limit if args.limit and args.limit > 0 else _DEFAULT_SEARCH_LIMIT
+    effective = args.query if args.raw else _quote_fts5_query(args.query)
     try:
-        hits = search_index(index, args.query, area=args.area, limit=limit)
+        hits = search_index(index, effective, area=args.area, limit=limit)
     except Exception as exc:  # FTS5 syntax errors surface here.
         return _fail(EXIT_FTS, f"FTS5 query failed: {exc}", query=args.query)
     return _ok({"query": args.query, "area": args.area, "hits": hits})
@@ -380,12 +393,19 @@ def cmd_delete(args: argparse.Namespace) -> int:
     except OSError as exc:
         return _fail(EXIT_IO, f"could not open index: {exc}")
 
-    if not (vault / rel).exists():
-        return _fail(EXIT_NOT_FOUND, "note not found", path=str(rel))
-
+    # Review wave 3: the exists→delete check had a race window between
+    # two concurrent `memory delete` invocations. Runner A could check
+    # exists() → True; runner B enters the lock first and unlinks;
+    # runner A enters the lock and raises FileNotFoundError → EXIT_IO
+    # instead of the contractual EXIT_NOT_FOUND. Move the existence
+    # check inside the lock and use unlink(missing_ok=True) so the
+    # contract holds under contention.
+    target = vault / rel
     try:
         with vault_lock(index):
-            delete_note(vault, rel)
+            if not target.exists():
+                return _fail(EXIT_NOT_FOUND, "note not found", path=str(rel))
+            target.unlink(missing_ok=True)
             delete_from_index(index, str(rel.as_posix()))
     except OSError as exc:
         return _fail(EXIT_IO, f"delete failed: {exc}", path=str(rel))
@@ -458,6 +478,11 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_search.add_argument("query")
     sp_search.add_argument("--area", default=None)
     sp_search.add_argument("--limit", type=int, default=_DEFAULT_SEARCH_LIMIT)
+    sp_search.add_argument(
+        "--raw",
+        action="store_true",
+        help="pass query verbatim to FTS5 (enables AND/OR/NEAR/*/column syntax)",
+    )
     sp_search.set_defaults(func=cmd_search)
 
     sp_read = sub.add_parser("read", help="read a note by relative path")
