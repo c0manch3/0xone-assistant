@@ -183,6 +183,7 @@ def build_agents(
     tools: list[str] | None = None,
     skills: list[str] | None = None,
     prompt_extra: str = "",
+    background: bool = False,
 ) -> dict[str, AgentDefinition]:
     base_prompt = (
         "You are a background subagent. "
@@ -200,6 +201,16 @@ def build_agents(
     }
     if skills is not None:
         common_kwargs["skills"] = skills
+    # Wave-2 B-W2-1: explicitly pass background= so Q1 can measure both modes.
+    try:
+        _probe = AgentDefinition(
+            description="x", prompt="x", model=model, background=background
+        )
+        _probe_has_bg = getattr(_probe, "background", None) == background
+    except TypeError:
+        _probe_has_bg = False
+    if _probe_has_bg:
+        common_kwargs["background"] = background
     return {
         "general": AgentDefinition(**common_kwargs),
         "worker": AgentDefinition(
@@ -208,6 +219,7 @@ def build_agents(
             tools=tools,
             maxTurns=max_turns,
             model=model,
+            **({"background": background} if _probe_has_bg else {}),
         ),
     }
 
@@ -295,14 +307,21 @@ async def _run_query(
 
 
 async def test_q1_q2_q3() -> None:
-    """Spawn a `general` subagent; check background + Task-tool + message kinds."""
-    print(f"[{_ts()}] Q1/Q2/Q3: spawn background subagent")
+    """Spawn a `general` subagent; check background + Task-tool + message kinds.
+
+    Wave-2 re-run: `background=True` is now passed explicitly (previous v1
+    spike omitted it — see B-W2-1). We keep this probe's verdict on the
+    new background=True code path; `test_q1_background_compare` below
+    contrasts against `background=False` in a separate run.
+    """
+    print(f"[{_ts()}] Q1/Q2/Q3: spawn background subagent (background=True)")
     obs: dict[str, Any] = {}
     hooks = make_spy_hooks(obs, tag="q1")
     agents = build_agents(
         model="inherit",
         max_turns=4,
         tools=["Read"],  # narrow; subagent must answer mostly from knowledge
+        background=True,  # wave-2: explicit.
     )
     opts = ClaudeAgentOptions(
         cwd=str(CWD),
@@ -389,6 +408,98 @@ async def test_q1_q2_q3() -> None:
         "hook_observations": obs,
     }
     RESULTS["q5_transcript_flush"] = _analyse_q5(obs)
+
+
+async def test_q1_background_compare() -> None:
+    """Wave-2 B-W2-1 follow-up: compare background=True vs background=False
+    on the same prompt shape. Records:
+      * result_at (main ResultMessage)
+      * first_task_notification_at (child completes)
+      * main_finished_before_subagent bool
+
+    Uses a slightly larger child task (writes a 200-word paragraph) to
+    widen the gap and reduce timing noise.
+    """
+    print(f"[{_ts()}] Q1-BG: compare background=True vs background=False")
+    compare: dict[str, Any] = {}
+
+    async def _one_run(*, bg: bool) -> dict[str, Any]:
+        obs: dict[str, Any] = {}
+        hooks = make_spy_hooks(obs, tag=f"q1bg_{bg}")
+        agents = build_agents(
+            model="inherit",
+            max_turns=4,
+            tools=["Read"],
+            background=bg,
+        )
+        opts = ClaudeAgentOptions(
+            cwd=str(CWD),
+            setting_sources=None,
+            max_turns=5,
+            allowed_tools=["Task", "Read"],
+            hooks=hooks,
+            agents=agents,
+            system_prompt=(
+                "You coordinate background tasks. When the user asks you to "
+                "delegate, use the `general` agent via the Task tool. AS SOON "
+                "as the Task tool returns a task_id, reply with exactly "
+                "'dispatched' and STOP. Do NOT wait, summarise, or comment."
+            ),
+        )
+        prompt = (
+            "Use the `general` agent (Task tool) to write a detailed 200-word "
+            "paragraph about the history of bridges. After you invoke Task, "
+            "reply 'dispatched' and stop."
+        )
+        run: dict[str, Any] = {}
+        await _run_query(
+            user_prompt=prompt,
+            options=opts,
+            per_test_timeout_s=300.0,
+            record_into=run,
+        )
+        return {
+            "background_flag": bg,
+            "result_at": run.get("result_at"),
+            "first_task_notification_at": run.get("first_task_notification_at"),
+            "first_task_started_at": run.get("first_task_started_at"),
+            "main_finished_before_subagent": (
+                run["result_at"] < run["first_task_notification_at"]
+                if run.get("result_at") is not None
+                and run.get("first_task_notification_at") is not None
+                else None
+            ),
+            "wall_seconds": run.get("wall_seconds"),
+            "stop_events_count": len(obs.get("stop_events", [])),
+            "start_events_count": len(obs.get("start_events", [])),
+            "timeline_kinds": [e["kind"] for e in run["timeline"]],
+            "main_cost_usd": (run.get("result") or {}).get("cost_usd"),
+        }
+
+    try:
+        compare["bg_true"] = await _one_run(bg=True)
+    except Exception as e:
+        compare["bg_true"] = {"error": repr(e)}
+    try:
+        compare["bg_false"] = await _one_run(bg=False)
+    except Exception as e:
+        compare["bg_false"] = {"error": repr(e)}
+
+    # Verdict synthesis.
+    bt = compare.get("bg_true", {})
+    bf = compare.get("bg_false", {})
+    bg_true_non_blocking = bt.get("main_finished_before_subagent") is True
+    bg_false_non_blocking = bf.get("main_finished_before_subagent") is True
+    if bg_true_non_blocking and not bg_false_non_blocking:
+        verdict = "PASS_BACKGROUND_FREES_MAIN"
+    elif bg_true_non_blocking and bg_false_non_blocking:
+        verdict = "PASS_BUT_BG_NO_EFFECT"
+    elif not bg_true_non_blocking and not bg_false_non_blocking:
+        verdict = "FAIL_BG_BLOCKS_MAIN_TURN"  # same as v1 finding — flag has no effect
+    else:
+        verdict = "AMBIGUOUS"
+    compare["verdict"] = verdict
+    RESULTS["q1_background_compare"] = compare
 
 
 def _analyse_q5(obs: dict[str, Any]) -> dict[str, Any]:
@@ -915,6 +1026,7 @@ async def main() -> None:
     tests = [
         ("Q10 (construct-only)", test_q10_model_inherit),
         ("Q1/Q2/Q3 + Q5 combined", test_q1_q2_q3),
+        ("Q1-BG compare", test_q1_background_compare),
         ("Q9 prompt semantic", test_q9_prompt_semantic),
         ("Q11 skills field", test_q11_skills_field),
         ("Q12 session id", test_q12_session_id_stability),

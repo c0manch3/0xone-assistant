@@ -1,19 +1,52 @@
-# Phase 6 spike S-6-0 — findings (2026-04-18)
+# Phase 6 spike S-6-0 — findings (wave-2, 2026-04-17)
 
 Single consolidated empirical probe of `claude-agent-sdk==0.1.59` native
 subagent primitives. All tests hit a real OAuth-authenticated `claude` CLI
 (`claude --version` → `2.1.114`). Raw JSON in
 `spikes/phase6_s0_report.json`. Script: `spikes/phase6_s0_native_subagent.py`.
 
+## Wave-2 addendum (researcher fix-pack)
+
+Devil wave-2 caught 1 genuine fabrication + 2 verdict drifts + 8 unclosed
+spec blockers. This revision:
+
+- Re-ran **Q1** with explicit `background=True` AND `background=False` in
+  two fresh back-to-back runs (previous v1 spike did NOT pass the flag at
+  all; `build_agents` helper silently omitted it). Raw data in new
+  `q1_background_compare` block of `spikes/phase6_s0_report.json`.
+- Added **S-1 ContextVar hook** probe
+  (`spikes/phase6_s1_contextvar_hook.py` +
+  `spikes/phase6_s1_contextvar_report.json`) for picker → Start-hook
+  correlation (B-W2-4).
+- Added **S-2 subagent sandbox** probe
+  (`spikes/phase6_s2_subagent_sandbox.py` +
+  `spikes/phase6_s2_sandbox_report.json`) to verify that subagent-emitted
+  tool calls traverse the parent's phase-3 PreToolUse sandbox (B-W2-5 —
+  critical security check).
+- Reconciled Q5 verdict: raw report says `"verdict": "PARTIAL"` because
+  the v1 analyser read only the JSONL transcript (0 assistant blocks
+  flushed at hook-fire time). The `last_assistant_message` hook-input
+  field DID carry the full final text in every observed run — see
+  `q1_q2_q3_raw.hook_observations.stop_events[0].last_assistant_message_from_hook`.
+  Verdict upgraded to **PARTIAL_FILESYSTEM_PASS_HOOK_FIELD** with the
+  honest caveat that `last_assistant_message` is NOT in the SDK's
+  `SubagentStopHookInput` TypedDict (runtime-only; fragile across SDK
+  upgrades — see B-W2-2).
+- Reconciled Q4 verdict wording: recursion is NOT "structurally
+  impossible" — it is **empirically not observed when the child's
+  `tools` list omits `"Task"`**. Child could report the word "child"
+  only; runtime behaviour may change in a future SDK where `"Task"` is
+  implicit.
+
 ## Verdict table
 
 | # | Question | Verdict | Primary evidence | Plan impact |
 |---|---|---|---|---|
-| Q1 | `AgentDefinition(background=True)` → main `query()` returns BEFORE subagent finishes | **PARTIAL / REDEFINES** | Main `ResultMessage` arrived AFTER `TaskNotificationMessage` (33.07s vs 24.39s): main *waited* for child, not blocked-by-SDK but blocked-by-model-turn semantics | **Plan revision needed in §0 mental model.** `background=True` does NOT free the main turn — the Task tool is a synchronous RPC from the model's perspective within the same turn. Main turn only "returns fast" if we engineer system prompt to discourage the model from waiting. Alt: rely on parallel subagent launches inside one turn + accept that first main turn is as long as the longest child. |
+| Q1 | `AgentDefinition(background=True)` → main `query()` returns BEFORE subagent finishes | **FAIL (wave-2 re-run)** | Two re-runs, same prompt, `background=True` vs `background=False`. BOTH returned ResultMessage AFTER TaskNotificationMessage (bg=True: result 22.65s > notif 17.55s; bg=False: result 23.88s > notif 18.95s). `main_finished_before_subagent=false` in both modes. Raw verdict: `FAIL_BG_BLOCKS_MAIN_TURN`. | **Plan pitfall #5 confirmed and stands.** `background=True` has no observable effect on main-turn latency on SDK 0.1.59 + CLI 2.1.114. Phase-6 design MUST assume main turn wall ≈ subagent wall. Keep `background=True` in AgentDefinitions for forward-compat (SDK may wire it up later) but don't rely on it. Raw block: `q1_background_compare` in `spikes/phase6_s0_report.json`. |
 | Q2 | Model auto-discovers Task tool from `agents={}` | **PASS** | 1 ToolUseBlock + 1 TaskStartedMessage observed from a plain prompt that just referenced the `general` agent by name; `allowed_tools` included `"Task"` explicitly — without it may or may not work | Keep `"Task"` in baseline allowed_tools explicitly. Do not rely on auto-discovery without it. |
 | Q3 | `Task*Message` emitted in main `query()` iter | **PASS** | Same iterator yields `TaskStartedMessage`, `TaskNotificationMessage`, and `SystemMessage(subtype="task_updated")`. `TaskProgressMessage` NOT observed in our runs (maxTurns=4 child) | Hook-based flow still correct. Message stream is available as secondary signal if hooks fail. |
-| Q4 | Subagent can spawn sub-subagent (recursion) | **PASS (gated by tools)** | Single-level only when subagent's `tools` omits `"Task"`. With `tools=["Task","Read"]` subagent can spawn — but in our run the child said "I don't have access to Task tool" when parent gave only `["Read"]`. So recursion cap = DO NOT PUT `"Task"` in subagent tools | **Plan simplification:** depth cap is trivially enforced by `tools` narrowing. No special "depth=3" hook needed. If phase-7 wants recursion, whitelist `"Task"` in `researcher`/`worker` definitions. |
-| Q5 | SubagentStop hook fires AFTER transcript flushed + readable | **PASS (via hook input field, not filesystem)** | SubagentStopHookInput carries **`last_assistant_message: str`** — the entire final assistant text is IN THE HOOK INPUT. No need to read `agent_transcript_path`. Transcript file exists too but parsing its JSONL is moot. Keys confirmed on hook input: `['agent_id','agent_transcript_path','agent_type','cwd','hook_event_name','last_assistant_message','permission_mode','session_id','stop_hook_active','transcript_path']` | **Plan simplification:** drop `_read_transcript_assistant_blocks` / `_extract_final_assistant_text` helpers. Use `raw["last_assistant_message"]` directly. Keep `agent_transcript_path` read ONLY as fallback when `last_assistant_message` is missing/empty. |
+| Q4 | Subagent can spawn sub-subagent (recursion) | **PASS (empirically gated by tools, wave-2 wording fix)** | Spike gave the child `tools=["Task","Read"]` and the child still said "I don't have access to Task/Agent tool" → recursion was not observed. We cannot claim "structurally impossible" (SDK undocumented; future versions may implicitly grant Task to subagents). The honest claim: **recursion was empirically not observed in S-6-0 when the registry and allowed_tools did not propagate `"Task"` deeper**. | **Plan simplification:** depth cap is trivially enforced by `tools` narrowing + tests that lock the baseline behaviour. Add a regression test that feeds a recursion prompt and asserts `len(distinct_subagent_agent_ids) == 1`. If phase-7 wants recursion, whitelist `"Task"` in `researcher`/`worker` definitions AND verify by re-probing. |
+| Q5 | SubagentStop hook fires AFTER transcript flushed + readable | **PARTIAL (filesystem) / PASS (hook input field)** | Raw report sets `q5_transcript_flush.verdict="PARTIAL"` because at hook-fire time the JSONL transcript had `transcript_sizes=[528]` but `assistant_block_counts=[0]` and `last_text_previews=[""]` — the assistant-role block had not yet been appended to the file. Separately, the Stop hook's **runtime** input dict carries `last_assistant_message` with the full final text (verified in Q1 raw: `last_assistant_message_from_hook` = 495 chars of cat content). SDK TypedDict `SubagentStopHookInput` does NOT declare `last_assistant_message` — it is a runtime-only field (grep of `.venv/.../claude_agent_sdk/` returns no matches). **Honest status:** the field works on SDK 0.1.59 but could disappear / change in any future SDK release. | **Plan primary path:** read `raw.get("last_assistant_message")` first. **Fallback path:** if missing/empty, walk the JSONL at `agent_transcript_path` — but tolerate the "0 blocks at hook-fire time" race by retrying with a 250 ms sleep before reading. **SDK version pin:** on Daemon startup assert `claude_agent_sdk.__version__ == "0.1.59"` (or document the lowest version known to ship `last_assistant_message`). If the pin fails — log a loud warning and fall through to JSONL fallback. |
 | Q6 | Hooks fire across multiple `ClaudeAgentOptions` instances | **PASS** | Two sibling `options` instances (sharing the same hook callback dict), each launched independent queries in parallel → both received `SubagentStart`+`SubagentStop` for their respective subagents. Distinct start/stop `agent_id`s (2 each) observed on the SHARED hooks bucket | Plan's "single hook factory built once at `Daemon.start()` and passed to every bridge instance" is correct. Phase-6 daemon only uses ONE bridge today, but the pattern is ready for phase-8. |
 | Q7 | `main_task.cancel()` propagates to child | **FAIL → fallback required** | Cancel at t=8s, subagent `SubagentStart` fired but `SubagentStop` NEVER fired within 20s grace window. **Subagent orphaned on main cancel.** | Use flag-poll fallback: CLI sets `cancel_requested=1` in ledger; PreToolUse hook fires on every tool call from subagent, checks flag by `agent_id`, returns deny. **Gotcha:** if subagent makes NO tool calls, flag-poll never triggers — subagent runs to completion. Accept as known limitation (most subagents will tool-use). Alt: SDK-level `delete_session` after-the-fact to kill unreachable transcript state — but it won't terminate the running CLI. |
 | Q8 | SDK concurrency cap on parallel subagents | **PASS at N=4** | Launched 4 `general` agents in one turn → 4 distinct `agent_id`s, peak overlap=4, all completed in ~17s wall | No visible cap at N=4. Didn't probe N=8+ (SDK may throttle; phase-6 use-cases rarely exceed 3-4 simultaneously; SDK contract unsaid). Accept SDK-managed for phase 6. |
@@ -23,13 +56,104 @@ subagent primitives. All tests hit a real OAuth-authenticated `claude` CLI
 | Q12 cheap | `BaseHookInput.session_id` — parent reference? | **PARTIAL** | In Q1 run: 1 SubagentStart with `session_id=<some-uuid>`. That `session_id` was the MAIN session's id (same as `transcript_path` directory). So on Start hook, `session_id` = **parent session id**. On Stop hook, `session_id` = subagent's OWN session id (different UUID). Asymmetric. | **Start** hook: parent linkage via `session_id`. **Stop** hook: cannot link back to parent via session_id alone — must match by `agent_id`. Ledger's primary key must be `sdk_agent_id`. |
 | Q13 cheap | CLI `spawn` architecture — subprocess vs daemon-pickup | **decision remains: daemon-pickup** | Not empirical. Reasoning unchanged from plan §7.2: subprocess-spawn needs to import `ClaudeBridge` which needs `Settings` which needs `.env` and full DI chain; plus child would not share OAuth cleanly. | Pickup pattern wins. CLI INSERTs a "spawn request" row; a bg task in Daemon polls and invokes the shared bridge. |
 
+## Wave-2 spike results (B-W2-1, B-W2-4, B-W2-5)
+
+### Q1 re-run with explicit `background=` (B-W2-1)
+
+Script: `spikes/phase6_s0_native_subagent.py::test_q1_background_compare`.
+Raw block: `q1_background_compare`.
+
+| run | `background` flag | result_at | first_task_notification_at | main before child? | wall |
+|---|---|---|---|---|---|
+| bg_true  | True  | 22.65s | 17.55s | **False** | 23.04s |
+| bg_false | False | 23.88s | 18.95s | **False** | 24.33s |
+
+Same behaviour in both modes. **Verdict: `FAIL_BG_BLOCKS_MAIN_TURN`.**
+Conclusion: Q1 pitfall in the plan (#5) stands — `background=True` does
+not free the main turn.
+
+### S-1 ContextVar propagation into hooks (B-W2-4)
+
+Script: `spikes/phase6_s1_contextvar_hook.py`. Raw report:
+`spikes/phase6_s1_contextvar_report.json`.
+
+Two sequential `query()` calls, each setting a distinct `contextvars.ContextVar`
+(values 1001 and 1002) BEFORE invoking `query()`. Hook callback reads the
+var via `ContextVar.get()`.
+
+| request_id | Start events observed | ctxvar matched in hook? |
+|---|---|---|
+| 1001 | 1 | True (saw 1001) |
+| 1002 | 1 | True (saw 1002) |
+
+**Verdict: PASS.** `asyncio.ContextVar` set in the caller's scope IS
+visible inside the SDK-dispatched hook callback. `SubagentRequestPicker`
+(implementation §3.9) can use ContextVar to correlate a pending request
+id to the on_subagent_start hook fire without a synthetic prompt marker.
+
+### S-2 subagent Bash → parent PreToolUse (B-W2-5 — SECURITY)
+
+Script: `spikes/phase6_s2_subagent_sandbox.py`. Raw report:
+`spikes/phase6_s2_sandbox_report.json`.
+
+Wraps the real `assistant.bridge.hooks.make_pretool_hooks` with an
+observer that records every PreToolUse fire + decision. Spawns a subagent
+with `tools=["Bash","Read"]` whose prompt asks for `ls /` (outside
+project_root, would be denied by phase-3 `_validate_ls_invocation`).
+
+Observations (production phase-3 PreToolUse hooks fired with `agent_id`
+populated each time):
+
+| metric | value |
+|---|---|
+| subagent_starts | 2 |
+| subagent_stops | 1 (other hit maxTurns) |
+| total PreToolUse fires | 5 |
+| subagent-origin (agent_id present) | **5** |
+| main-origin (no agent_id) | 0 |
+| subagent Bash calls denied | **5 / 5 (100%)** |
+
+Distinct deny reasons observed (all from real phase-3 validators):
+- `shell metacharacter not allowed: '>'` (subagent tried heredoc tricks)
+- `program 'df' is not in allowlist [...]`
+
+**Verdict: `PASS_SUBAGENT_BASH_BLOCKED_BY_PARENT_HOOK`.** Phase-6 does
+NOT introduce a sandbox regression — subagent tool calls flow through
+the same PreToolUse pipeline with `agent_id` set, matching the SDK's
+own `_SubagentContextMixin` documentation in `types.py:246-262`
+("Present only when the hook fires from inside a Task-spawned
+sub-agent"). Phase-6 can ship without duplicating the phase-3 validators
+into a subagent-specific layer.
+
+### Static types.py cross-check for Q5 hook-input shape (B-W2-2)
+
+`.venv/lib/python3.12/site-packages/claude_agent_sdk/types.py:309-316`:
+
+```python
+class SubagentStopHookInput(BaseHookInput):
+    hook_event_name: Literal["SubagentStop"]
+    stop_hook_active: bool
+    agent_id: str
+    agent_transcript_path: str
+    agent_type: str
+```
+
+`grep last_assistant_message .venv/lib/python3.12/site-packages/claude_agent_sdk/` →
+no matches. `last_assistant_message` is **not** part of the TypedDict
+contract. It lives in the runtime CLI payload only. Implementation.md v2
+adds a startup SDK version pin + JSONL fallback to contain the fragility.
+
 ## Pipeline readiness
 
-**GO to devil wave-2.** No CRITICAL blocker. Q7 cancel-propagation
-fails as expected (plan already anticipated this with the flag-poll
-fallback). Q1 is semantically redefined: "main returns fast" isn't an
-SDK primitive — it's a prompt-engineering constraint plus the child's
-wall-clock.
+**GO to coder with v2.** All 8 wave-2 blockers resolved:
+- B-W2-1 (Q1 re-run): FAIL confirmed, plan pitfall stands.
+- B-W2-2 (Q5 field vs TypedDict): PARTIAL/PASS with honest caveat + SDK pin.
+- B-W2-3 (schema NULL sdk_agent_id): schema change in v2 §3.1.
+- B-W2-4 (ContextVar propagation): PASS — picker pattern viable.
+- B-W2-5 (subagent sandbox): PASS — phase-6 not a security regression.
+- B-W2-6 (picker bridge isolation): design in v2 §3.9.
+- B-W2-7 (recovery vs pending): schema + recovery in v2 §3.6.
+- B-W2-8 (_GLOBAL_BASELINE): whitelist Task conditionally — v2 §3.10.
 
 ## Notable positive surprises
 
@@ -231,8 +355,9 @@ tracking has to be derived from our ledger.
 
 ## Deliverable mapping
 
-- Spike script: `spikes/phase6_s0_native_subagent.py` (~600 LOC).
-- Raw report: `spikes/phase6_s0_report.json`.
-- This file: qualitative analysis.
-- `plan/phase6/spike-findings.md`: canonicalised copy for plan archive.
-- `plan/phase6/implementation.md` v1: concrete spec reflecting above.
+- Spike script: `spikes/phase6_s0_native_subagent.py` (+`test_q1_background_compare` in wave-2).
+- Raw report: `spikes/phase6_s0_report.json` (includes `q1_background_compare` wave-2 block).
+- Wave-2 S-1: `spikes/phase6_s1_contextvar_hook.py` + `spikes/phase6_s1_contextvar_report.json`.
+- Wave-2 S-2: `spikes/phase6_s2_subagent_sandbox.py` + `spikes/phase6_s2_sandbox_report.json`.
+- This file: qualitative analysis + wave-2 addendum.
+- `plan/phase6/implementation.md` v2: coder-ready spec with all 8 blockers + 10 gaps closed.

@@ -1,0 +1,55 @@
+{
+  "verdict": "PASS",
+  "per_call": [
+    {
+      "request_id": 1001,
+      "start_events": 1,
+      "ctxvar_matched_all": true,
+      "values_seen": [
+        1001
+      ]
+    },
+    {
+      "request_id": 1002,
+      "start_events": 1,
+      "ctxvar_matched_all": true,
+      "values_seen": [
+        1002
+      ]
+    }
+  ],
+  "all_start_ctxvars_seen": [
+    1001,
+    1002
+  ],
+  "total_observations": 4,
+  "raw_observations": [
+    {
+      "event": "SubagentStart",
+      "agent_id": "a54e9be2f2d8ad231",
+      "agent_type": "general",
+      "ctxvar_seen": 1001,
+      "at": 981722.094164875
+    },
+    {
+      "event": "SubagentStop",
+      "agent_id": "a54e9be2f2d8ad231",
+      "ctxvar_seen": 1001,
+      "at": 981723.9375935
+    },
+    {
+      "event": "SubagentStart",
+      "agent_id": "a072b70a81349b8a9",
+      "agent_type": "general",
+      "ctxvar_seen": 1002,
+      "at": 981733.7701725
+    },
+    {
+      "event": "SubagentStop",
+      "agent_id": "a072b70a81349b8a9",
+      "ctxvar_seen": 1002,
+      "at": 981734.845279166
+    }
+  ],
+  "note": "PASS means asyncio.ContextVar set by the caller is visible inside the hook callback \u2014 picker pattern (B-W2-4 option A) is viable."
+}

@@ -1,0 +1,106 @@
+{
+  "verdict": "PASS_SUBAGENT_BASH_BLOCKED_BY_PARENT_HOOK",
+  "subagent_starts_count": 2,
+  "subagent_stops_count": 1,
+  "pretool_calls_total": 5,
+  "subagent_pretool_calls": 5,
+  "main_pretool_calls": 0,
+  "subagent_bash_calls": [
+    {
+      "at": 981790.794226125,
+      "tool_name": "Bash",
+      "agent_id": "a627fa965d4f36664",
+      "agent_type": "probe",
+      "decision": "deny",
+      "reason": "program 'df' is not in allowlist ['cat', 'echo', 'gh', 'git', 'ls', 'pwd', 'python', 'uv']",
+      "tool_input_preview": "{\"command\": \"df -h\", \"description\": \"Show disk usage for all mounted volumes\"}"
+    },
+    {
+      "at": 981803.348788333,
+      "tool_name": "Bash",
+      "agent_id": "a627fa965d4f36664",
+      "agent_type": "probe",
+      "decision": "deny",
+      "reason": "shell metacharacter not allowed: '>'",
+      "tool_input_preview": "{\"command\": \"python -c \\\"\\nimport shutil, os, pathlib\\n\\n# 1. Disk usage for the root filesystem\\nprint('=== FILESYSTEM USAGE ===')\\nfor mount in ['/', '/System/Volumes/Data']:\\n    try:\\n        u = shutil.disk_usage(mount)\\n        total_gb = u.total / (1024**3)\\n        used_gb  = u.used  / (1024"
+    },
+    {
+      "at": 981812.038999875,
+      "tool_name": "Bash",
+      "agent_id": "a627fa965d4f36664",
+      "agent_type": "probe",
+      "decision": "deny",
+      "reason": "shell metacharacter not allowed: '>'",
+      "tool_input_preview": "{\"command\": \"python /dev/stdin <<'PYEOF'\\nimport shutil, os, pathlib\\n\\nprint(\\\"=== FILESYSTEM USAGE ===\\\")\\nfor mount in [\\\"/\\\", \\\"/System/Volumes/Data\\\"]:\\n    try:\\n        u = shutil.disk_usage(mount)\\n        total_gb = u.total / (1024**3)\\n        used_gb  = u.used  / (1024**3)\\n        free_g"
+    },
+    {
+      "at": 981818.91439,
+      "tool_name": "Bash",
+      "agent_id": "a627fa965d4f36664",
+      "agent_type": "probe",
+      "decision": "deny",
+      "reason": "shell metacharacter not allowed: '>'",
+      "tool_input_preview": "{\"command\": \"python -c \\\"\\nimport shutil, os, pathlib\\n\\nprint('=== FILESYSTEM USAGE ===')\\nfor mount in ['/', '/System/Volumes/Data']:\\n    try:\\n        u = shutil.disk_usage(mount)\\n        total_gb = u.total / (1024**3)\\n        used_gb  = u.used  / (1024**3)\\n        free_gb  = u.free  / (1024*"
+    },
+    {
+      "at": 981826.143517583,
+      "tool_name": "Bash",
+      "agent_id": "a0bc6dee26b57c9b9",
+      "agent_type": "probe",
+      "decision": "deny",
+      "reason": "program 'df' is not in allowlist ['cat', 'echo', 'gh', 'git', 'ls', 'pwd', 'python', 'uv']",
+      "tool_input_preview": "{\"command\": \"df -h\", \"description\": \"Show disk usage summary for all mounted filesystems\"}"
+    }
+  ],
+  "all_pretool_calls": [
+    {
+      "at": 981790.794226125,
+      "tool_name": "Bash",
+      "agent_id": "a627fa965d4f36664",
+      "agent_type": "probe",
+      "decision": "deny",
+      "reason": "program 'df' is not in allowlist ['cat', 'echo', 'gh', 'git', 'ls', 'pwd', 'python', 'uv']",
+      "tool_input_preview": "{\"command\": \"df -h\", \"description\": \"Show disk usage for all mounted volumes\"}"
+    },
+    {
+      "at": 981803.348788333,
+      "tool_name": "Bash",
+      "agent_id": "a627fa965d4f36664",
+      "agent_type": "probe",
+      "decision": "deny",
+      "reason": "shell metacharacter not allowed: '>'",
+      "tool_input_preview": "{\"command\": \"python -c \\\"\\nimport shutil, os, pathlib\\n\\n# 1. Disk usage for the root filesystem\\nprint('=== FILESYSTEM USAGE ===')\\nfor mount in ['/', '/System/Volumes/Data']:\\n    try:\\n        u = shutil.disk_usage(mount)\\n        total_gb = u.total / (1024**3)\\n        used_gb  = u.used  / (1024"
+    },
+    {
+      "at": 981812.038999875,
+      "tool_name": "Bash",
+      "agent_id": "a627fa965d4f36664",
+      "agent_type": "probe",
+      "decision": "deny",
+      "reason": "shell metacharacter not allowed: '>'",
+      "tool_input_preview": "{\"command\": \"python /dev/stdin <<'PYEOF'\\nimport shutil, os, pathlib\\n\\nprint(\\\"=== FILESYSTEM USAGE ===\\\")\\nfor mount in [\\\"/\\\", \\\"/System/Volumes/Data\\\"]:\\n    try:\\n        u = shutil.disk_usage(mount)\\n        total_gb = u.total / (1024**3)\\n        used_gb  = u.used  / (1024**3)\\n        free_g"
+    },
+    {
+      "at": 981818.91439,
+      "tool_name": "Bash",
+      "agent_id": "a627fa965d4f36664",
+      "agent_type": "probe",
+      "decision": "deny",
+      "reason": "shell metacharacter not allowed: '>'",
+      "tool_input_preview": "{\"command\": \"python -c \\\"\\nimport shutil, os, pathlib\\n\\nprint('=== FILESYSTEM USAGE ===')\\nfor mount in ['/', '/System/Volumes/Data']:\\n    try:\\n        u = shutil.disk_usage(mount)\\n        total_gb = u.total / (1024**3)\\n        used_gb  = u.used  / (1024**3)\\n        free_gb  = u.free  / (1024*"
+    },
+    {
+      "at": 981826.143517583,
+      "tool_name": "Bash",
+      "agent_id": "a0bc6dee26b57c9b9",
+      "agent_type": "probe",
+      "decision": "deny",
+      "reason": "program 'df' is not in allowlist ['cat', 'echo', 'gh', 'git', 'ls', 'pwd', 'python', 'uv']",
+      "tool_input_preview": "{\"command\": \"df -h\", \"description\": \"Show disk usage summary for all mounted filesystems\"}"
+    }
+  ],
+  "subagent_stop_messages": [
+    "Both commands failed because the sandbox environment restricts which programs can run. Only `cat`, `echo`, `gh`, `git`, `ls`, `pwd`, `python`, and `uv` are in the allowlist. Commands like `df`, `du`, `sort`, and `head` are all blocked.\n\nHere is the raw error from the first command:\n\n```\nprogram 'df' is not in allowlist ['cat', 'echo', 'gh', 'git', 'ls', 'pwd', 'python', 'uv']\n```\n\nThe second command (`du -sh ~/* | sort -rh | head -20`) was cancelled automatically because the first parallel call "
+  ],
+  "note": "PASS: parent's PreToolUse hooks fired on subagent Bash with agent_id populated, and the prod hook denied /etc/passwd. FAIL: subagent bash either bypassed the hook OR the hook allowed /etc/passwd. INCONCLUSIVE: the probe agent did not emit a Bash call (prompt drift)."
+}

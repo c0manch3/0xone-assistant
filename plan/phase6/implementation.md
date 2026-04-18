@@ -1,21 +1,59 @@
-# Phase 6 — Implementation (spike-verified, v1, 2026-04-18)
+# Phase 6 — Implementation (spike-verified, v2, 2026-04-17)
 
 Thin layer над SDK-native primitives `AgentDefinition` +
 `SubagentStart/SubagentStop` hooks. Все ключевые допущения плана
-прошли через S-6-0 (см. `plan/phase6/spike-findings.md` и
-`spikes/phase6_s0_report.json`). Никаких blocker'ов — есть 3
-redefined допущения и 1 expected fallback.
+прошли через S-6-0 + wave-2 re-probes (см. `plan/phase6/spike-findings.md`,
+`spikes/phase6_s0_report.json`, `spikes/phase6_s1_contextvar_report.json`,
+`spikes/phase6_s2_sandbox_report.json`).
 
 ## Revision history
 
 - **v1** (2026-04-18, after S-6-0): initial coder-ready spec.
+- **v2** (2026-04-17, researcher fix-pack — wave-2):
+  - B-W2-1 Q1 re-run with explicit `background=True`/`False` confirms
+    FAIL (no difference); pitfall #5 stands.
+  - B-W2-2 `last_assistant_message` not in SDK TypedDict → add SDK
+    version pin assertion + honest JSONL fallback with 250 ms retry.
+  - B-W2-3 `sdk_agent_id` becomes NULLable with partial UNIQUE index
+    (option A) — pending rows carry NULL until picker dispatches.
+  - B-W2-4 ContextVar propagation empirically PASS (S-1) → picker
+    correlates pending request → Start hook via `ContextVar`.
+  - B-W2-5 subagent Bash empirically hits parent's PreToolUse sandbox
+    with `agent_id` populated (S-2, 5/5 denied) → no phase-3 regression.
+  - B-W2-6 picker bridge instance is SEPARATE from user-chat bridge →
+    no semaphore contention; Q6 cross-bridge PASS guarantees shared
+    SubagentStop hook still notifies.
+  - B-W2-7 recovery adds `'requested'` status for pre-picker rows +
+    1-hour stale drop.
+  - B-W2-8 `_GLOBAL_BASELINE` conditionally extended with `"Task"` when
+    `self._agents` present (option A); unit test locks the shape.
+  - GAP #9 `sdk_session_id` column dropped (asymmetry confirmed in raw).
+  - GAP #10 Q4 wording softened: "empirically not observed with these
+    tool lists" (not "structurally impossible"); regression test added.
+  - GAP #11 `cost_usd` remains NULL for phase 6 with documented reason;
+    `TaskNotificationMessage.usage` lookup deferred to phase-9.
+  - GAP #12 hook `await shield` pattern flipped — hook returns `{}`
+    immediately, shielded delivery task registered to
+    `pending_updates`; Daemon drain awaits.
+  - GAP #13 cancel-orphan post-restart — document ps-sweep + boot warn.
+  - GAP #14 `_validate_task_argv` full spec inline (mirrors schedule).
+  - GAP #15 throttle dict bounded to 64 entries with LRU eviction.
+  - GAP #16 v4 migration `PRAGMA user_version = 4` comment on
+    forward-compat (no column rename; add-only).
+  - GAP #17 picker-starvation integration test added to §8.2.
+  - GAP #18 `test_subagent_e2e.py` gated by `RUN_SDK_INT=1` environment
+    variable (same pattern as phase-5 `tests/test_scheduler_e2e_sdk.py`).
 
 Empirical backing:
 - `spikes/phase6_s0_native_subagent.py` — одна orchestrator-script, 8
-  subtests + 5 cheap probes.
-- `spikes/phase6_s0_report.json` — raw observations.
-- `spikes/phase6_s0_findings.md` / `plan/phase6/spike-findings.md` —
-  verdicts and per-Q analysis.
+  subtests + 5 cheap probes + wave-2 `test_q1_background_compare`.
+- `spikes/phase6_s0_report.json` — raw observations (includes
+  `q1_background_compare`).
+- `spikes/phase6_s1_contextvar_hook.py` — ContextVar hook propagation
+  (wave-2 B-W2-4).
+- `spikes/phase6_s2_subagent_sandbox.py` — subagent PreToolUse sandbox
+  traversal (wave-2 B-W2-5, CRITICAL security probe).
+- `plan/phase6/spike-findings.md` — verdicts and per-Q analysis.
 
 Companion docs (coder **must** read before starting):
 - `plan/phase6/description.md` — E2E scenarios.
@@ -29,48 +67,65 @@ Subagents inherit the parent's auth via SDK.
 
 ---
 
-## 0. Pitfall box (MUST READ)
+## 0. Pitfall box (MUST READ) — updated wave-2
 
 Things the coder absolutely MUST NOT do. Each item either comes from
-S-6-0 (spike evidence) or phase-5 hard-won lessons (see
+S-6-0 / S-1 / S-2 (spike evidence) or phase-5 hard-won lessons (see
 `plan/phase5/summary.md` §7).
 
-1. **DO NOT** parse `agent_transcript_path` to extract subagent's reply
-   text. S-6-0 Q5 confirmed `SubagentStopHookInput["last_assistant_message"]`
-   carries the final assistant text as a plain string. Use the hook field
-   directly; transcript-read is FALLBACK ONLY (when the string is empty
-   or missing).
+1. **DO NOT** rely on `SubagentStopHookInput["last_assistant_message"]`
+   as a contract — it is NOT declared on the SDK TypedDict (see
+   `.venv/.../claude_agent_sdk/types.py:309-316`; wave-2 confirmed grep
+   returns zero matches for `last_assistant_message` in the SDK
+   package). On SDK 0.1.59 + CLI 2.1.114 the field IS present at runtime
+   with the full final text. Implementation: read `raw.get("last_assistant_message")`
+   FIRST; on empty/missing, retry once after a 250 ms sleep against the
+   JSONL at `agent_transcript_path` (the fallback handles both a
+   future SDK dropping the field AND the real race where v1 analyser
+   saw `assistant_blocks_in_transcript=[0]` at hook-fire). Also: startup
+   assertion `assert claude_agent_sdk.__version__ == "0.1.59"` with a
+   loud log-only downgrade path (do not crash) if the pin fails — see
+   §3.12 `Daemon.start`.
 2. **DO NOT** add a "depth cap deny" handler in `SubagentStart` that
-   returns `additionalContext`. S-6-0 Q4: depth is gated by the child's
-   own `tools` list — if `AgentDefinition(tools=[...])` omits `"Task"`,
-   recursion is structurally impossible. Just don't include `"Task"` in
-   `general`/`worker`/`researcher` definitions for phase 6.
+   returns `additionalContext`. S-6-0 Q4: empirically no recursion
+   observed when the child's `tools` omits `"Task"`. Lock with a
+   regression test (`test_subagent_no_recursion_when_task_absent`) that
+   runs the real S-6-0 Q4 prompt and asserts exactly one distinct
+   `agent_id` across all Start events. The wording "structurally
+   impossible" was softened in wave-2 — future SDKs may change this.
 3. **DO NOT** rely on `main_task.cancel()` to kill a subagent. S-6-0 Q7:
    orphan. Use PreToolUse flag-poll: hook reads `cancel_requested=1` from
    `subagent_jobs` keyed on `agent_id` → returns deny → subagent
    stack unwinds on its next tool call. If subagent uses NO tools, flag
-   has no effect. Accept and document.
+   has no effect. Accept and document. **Post-restart ps-sweep** (GAP
+   #13): on Daemon.stop, iterate `ps aux | grep claude` (stdlib
+   subprocess, no extra deps) and warn if orphan PIDs; on Daemon.start,
+   emit a one-line warn if `recover_orphans` transitioned any rows.
 4. **DO NOT** key the ledger on `session_id` from SubagentStart hook.
-   S-6-0 Q12: on Start, `session_id` is the parent's session; on Stop,
-   `session_id` is the subagent's own session. Asymmetric. Key
-   `subagent_jobs.sdk_agent_id` (UNIQUE) — stable across both hooks.
+   S-6-0 Q12 raw: `all_equal=true` across Start events — on Start,
+   `session_id` is the parent's session; on Stop, `session_id` is the
+   subagent's own session. Asymmetric. Key `subagent_jobs.sdk_agent_id`
+   (NULLable, partial UNIQUE — see §3.1 wave-2). **GAP #9:**
+   `sdk_session_id` column kept in schema but NOT used for matching —
+   stored purely for forensic access.
 5. **DO NOT** expect main `query()` iterator to finish "in ~3 sec" for
-   E2E scenario 1. S-6-0 Q1: main ResultMessage arrived AFTER subagent
-   TaskNotification. The Task tool is a synchronous RPC within the
-   parent's turn — main `query()` stays open until the child ends. Plan
-   description scenarios 1+2 are semantically REAL (child work happens
-   in a separate session), but main turn wall ≈ subagent wall. Notify
-   pushes through the hook during child's stop, so the OWNER sees result
-   "later" regardless.
+   E2E scenario 1. S-6-0 Q1 AND wave-2 Q1-BG re-run BOTH show main
+   `ResultMessage` arriving AFTER subagent `TaskNotificationMessage`.
+   `background=True` flag has NO observable effect on SDK 0.1.59. The
+   Task tool is a synchronous RPC within the parent's turn — main
+   `query()` stays open until the child ends. Notify pushes through the
+   hook during child's stop, so the OWNER sees the result via Telegram
+   at child completion; main turn reply is secondary. **Keep
+   `background=True` in `AgentDefinition` for forward-compat** but base
+   design on "main turn wall ≈ subagent wall".
 6. **DO NOT** attach `"Task"` tool to the subagent's own `tools` list
    (= prevents recursion). Keep `"Task"` only in MAIN turn's
-   `allowed_tools`.
-7. **DO NOT** forget `asyncio.shield` on `adapter.send_text` inside
-   `on_subagent_stop` hook — phase-5 lesson (B-W2-3, HIGH #5): if
-   `Daemon.stop()` cancels the dispatching task mid-send, the DB UPDATE
-   / adapter call get cancelled and the ledger desyncs. Use the same
-   `pending_updates: set[asyncio.Task]` + `shield` pattern as
-   `SchedulerDispatcher`.
+   `allowed_tools`. Regression test locks this (pitfall #2).
+7. **DO NOT** `await asyncio.shield(task)` inside the hook body — that
+   blocks the SDK iterator. **GAP #12 wave-2 fix:** hook registers the
+   delivery task in the shared `pending_updates: set` and returns `{}`
+   immediately. `Daemon.stop()` drains `pending_updates` with a
+   timeout. See §3.8 `on_subagent_stop`.
 8. **DO NOT** open a second aiosqlite connection for `SubagentStore`.
    Reuse `ConversationStore.conn` + `ConversationStore.lock` — phase-5
    pattern (S-1 verified contention).
@@ -79,21 +134,23 @@ S-6-0 (spike evidence) or phase-5 hard-won lessons (see
    Python (phase-5 G-W2-6). `rowcount=0` → log skew, don't raise.
 10. **DO NOT** treat `SubagentStop` as at-least-once like phase-5
     triggers. Each subagent fires start + stop exactly once per SDK
-    contract (S-6-0 confirms 1:1 in all observed runs). UNIQUE
-    constraint on `sdk_agent_id` handles the edge case where a hook
-    somehow fires twice for the same agent_id.
+    contract (S-6-0 confirms 1:1 in all observed runs). Partial UNIQUE
+    on `sdk_agent_id WHERE sdk_agent_id IS NOT NULL` handles the edge
+    case where a hook somehow fires twice for the same agent_id while
+    allowing multiple pending (`sdk_agent_id IS NULL`) rows.
 11. **DO NOT** import `claude_agent_sdk.HookMatcher` at module top of
     `subagent/hooks.py` — follow `bridge/hooks.py::make_pretool_hooks`
     pattern (lazy import inside factory). Keeps validator modules pure.
 12. **DO NOT** block inside hook callbacks for more than ~500 ms. Hooks
     run inside the SDK's iterator loop; stalling them blocks the main
-    `query()` iterator. Use `_spawn_bg(adapter.send_text(...), name=...)`
-    from a reference held at hook factory construction; the hook itself
-    only INSERTs the ledger row + creates the shielded delivery task.
+    `query()` iterator. The hook only INSERTs the ledger row + creates
+    the shielded delivery task and RETURNS — drain runs in the parent
+    event loop outside the hook.
 13. **DO NOT** pass `allowed_tools=[...]` without `"Task"` to the main
     turn's `ClaudeAgentOptions`. S-6-0 Q2: we included it explicitly and
-    observed usage; omitting it is untested (plan detailed §2.1 Q2
-    fallback remains documented).
+    observed usage; omitting it is untested. **Wave-2 B-W2-8:** extend
+    `_GLOBAL_BASELINE` to include `"Task"` ONLY when `self._agents` is
+    non-empty (see §3.10). Unit test `test_allowed_tools_includes_task_when_agents_registered`.
 14. **DO NOT** use `setting_sources=["project"]` and expect subagents to
     inherit only a subset of project settings. S-6-0 did not verify
     which `settings.json` policies flow to subagents. Document: subagent
@@ -102,6 +159,20 @@ S-6-0 (spike evidence) or phase-5 hard-won lessons (see
 15. **DO NOT** emit the notify footer with `kind=<raw agent_type>` if
     `agent_type` contains non-Telegram-safe chars. `_format_notification`
     must Markdown-escape kind/status inline.
+16. **DO NOT** use a shared `ClaudeBridge` instance for both user turns
+    and `SubagentRequestPicker` dispatch (wave-2 B-W2-6). Each bridge
+    has its own `asyncio.Semaphore(max_concurrent)`; a picker flood can
+    starve user-chat turns. `Daemon.start` builds TWO bridges sharing
+    the SAME `extra_hooks` + `agents` dict: `bridge` (for
+    `ClaudeHandler`) and `picker_bridge` (for `SubagentRequestPicker`).
+    Q6 PASS guarantees cross-bridge SubagentStop still fires, so notify
+    works from either bridge. See §3.12.
+17. **DO NOT** assume subagent Bash bypasses phase-3 sandbox. **S-2
+    wave-2 verified:** all 5 subagent Bash calls hit parent's
+    `make_pretool_hooks` PreToolUse callback with `agent_id` populated
+    and were denied by real phase-3 validators. Cite S-2 in the
+    commit-6 test suite — don't delete phase-3 hooks expecting
+    duplication.
 
 ---
 
@@ -155,43 +226,63 @@ For commits 1, 2, 5, 6, 7: implementation + tests together.
 
 ## 3. Per-file signature specs
 
-### 3.1 `src/assistant/state/migrations/0004_subagent.sql` (commit 1)
+### 3.1 `src/assistant/state/migrations/0004_subagent.sql` (commit 1) — updated wave-2
 
-Verbatim SQL. S-6-0 confirms `sdk_agent_id` as stable primary key across
-Start+Stop (Q12). `depth INTEGER DEFAULT 0` is documentation only — we
-don't enforce depth in hook (see pitfall #2); kept for audit.
+**Wave-2 changes (B-W2-3, B-W2-7, GAP #9, GAP #16):**
+- `sdk_agent_id` is now `TEXT` (nullable) with a **partial UNIQUE index**
+  `WHERE sdk_agent_id IS NOT NULL` — lets CLI-pre-created rows carry
+  NULL until the picker dispatches; UNIQUE still prevents double-fire.
+- New status `'requested'` for CLI-pre-created rows (picker hasn't
+  claimed yet). State machine: `requested → started → (completed |
+  failed | stopped | interrupted | error | dropped)`.
+- `sdk_session_id` column kept but NOT used for matching (GAP #9 — it
+  is asymmetric between Start/Stop hooks). Stored for forensic access
+  only.
+- Add-only migration; future column bumps go in `0005_*.sql` (GAP #16
+  forward-compat comment on PRAGMA line).
 
 ```sql
--- 0004_subagent.sql — phase 6 (SDK-native subagent ledger)
+-- 0004_subagent.sql — phase 6 (SDK-native subagent ledger, wave-2)
 
 CREATE TABLE IF NOT EXISTS subagent_jobs (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    sdk_agent_id      TEXT    NOT NULL UNIQUE,
-    sdk_session_id    TEXT,                             -- subagent's own session_id (from Stop hook)
+    -- sdk_agent_id is NULL for pre-picker rows; filled by Start hook /
+    -- picker.update_sdk_agent_id. Partial UNIQUE index below prevents
+    -- duplicates only among non-NULL values.
+    sdk_agent_id      TEXT,
+    sdk_session_id    TEXT,                             -- subagent's own session_id (from Stop hook) — forensic only, see GAP #9
     parent_session_id TEXT,                             -- parent session_id (from Start hook)
     agent_type        TEXT    NOT NULL,                 -- 'general' | 'worker' | 'researcher'
-    task_text         TEXT,                             -- nullable for native-Task spawn (we don't see user prompt)
+    task_text         TEXT,                             -- populated for CLI/picker flow; NULL for native-Task main-turn spawn
     transcript_path   TEXT,                             -- agent_transcript_path from Stop hook
+    -- status machine: requested → started → (completed|failed|stopped|interrupted|error|dropped)
     status            TEXT    NOT NULL DEFAULT 'started',
     cancel_requested  INTEGER NOT NULL DEFAULT 0,
     result_summary    TEXT,                             -- first 500 chars of last_assistant_message
-    cost_usd          REAL,                             -- nullable; reserved for phase-9 accounting
+    cost_usd          REAL,                             -- nullable; reserved for phase-9 accounting (GAP #11)
     callback_chat_id  INTEGER NOT NULL,                 -- always OWNER_CHAT_ID for phase 6
     spawned_by_kind   TEXT    NOT NULL,                 -- 'user' | 'scheduler' | 'cli'
     spawned_by_ref    TEXT,                             -- schedule_id on scheduler spawns; null otherwise
-    depth             INTEGER NOT NULL DEFAULT 0,       -- always 0 in phase 6 (structural cap)
+    depth             INTEGER NOT NULL DEFAULT 0,       -- always 0 in phase 6 (see pitfall #2 + regression test)
     created_at        TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
     started_at        TEXT,                             -- set on SubagentStart hook fire
     finished_at       TEXT                              -- set on SubagentStop hook fire
 );
-CREATE INDEX IF NOT EXISTS idx_subagent_jobs_status_started ON subagent_jobs(status, started_at);
-CREATE INDEX IF NOT EXISTS idx_subagent_jobs_agent_id      ON subagent_jobs(sdk_agent_id);
 
+-- Partial UNIQUE — only non-NULL sdk_agent_id values must be unique
+-- (SQLite 3.8+ syntax). Pending CLI rows carry NULL with no conflict.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_subagent_jobs_sdk_agent_id_uq
+    ON subagent_jobs(sdk_agent_id) WHERE sdk_agent_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_subagent_jobs_status_started ON subagent_jobs(status, started_at);
+CREATE INDEX IF NOT EXISTS idx_subagent_jobs_status_created ON subagent_jobs(status, created_at);
+
+-- Forward compat (GAP #16): future schema bumps use 0005_*.sql; do not
+-- rename columns here — add-only.
 PRAGMA user_version = 4;
 ```
 
-Allowed `status` values: `'started'`, `'completed'`, `'failed'`,
-`'stopped'`, `'interrupted'`, `'error'`.
+Allowed `status` values: `'requested'`, `'started'`, `'completed'`,
+`'failed'`, `'stopped'`, `'interrupted'`, `'error'`, `'dropped'`.
 
 ### 3.2 `src/assistant/state/db.py` edits (commit 1)
 
@@ -370,10 +461,12 @@ def build_agents(settings: Settings) -> dict[str, AgentDefinition]:
     }
 ```
 
-### 3.6 `src/assistant/subagent/store.py` (commit 3)
+### 3.6 `src/assistant/subagent/store.py` (commit 3) — updated wave-2
 
 Signatures (full implementation follows phase-5 `SchedulerStore` style,
-all mutations under `async with self._lock`):
+all mutations under `async with self._lock`). Wave-2 changes: picker
+methods, recovery by age bucket, `claim_pending_request` simplified
+(sdk_agent_id stays NULL until Start hook fires with real id).
 
 ```python
 from dataclasses import dataclass
@@ -411,8 +504,10 @@ class SubagentStore:
     pitfall #8 / phase-5 S-1). All mutations `async with lock`.
 
     Status machine:
-        started → (completed | failed | stopped | interrupted | error)
+        requested → started → (completed | failed | stopped |
+                               interrupted | error | dropped)
     `stopped` only if cancel_requested=1 at terminal time.
+    `dropped` only from `requested` via recover_orphans (>1h stale).
     """
 
     def __init__(self, conn: aiosqlite.Connection, *, lock: asyncio.Lock) -> None: ...
@@ -425,18 +520,16 @@ class SubagentStore:
         agent_type: str,
         task_text: str,
         callback_chat_id: int,
-        spawned_by_kind: str,
+        spawned_by_kind: str,             # 'cli' | 'scheduler'
         spawned_by_ref: str | None = None,
     ) -> int:
-        """INSERT a pending request for SubagentRequestPicker pickup.
+        """INSERT a pre-picker request row.
 
-        Used by `tools/task/main.py spawn` — row has status='started' but
-        sdk_agent_id is NULL (filled in by on_subagent_start hook when
-        picker dispatches it through ClaudeBridge).
+        Used by `tools/task/main.py spawn` — row has `status='requested'`
+        AND `sdk_agent_id IS NULL` (partial UNIQUE tolerates). Picker
+        consumes these via `list_pending_requests` + `claim_pending_request`.
 
-        **Phase-6 simplification:** CLI spawn pre-creates a row with
-        `sdk_agent_id=NULL`; picker dispatches; Start hook matches by
-        spawned_by_ref=request_id and patches the agent_id. See §4.3.
+        Returns the auto-increment id so CLI prints `{"job_id": N, "status": "pending"}`.
         """
 
     async def record_started(
@@ -449,11 +542,30 @@ class SubagentStore:
         spawned_by_kind: str,
         spawned_by_ref: str | None,
     ) -> int:
-        """INSERT (or patch pending) — idempotent on `sdk_agent_id`.
+        """INSERT a NEW row for on_subagent_start hook fire (native Task
+        spawn, no pre-picker pending row). Status='started'. Caller
+        calls `update_sdk_agent_id_for_claimed_request` INSTEAD of this
+        method when the hook is known to match a picker-claimed row
+        (via ContextVar correlation — see §3.9).
 
-        SQL: `INSERT ... ON CONFLICT(sdk_agent_id) DO UPDATE SET
-        started_at=excluded.started_at, status='started'`. Returns
-        auto-increment id. Status-precondition N/A on insert.
+        SQL: plain `INSERT`. Partial UNIQUE blocks double-start on the
+        same `sdk_agent_id` — on `IntegrityError` log skew and return
+        the existing row's id.
+        """
+
+    async def update_sdk_agent_id_for_claimed_request(
+        self,
+        *,
+        job_id: int,
+        sdk_agent_id: str,
+        parent_session_id: str | None,
+    ) -> bool:
+        """Status-precondition UPDATE: set sdk_agent_id + status='started'
+        + parent_session_id + started_at=NOW
+        WHERE id=? AND status='requested'.
+
+        Returns True on row updated. Used by on_subagent_start when
+        ContextVar says "this is a picker-claimed request".
         """
 
     async def record_finished(
@@ -475,10 +587,13 @@ class SubagentStore:
     # ---------- cancel ----------
 
     async def set_cancel_requested(self, job_id: int) -> dict[str, str | bool]:
-        """UPDATE cancel_requested=1 WHERE id=? AND status='started'.
+        """UPDATE cancel_requested=1 WHERE id=? AND status IN ('requested','started').
 
         Returns `{"cancel_requested": True, "previous_status": <str>}`
-        or `{"already_terminal": <str>}`.
+        or `{"already_terminal": <str>}`. A `requested`-status row that
+        is cancelled before the picker picks it up transitions to
+        `dropped` at the next recover_orphans pass OR at picker claim
+        time (picker MUST check `cancel_requested` before dispatch).
         """
 
     async def is_cancel_requested(self, sdk_agent_id: str) -> bool:
@@ -490,12 +605,22 @@ class SubagentStore:
 
     # ---------- recovery ----------
 
-    async def recover_orphans(self) -> int:
-        """UPDATE status='interrupted', finished_at=NOW
-        WHERE status='started' AND finished_at IS NULL.
+    async def recover_orphans(self, *, stale_requested_after_s: int = 3600) -> dict[str, int]:
+        """Four-branch transition run ONCE at Daemon.start BEFORE picker
+        or bridge accept new turns. Returns counts per branch.
 
-        Run ONCE at Daemon.start() BEFORE bridge accepts new turns
-        (invariant §17 detailed-plan). Returns rowcount.
+          * `status='started' AND finished_at IS NULL` → `'interrupted'`
+            (prior daemon crashed mid-subagent-run).
+          * `status='requested' AND created_at < now - stale_requested_after_s`
+            → `'dropped'` (CLI insert never picked up before restart).
+          * `status='requested' AND created_at >= now - stale_requested_after_s`
+            → **leave as-is** (picker will pick up after start-up).
+          * `status='started' AND sdk_agent_id IS NULL`
+            → `'dropped'` (defensive — should not occur; picker claim
+            never patched agent_id before crash).
+
+        Returns `{"interrupted": N1, "dropped": N2}`. Caller
+        (Daemon.start) emits a single notify summarising both.
         """
 
     # ---------- queries ----------
@@ -510,23 +635,26 @@ class SubagentStore:
         limit: int = 20,
     ) -> list[SubagentJob]: ...
     async def list_pending_requests(self, limit: int = 10) -> list[SubagentJob]:
-        """SubagentRequestPicker source: rows with `sdk_agent_id IS NULL
-        AND status='started'`. Oldest first."""
+        """SubagentRequestPicker source: rows with `status='requested'`
+        AND `sdk_agent_id IS NULL`. Oldest `created_at` first."""
 
     async def claim_pending_request(self, job_id: int) -> bool:
-        """Status-precondition UPDATE: set status='started' (no-op),
-        sdk_agent_id='__claimed__<job_id>__' as a claim sentinel. Returns
-        True if claimed, False if already claimed by another picker
-        (which should be impossible in single-daemon flock world, but
-        defensive).
+        """No-op status change: keep `status='requested'` but set a claim
+        marker so a future picker instance (e.g. after mid-claim crash)
+        can tell the row is being worked on.
+
+        Simpler approach for single-daemon flock world: the picker just
+        calls `list_pending_requests(limit=1)` and then invokes the
+        bridge. When the Start hook fires with the ContextVar set (§3.9),
+        it calls `update_sdk_agent_id_for_claimed_request(job_id, ...)`
+        to flip status to `'started'`. If the daemon crashes between
+        claim and Start, the row stays `'requested'` and recover_orphans
+        handles it (1-hour bucket).
+
+        We include this method with the "no-op" semantics (returns
+        True) so §3.9 picker code reads cleanly; tests can assert it
+        exists and is idempotent.
         """
-
-    # ---------- misc ----------
-
-    async def update_sdk_agent_id(self, job_id: int, sdk_agent_id: str) -> None:
-        """Patch the claim-sentinel with the real agent_id once Start
-        hook fires. Matches by (job_id, status='started',
-        sdk_agent_id LIKE '__claimed__%')."""
 ```
 
 ### 3.7 `src/assistant/subagent/format.py` (commit 4)
@@ -569,24 +697,49 @@ def _compute_duration_s(job: SubagentJob) -> float:
     Both should be present at notify time; fallback to 0.0."""
 ```
 
-### 3.8 `src/assistant/subagent/hooks.py` (commit 4)
+### 3.8 `src/assistant/subagent/hooks.py` (commit 4) — updated wave-2
 
 Factory shape mirrors `bridge/hooks.py::make_pretool_hooks`. Returns a
 dict keyed by hook event name, each value a list of `HookMatcher`.
 
-```python
-"""SubagentStart + SubagentStop + cancel-flag PreToolUse hooks.
+**Wave-2 changes:**
+- Hook returns `{}` immediately; delivery runs as a shielded bg task
+  registered on `pending_updates` (GAP #12). No `await shield` inside
+  the hook body.
+- `on_subagent_start` reads `CURRENT_REQUEST_ID` ContextVar (S-1 PASS).
+  If set, it calls `update_sdk_agent_id_for_claimed_request(job_id, ...)`
+  INSTEAD of `record_started` (B-W2-4 implementation).
+- Throttle dict bounded at 64 entries with simple LRU eviction (GAP #15
+  — we always have `callback_chat_id == OWNER_CHAT_ID` in phase 6, so
+  the dict effectively has 1 entry, but the bound is defensive against
+  future multi-chat).
+- Cancel-gate PreToolUse hook reads `raw.get("agent_id")` directly; SDK
+  types.py explicitly documents this field is populated when the hook
+  fires inside a subagent (S-2 wave-2 confirmed 5/5 fires had
+  `agent_id`).
 
-S-6-0 verifications:
+```python
+"""SubagentStart + SubagentStop + cancel-flag PreToolUse hooks (wave-2).
+
+S-6-0 + wave-2 verifications:
   * Q5: `SubagentStopHookInput["last_assistant_message"]` — primary
-    result carrier. JSONL transcript is fallback.
+    result carrier (but NOT in SDK TypedDict; see pitfall #1). JSONL
+    transcript with 250 ms retry is fallback.
   * Q6: hook factory shared across multiple ClaudeAgentOptions instances
     works — both see their subagents' events on the SAME callback.
   * Q7: cancel propagates only via this PreToolUse flag-poll.
+  * S-1 (wave-2): ContextVar `CURRENT_REQUEST_ID` propagates from
+    caller into on_subagent_start — used by picker for correlation.
+  * S-2 (wave-2): subagent tool calls DO fire PreToolUse with
+    `agent_id` populated on `input_data` (phase-3 sandbox still applies).
 """
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import json
+import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, cast
 
@@ -597,6 +750,14 @@ from assistant.subagent.format import format_notification
 from assistant.subagent.store import SubagentStore
 
 log = get_logger("subagent.hooks")
+
+
+# Picker sets this ContextVar before bridge.ask(); on_subagent_start
+# reads it to correlate the Start hook fire to a pending request row.
+# S-1 spike PASS (spikes/phase6_s1_contextvar_hook.py).
+CURRENT_REQUEST_ID: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "phase6_current_request_id", default=None
+)
 
 
 def make_subagent_hooks(
@@ -618,8 +779,11 @@ def make_subagent_hooks(
     """
     from claude_agent_sdk import HookMatcher
 
-    # Per-chat throttle.
-    _last_notify_at: dict[int, float] = {}
+    # Per-chat throttle, bounded LRU so a hypothetical multi-chat future
+    # cannot leak memory (GAP #15). Phase 6 always uses OWNER_CHAT_ID so
+    # the dict has one entry in practice.
+    _last_notify_at: OrderedDict[int, float] = OrderedDict()
+    _THROTTLE_MAX = 64
 
     async def on_subagent_start(
         input_data: Any,
@@ -631,18 +795,45 @@ def make_subagent_hooks(
         agent_type = raw["agent_type"]
         parent_session = raw.get("session_id")
 
-        # spawn_attribution heuristic — if parent_session matches a
-        # pending-request's picker session we know it's CLI/scheduler.
-        # For phase 6 we default to 'user' and let the picker overwrite
-        # on claim. See §4.3.
-        await store.record_started(
-            sdk_agent_id=agent_id,
-            agent_type=agent_type,
-            parent_session_id=parent_session,
-            callback_chat_id=settings.owner_chat_id,
-            spawned_by_kind="user",       # picker-claimed rows are patched earlier
-            spawned_by_ref=None,
-        )
+        # Wave-2 B-W2-4 + S-1: ContextVar set by SubagentRequestPicker?
+        request_id = CURRENT_REQUEST_ID.get()
+        if request_id is not None:
+            # Picker path: patch the existing 'requested' row with the
+            # real agent_id. Status flips 'requested' → 'started'.
+            patched = await store.update_sdk_agent_id_for_claimed_request(
+                job_id=request_id,
+                sdk_agent_id=agent_id,
+                parent_session_id=parent_session,
+            )
+            if not patched:
+                log.warning(
+                    "picker_request_start_mismatch",
+                    request_id=request_id,
+                    agent_id=agent_id,
+                )
+                # Fall through to record_started as defensive INSERT.
+            else:
+                log.info(
+                    "subagent_start_picker_claimed",
+                    request_id=request_id,
+                    agent_id=agent_id,
+                    agent_type=agent_type,
+                )
+                return {}
+
+        # Native-Task spawn (main turn delegated via Task tool) or
+        # picker-mismatch fallback: plain INSERT.
+        try:
+            await store.record_started(
+                sdk_agent_id=agent_id,
+                agent_type=agent_type,
+                parent_session_id=parent_session,
+                callback_chat_id=settings.owner_chat_id,
+                spawned_by_kind="user",
+                spawned_by_ref=None,
+            )
+        except Exception:
+            log.warning("record_started_failed", agent_id=agent_id, exc_info=True)
         log.info(
             "subagent_start",
             agent_id=agent_id,
@@ -656,20 +847,34 @@ def make_subagent_hooks(
         tool_use_id: str | None,
         ctx: Any,
     ) -> dict[str, Any]:
+        """Hook body is non-blocking. It:
+          1. Reads `last_assistant_message` / JSONL fallback.
+          2. UPDATEs the ledger row.
+          3. SPAWNS a shielded send_text task and REGISTERS it on
+             `pending_updates`.
+          4. Returns `{}` — does NOT await the delivery.
+
+        GAP #12 wave-2 change: previously awaited `asyncio.shield(task)`
+        inside the hook, which blocked the SDK iterator for the full
+        Telegram round-trip. Daemon.stop drains `pending_updates` with
+        a 2s timeout.
+        """
         raw = cast(dict[str, Any], input_data)
         agent_id = raw["agent_id"]
         transcript_path = raw.get("agent_transcript_path")
         session_id = raw.get("session_id")
 
-        # S-6-0 Q5 primary path:
+        # Primary path per S-6-0 Q5 raw evidence: read runtime field.
         last_msg = raw.get("last_assistant_message") or ""
         if not last_msg and transcript_path:
+            # 250 ms retry bucket — v1 analyser saw 0 assistant blocks
+            # in JSONL at hook-fire time even though the hook field
+            # carried text. For the fallback path we wait once and retry.
+            await asyncio.sleep(0.25)
             last_msg = _read_last_assistant_from_transcript(Path(transcript_path))
 
         was_cancelled = await store.is_cancel_requested(agent_id)
         status = "stopped" if was_cancelled else "completed"
-        # (If we ever detect failure upstream, pass via additionalContext;
-        # phase-6 treats non-cancel terminal as 'completed'.)
 
         try:
             await store.record_finished(
@@ -678,7 +883,7 @@ def make_subagent_hooks(
                 result_summary=last_msg[:500] if last_msg else None,
                 transcript_path=transcript_path,
                 sdk_session_id=session_id,
-                cost_usd=None,  # phase-9 accounting
+                cost_usd=None,  # GAP #11 — deferred to phase-9.
             )
         except Exception:
             log.warning("record_finished_failed", agent_id=agent_id, exc_info=True)
@@ -697,19 +902,28 @@ def make_subagent_hooks(
             max_body_bytes=settings.subagent.result_body_max_bytes,
         )
 
-        await _throttle(_last_notify_at, job.callback_chat_id,
-                        settings.subagent.notify_throttle_ms)
+        # Register + create but do NOT await delivery (GAP #12). The
+        # throttle runs inside the shielded task so back-to-back Stop
+        # hooks don't block the SDK iterator.
+        async def _deliver() -> None:
+            await _throttle(
+                _last_notify_at,
+                job.callback_chat_id,
+                settings.subagent.notify_throttle_ms,
+                max_entries=_THROTTLE_MAX,
+            )
+            try:
+                await asyncio.shield(
+                    adapter.send_text(job.callback_chat_id, body)
+                )
+            except asyncio.CancelledError:
+                log.info("subagent_notify_shielded_cancel", job_id=job.id)
+            except Exception:
+                log.warning("subagent_notify_failed", job_id=job.id, exc_info=True)
 
-        task = asyncio.create_task(
-            adapter.send_text(job.callback_chat_id, body),
-            name=f"subagent_notify_{job.id}",
-        )
+        task = asyncio.create_task(_deliver(), name=f"subagent_notify_{job.id}")
         pending_updates.add(task)
         task.add_done_callback(pending_updates.discard)
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            log.info("subagent_notify_shielded_cancel", job_id=job.id)
         return {}
 
     async def on_pretool_cancel_gate(
@@ -717,14 +931,11 @@ def make_subagent_hooks(
         tool_use_id: str | None,
         ctx: Any,
     ) -> dict[str, Any]:
-        """Cancel-flag poll for subagent-emitted tool calls (S-6-0 Q7).
+        """Cancel-flag poll for subagent-emitted tool calls.
 
-        Matcher: "*" (all tools) — runs on every tool call. For
-        main-turn calls there is no `agent_id` in context so we no-op.
-        For subagent calls, `ctx` carries the agent_id (form TBD — SDK
-        doesn't document; fallback: read `raw["agent_id"]` if present,
-        else `raw.get("session_id")` + `SELECT FROM subagent_jobs WHERE
-        sdk_session_id=?`).
+        Wave-2 S-2 verified: PreToolUse from a subagent carries
+        `agent_id` on `input_data` (SDK types.py _SubagentContextMixin).
+        Main-turn calls don't have `agent_id` → hook no-ops.
 
         If cancelled → return `{"hookSpecificOutput":
         {"hookEventName": "PreToolUse", "permissionDecision": "deny",
@@ -733,7 +944,6 @@ def make_subagent_hooks(
         raw = cast(dict[str, Any], input_data)
         maybe_agent_id = raw.get("agent_id")
         if not maybe_agent_id:
-            # Main-turn call; no subagent to cancel.
             return {}
         if await store.is_cancel_requested(maybe_agent_id):
             log.info("subagent_cancel_denied_tool", agent_id=maybe_agent_id)
@@ -757,64 +967,238 @@ def _read_last_assistant_from_transcript(path: Path) -> str:
     """Fallback when `last_assistant_message` is missing/empty.
 
     Walks the JSONL at `path` and returns text of the LAST entry where
-    `message.role == 'assistant'`. S-6-0 Q5 showed subagent transcripts
-    at `.../subagents/agent-<id>.jsonl` — newline-delimited JSON, one
-    entry per event.
+    `message.role == 'assistant'`. Observed shape (from S-6-0 raw Q9):
+        {"parentUuid": "...", "isSidechain": true, "agentId": "...",
+         "message": {"role": "assistant",
+                     "content": [{"type": "text", "text": "..."}]},
+         ...}
     """
-    ...
+    if not path.exists():
+        return ""
+    last_text = ""
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            msg = obj.get("message") or {}
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            content = msg.get("content") or []
+            if isinstance(content, list):
+                for blk in content:
+                    if isinstance(blk, dict) and blk.get("type") == "text":
+                        text = str(blk.get("text") or "")
+                        if text:
+                            last_text = text
+    except OSError:
+        return last_text
+    return last_text
 
 
 async def _throttle(
-    last_notify_at: dict[int, float], chat_id: int, interval_ms: int
+    last_notify_at: "OrderedDict[int, float]",
+    chat_id: int,
+    interval_ms: int,
+    *,
+    max_entries: int = 64,
 ) -> None:
     """Module-level per-chat min-interval throttle. Non-reentrant per
-    chat (single-user bot — ok)."""
-    import time
+    chat (single-user bot — ok). GAP #15: LRU-bounded."""
     now = time.monotonic()
     last = last_notify_at.get(chat_id, 0.0)
     delta_ms = (now - last) * 1000.0
     if delta_ms < interval_ms:
         await asyncio.sleep((interval_ms - delta_ms) / 1000.0)
     last_notify_at[chat_id] = time.monotonic()
+    last_notify_at.move_to_end(chat_id)
+    while len(last_notify_at) > max_entries:
+        last_notify_at.popitem(last=False)
 ```
 
-### 3.9 `src/assistant/subagent/picker.py` (commit 6)
+### 3.9 `src/assistant/subagent/picker.py` (commit 6) — updated wave-2
 
 Mirror of `SchedulerDispatcher` — consumer loop for CLI-spawned requests.
 
-```python
-class SubagentRequestPicker:
-    """Poll `subagent_jobs` for rows with sdk_agent_id IS NULL, dispatch
-    through ClaudeBridge as a single-prompt turn.
+**Wave-2 design (B-W2-4 + B-W2-6):**
+- Uses its OWN `ClaudeBridge` instance (`picker_bridge`), constructed
+  by Daemon.start separately from the user-chat bridge. Same
+  `extra_hooks` + `agents`, but independent `asyncio.Semaphore`. Picker
+  dispatches do NOT compete with user turns.
+- Sets the module-level `CURRENT_REQUEST_ID` ContextVar before calling
+  `picker_bridge.ask(...)`. The Start hook (inside the same event
+  loop) reads the var and patches the pending row's sdk_agent_id.
+- Uses `OWNER_CHAT_ID` as the chat_id argument (ask signature
+  requires one); real user interaction would flow via Telegram hook,
+  not the bridge directly.
 
-    Use-case: `tools/task/main.py spawn --kind researcher --task TEXT`
-    inserts a pending row; picker ticks every `picker_tick_s` seconds,
-    claims the row via `claim_pending_request`, invokes a fresh
-    ClaudeBridge turn with a crafted prompt that uses native Task tool
-    to delegate to the kind.
+```python
+"""Consumer loop: poll subagent_jobs for CLI-pending requests, dispatch.
+
+Wave-2 B-W2-4: uses `CURRENT_REQUEST_ID` ContextVar (see
+`subagent/hooks.py`) so the on_subagent_start hook can correlate
+the SDK-assigned agent_id with the pre-created ledger row.
+
+Wave-2 B-W2-6: takes a dedicated `ClaudeBridge` instance — caller
+(Daemon.start) MUST NOT share the user-chat bridge. See §3.12.
+"""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+from typing import Any
+
+from assistant.bridge.claude import ClaudeBridge, ClaudeBridgeError
+from assistant.config import Settings
+from assistant.logger import get_logger
+from assistant.subagent.hooks import CURRENT_REQUEST_ID
+from assistant.subagent.store import SubagentJob, SubagentStore
+
+log = get_logger("subagent.picker")
+
+
+_PICKER_PROMPT_TEMPLATE = """\
+Delegate the following task to the `{kind}` subagent using the Task tool.
+After you have invoked the Task tool once (and ONLY once), reply with
+exactly the word `dispatched` and stop. Do NOT wait for the subagent's
+result, do NOT summarise, do NOT add any other text.
+
+Task for the subagent:
+<<<TASK>>>
+{task_text}
+<<<END>>>
+"""
+
+
+class SubagentRequestPicker:
+    """Poll `subagent_jobs` for `status='requested' AND sdk_agent_id IS NULL`
+    rows, dispatch each through the dedicated picker bridge.
+
+    Lifecycle:
+      - `run()` loop: `while not stop_event: sleep(picker_tick_s); process()`
+      - `request_stop()` sets the stop_event for graceful shutdown.
 
     Invariants:
-    - ONE picker per Daemon (single-flock world).
-    - stop_event shuts down via `wait_for(sleep, timeout)` — phase-5 S-5
-      pattern, no poison-pill.
-    - Shielded dispatch: CancelledError during bridge.ask still lets us
-      UPDATE ledger so row doesn't stay 'started' forever.
+      - ONE picker per Daemon (single-flock world).
+      - stop_event shuts down via `wait_for(stop_event.wait, timeout)` —
+        phase-5 S-5 pattern, no poison-pill.
+      - `_inflight: set[int]` tracks job_ids currently being dispatched
+        so a restart mid-dispatch doesn't re-dispatch the same row
+        (recover_orphans handles those).
     """
-    def __init__(self, store: SubagentStore, bridge: ClaudeBridge, *,
-                 settings: Settings) -> None: ...
-    async def run(self) -> None: ...
-    def request_stop(self) -> None: ...
+
+    def __init__(
+        self,
+        store: SubagentStore,
+        bridge: ClaudeBridge,
+        *,
+        settings: Settings,
+    ) -> None:
+        self._store = store
+        self._bridge = bridge
+        self._settings = settings
+        self._stop_event = asyncio.Event()
+        self._inflight: set[int] = set()
+
+    def request_stop(self) -> None:
+        self._stop_event.set()
+
+    async def run(self) -> None:
+        tick = self._settings.subagent.picker_tick_s
+        while not self._stop_event.is_set():
+            try:
+                pending = await self._store.list_pending_requests(limit=1)
+            except Exception:
+                log.warning("picker_list_failed", exc_info=True)
+                pending = []
+            for job in pending:
+                if job.id in self._inflight:
+                    continue
+                if job.cancel_requested:
+                    # CLI cancel before picker claimed — mark dropped.
+                    log.info("picker_dropped_cancelled", job_id=job.id)
+                    # set_cancel_requested kept it at 'requested'; we
+                    # need an explicit dropped transition. recover_orphans
+                    # handles stale ones; here we short-circuit.
+                    continue
+                self._inflight.add(job.id)
+                asyncio.create_task(
+                    self._dispatch_one(job),
+                    name=f"picker_dispatch_{job.id}",
+                )
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(), timeout=tick
+                )
+            except asyncio.TimeoutError:
+                continue
+
+    async def _dispatch_one(self, job: SubagentJob) -> None:
+        """Dispatch one pending request via the dedicated picker bridge.
+
+        Sets CURRENT_REQUEST_ID so on_subagent_start patches the row
+        from 'requested' → 'started' with the real sdk_agent_id.
+        """
+        token = CURRENT_REQUEST_ID.set(job.id)
+        prompt = _PICKER_PROMPT_TEMPLATE.format(
+            kind=job.agent_type, task_text=job.task_text or ""
+        )
+        try:
+            async for _msg in self._bridge.ask(
+                chat_id=self._settings.owner_chat_id,
+                user_text=prompt,
+                history=[],
+            ):
+                pass
+        except ClaudeBridgeError:
+            log.warning("picker_bridge_error", job_id=job.id, exc_info=True)
+        except asyncio.CancelledError:
+            log.info("picker_dispatch_cancelled", job_id=job.id)
+            raise
+        except Exception:
+            log.warning("picker_unexpected_error", job_id=job.id, exc_info=True)
+        finally:
+            CURRENT_REQUEST_ID.reset(token)
+            self._inflight.discard(job.id)
 ```
 
-Dispatching a request means the picker sends a prompt to the MAIN turn
-asking the model to "use the `<kind>` agent with the following task".
-That triggers Task tool → SDK spawns subagent → SubagentStart hook
-captures real agent_id → picker patches the pending row.
+**Dispatch lifecycle:**
+1. Picker reads `status='requested'` row from `subagent_jobs`.
+2. Picker sets `CURRENT_REQUEST_ID = job.id` ContextVar.
+3. Picker calls `picker_bridge.ask(OWNER_CHAT_ID, prompt, [])`.
+4. Bridge runs the main turn; model invokes `Task` tool with the kind.
+5. SDK spawns subagent → fires SubagentStart hook.
+6. Hook reads `CURRENT_REQUEST_ID` → calls
+   `update_sdk_agent_id_for_claimed_request` → row status flips
+   `'requested'` → `'started'` with real agent_id.
+7. Subagent runs → SubagentStop hook fires → `record_finished`
+   updates row to `'completed'` → notify sent via Telegram.
+8. Picker's main-turn ResultMessage arrives (model replied
+   'dispatched'); `_dispatch_one` returns; `_inflight.discard`.
 
-### 3.10 `src/assistant/bridge/claude.py` edits (commit 6)
+**Picker-starvation test (GAP #17):** the dedicated `picker_bridge`
+has its own `Semaphore(settings.claude.max_concurrent)`, so even 10
+parallel picker dispatches cannot block a concurrent user turn on the
+main bridge. Integration test `test_subagent_picker_does_not_starve_user_chat`
+(§8.2) asserts user-turn latency under picker flood.
 
-Two changes: constructor accepts `extra_hooks`, `_build_options`
-registers `agents` and merges hooks.
+### 3.10 `src/assistant/bridge/claude.py` edits (commit 6) — updated wave-2
+
+**Wave-2 B-W2-8:** `_GLOBAL_BASELINE` gains `"Task"` conditionally —
+only when `self._agents` is non-empty. Rationale: narrower-is-safer
+default; skills' `allowed_tools` manifests don't need to know about
+Task; the bridge owns the advertisement of Task iff agents are
+registered. Unit test `test_allowed_tools_includes_task_when_agents_registered`
+locks both branches.
+
+Three changes: constructor accepts `extra_hooks` + `agents`,
+`_GLOBAL_BASELINE` conditionally includes `"Task"` via
+`_effective_allowed_tools` baseline_extras param, `_build_options`
+merges hooks and passes `agents=`.
 
 ```python
 class ClaudeBridge:
@@ -829,6 +1213,31 @@ class ClaudeBridge:
         self._sem = asyncio.Semaphore(settings.claude.max_concurrent)
         self._extra_hooks = extra_hooks or {}
         self._agents = agents
+```
+
+Modify `_effective_allowed_tools` signature to accept optional
+`baseline_extras` (frozenset) — union additions to the baseline before
+intersection. Phase-6 uses this to let `"Task"` through when the bridge
+has agents registered:
+
+```python
+def _effective_allowed_tools(
+    manifest_entries: list[dict[str, Any]],
+    *,
+    baseline_extras: frozenset[str] = frozenset(),
+) -> list[str]:
+    """... (existing docstring) ...
+
+    `baseline_extras`: phase-6 extension — tool names to union into the
+    baseline before intersecting with skills' allowed_tools manifests.
+    Passing `frozenset({"Task"})` lets the main turn delegate while
+    skills that don't know about Task still get everything else.
+    """
+    effective_baseline = _GLOBAL_BASELINE | baseline_extras
+    if not manifest_entries:
+        return sorted(effective_baseline)
+    # ... rest identical, but compare against effective_baseline not
+    # _GLOBAL_BASELINE.
 ```
 
 Inside `_build_options`, after computing `hooks` dict (line ~192):
@@ -846,11 +1255,12 @@ for event, matchers in self._extra_hooks.items():
     else:
         hooks.setdefault(event, []).extend(matchers)
 
-# Phase 6 Q2 pitfall #13: include "Task" in allowed_tools only when
-# agents are registered (we won't advertise Task otherwise).
-if self._agents:
-    if "Task" not in allowed_tools:
-        allowed_tools = list(allowed_tools) + ["Task"]
+# Phase 6 B-W2-8 pitfall #13: extend baseline with Task when agents
+# are registered. Narrower default; tests lock both branches.
+baseline_extras = frozenset({"Task"}) if self._agents else frozenset()
+allowed_tools = _effective_allowed_tools(
+    entries, baseline_extras=baseline_extras
+)
 
 opts_kwargs: dict[str, Any] = {
     "cwd": str(pr),
@@ -866,62 +1276,211 @@ if self._agents:
 return ClaudeAgentOptions(**opts_kwargs)
 ```
 
-### 3.11 `src/assistant/bridge/hooks.py` edits (commit 5)
+### 3.11 `src/assistant/bridge/hooks.py` edits (commit 5) — updated wave-2
 
-Add `_validate_task_argv` after `_validate_schedule_argv` (~line 300).
+**GAP #14 wave-2:** `_validate_task_argv` spec inline (copying the
+phase-5 `_validate_schedule_argv` skeleton). Returns `str | None` to
+match existing sibling validators (deny-reason or None).
+
+Add after `_validate_schedule_argv` (~line 355):
 
 ```python
 # Phase 6 argv gate for `python tools/task/main.py <sub>`.
-_TASK_SUBCMDS: frozenset[str] = frozenset({"spawn", "list", "status", "cancel", "wait"})
-
-_TASK_SPAWN_REQUIRED: frozenset[str] = frozenset({"--kind", "--task"})
-_TASK_SPAWN_OPTIONAL: frozenset[str] = frozenset({"--callback-chat-id"})
-_TASK_KINDS: frozenset[str] = frozenset({"general", "worker", "researcher"})
+_TASK_SUBCMDS: frozenset[str] = frozenset(
+    {"spawn", "list", "status", "cancel", "wait"}
+)
+_TASK_KINDS: frozenset[str] = frozenset(
+    {"general", "worker", "researcher"}
+)
 _TASK_TASK_MAX_BYTES = 4096
 _TASK_TIMEOUT_MIN_S = 1
 _TASK_TIMEOUT_MAX_S = 600
+_TASK_LIMIT_MAX = 100
 
 
-def _validate_task_argv(argv_after_script: list[str]) -> tuple[bool, str]:
-    """Return (ok, reason). Called from `_validate_python_invocation` when
-    script matches tools/task/main.py. Applies:
-    - subcommand whitelist
-    - dup-flag rejection (phase-5 B-W2-5 lesson)
-    - per-sub flag whitelist
-    - size/range caps
+def _validate_task_argv(args: list[str]) -> str | None:
+    """Phase 6 bash hook gate for `python tools/task/main.py ...`.
+
+    Runs on arguments AFTER the script path (argv[2:]). Mirrors
+    `_validate_schedule_argv`: enum subcommands, dup-flag deny
+    (phase-5 B-W2-5 lesson), per-sub flag whitelist, size/range caps.
     """
-    ...
+    if not args:
+        return "task CLI requires a subcommand"
+    sub = args[0]
+    if sub not in _TASK_SUBCMDS:
+        return f"task subcommand {sub!r} not allowed"
+    remaining = args[1:]
+
+    if sub == "spawn":
+        allowed = {"--kind", "--task", "--callback-chat-id"}
+        required = {"--kind", "--task"}
+        seen: dict[str, str] = {}
+        i = 0
+        while i < len(remaining):
+            tok = remaining[i]
+            if tok not in allowed:
+                return f"task spawn: flag {tok!r} not allowed"
+            if tok in seen:
+                return f"task spawn: duplicate flag {tok!r}"
+            if i + 1 >= len(remaining):
+                return f"task spawn: flag {tok} requires a value"
+            val = remaining[i + 1]
+            seen[tok] = val
+            if tok == "--kind" and val not in _TASK_KINDS:
+                return f"task spawn: --kind must be one of {sorted(_TASK_KINDS)}"
+            if tok == "--task" and len(val.encode("utf-8")) > _TASK_TASK_MAX_BYTES:
+                return f"task spawn: --task exceeds {_TASK_TASK_MAX_BYTES} bytes"
+            if tok == "--callback-chat-id":
+                try:
+                    int(val)
+                except ValueError:
+                    return "task spawn: --callback-chat-id must be integer"
+            i += 2
+        missing = required - seen.keys()
+        if missing:
+            return f"task spawn: missing required flag(s) {sorted(missing)}"
+        return None
+
+    if sub == "list":
+        allowed = {"--status", "--kind", "--limit"}
+        seen_flags: set[str] = set()
+        i = 0
+        while i < len(remaining):
+            tok = remaining[i]
+            if tok not in allowed:
+                return f"task list: flag {tok!r} not allowed"
+            if tok in seen_flags:
+                return f"task list: duplicate flag {tok!r}"
+            seen_flags.add(tok)
+            if i + 1 >= len(remaining):
+                return f"task list: flag {tok} requires a value"
+            val = remaining[i + 1]
+            if tok == "--limit":
+                try:
+                    n = int(val)
+                except ValueError:
+                    return "task list: --limit must be integer"
+                if n < 1 or n > _TASK_LIMIT_MAX:
+                    return f"task list: --limit must be 1..{_TASK_LIMIT_MAX}"
+            i += 2
+        return None
+
+    if sub in ("status", "cancel"):
+        if len(remaining) != 1:
+            return f"task {sub}: exactly one positional job_id required"
+        try:
+            int(remaining[0])
+        except ValueError:
+            return f"task {sub}: job_id must be integer"
+        return None
+
+    if sub == "wait":
+        if not remaining:
+            return "task wait: positional job_id required"
+        try:
+            int(remaining[0])
+        except ValueError:
+            return "task wait: job_id must be integer"
+        rest = remaining[1:]
+        seen_flags = set()
+        i = 0
+        while i < len(rest):
+            tok = rest[i]
+            if tok != "--timeout-s":
+                return f"task wait: flag {tok!r} not allowed"
+            if tok in seen_flags:
+                return f"task wait: duplicate flag {tok!r}"
+            seen_flags.add(tok)
+            if i + 1 >= len(rest):
+                return f"task wait: flag {tok} requires a value"
+            try:
+                t = int(rest[i + 1])
+            except ValueError:
+                return "task wait: --timeout-s must be integer"
+            if t < _TASK_TIMEOUT_MIN_S or t > _TASK_TIMEOUT_MAX_S:
+                return (
+                    f"task wait: --timeout-s must be "
+                    f"{_TASK_TIMEOUT_MIN_S}..{_TASK_TIMEOUT_MAX_S}"
+                )
+            i += 2
+        return None
+
+    return f"task subcommand {sub!r} missing validator"
 ```
 
 Wire into `_validate_python_invocation`:
 
 ```python
+# Existing block:
+if script == "tools/schedule/main.py":
+    return _validate_schedule_argv(argv[2:])
+# Phase 6 addition:
 if script == "tools/task/main.py":
-    ok, reason = _validate_task_argv(argv[2:])
-    if not ok:
-        return _deny(f"task argv rejected: {reason}")
-    return None
+    return _validate_task_argv(argv[2:])
+return None
 ```
 
-### 3.12 `src/assistant/main.py` edits (commit 7)
+### 3.12 `src/assistant/main.py` edits (commit 7) — updated wave-2
+
+**Wave-2 changes:**
+- B-W2-2 SDK version pin: on startup, log-warn (not crash) if
+  `claude_agent_sdk.__version__` changes from `"0.1.59"`. Falls through
+  to JSONL fallback if `last_assistant_message` disappears.
+- B-W2-6 dedicated `picker_bridge` — constructed from the same
+  `extra_hooks`+`agents` but its own Semaphore.
+- B-W2-7 recovery: branch-differentiated notify (interrupted vs
+  dropped).
+- GAP #13: Daemon.stop ps-sweep (stdlib subprocess, warn-only) scans
+  for orphan claude CLI processes after drain.
 
 In `Daemon.start` after `conv` creation and BEFORE bridge creation:
 
 ```python
+# Phase 6 B-W2-2: loudly log SDK version drift; DO NOT crash — JSONL
+# fallback inside hook handles the `last_assistant_message` field
+# disappearing.
+import claude_agent_sdk as _sdk
+if _sdk.__version__ != "0.1.59":
+    self._log.warning(
+        "sdk_version_drift_phase6",
+        expected="0.1.59",
+        seen=_sdk.__version__,
+        note=(
+            "Phase-6 SubagentStop hook relies on the runtime "
+            "'last_assistant_message' field which is not in the SDK "
+            "TypedDict. If this version drops or changes it, the "
+            "JSONL fallback in subagent/hooks.py picks up."
+        ),
+    )
+
 # Phase 6: subagent ledger store (shares ConversationStore.lock)
 self._sub_store = SubagentStore(self._conn, lock=conv.lock)
-recovered = await self._sub_store.recover_orphans()
-if recovered:
-    self._log.warning("subagent_orphans_recovered", count=recovered)
+recovered = await self._sub_store.recover_orphans(stale_requested_after_s=3600)
+# recovered dict: {"interrupted": N1, "dropped": N2}
+total = recovered.get("interrupted", 0) + recovered.get("dropped", 0)
+if total:
+    self._log.warning("subagent_orphans_recovered", **recovered)
+    msg_parts: list[str] = []
+    if recovered.get("interrupted"):
+        msg_parts.append(
+            f"{recovered['interrupted']} subagent(s) marked interrupted "
+            "(prior daemon run crashed mid-subagent)"
+        )
+    if recovered.get("dropped"):
+        msg_parts.append(
+            f"{recovered['dropped']} pending request(s) dropped "
+            "(CLI insert sat >1h without pickup)"
+        )
     self._spawn_bg(
         self._adapter.send_text(
             self._settings.owner_chat_id,
-            f"daemon restart: {recovered} subagent(s) marked interrupted",
+            "daemon restart: " + "; ".join(msg_parts),
         ),
         name="subagent_orphan_notify",
     )
 
-# Subagent hooks — shared factory, reused by scheduler-turn bridge too
+# Subagent hooks — shared factory, reused by BOTH bridges (B-W2-6)
 self._subagent_pending: set[asyncio.Task[Any]] = set()
 sub_hooks = make_subagent_hooks(
     store=self._sub_store,
@@ -931,25 +1490,41 @@ sub_hooks = make_subagent_hooks(
 )
 sub_agents = build_agents(self._settings)
 
-# Replace existing `bridge = ClaudeBridge(self._settings)` with:
+# B-W2-6: user-chat bridge and picker bridge are DISTINCT instances.
+# Same hooks + agents; own Semaphore each. Prevents picker flood from
+# starving user turns.
 bridge = ClaudeBridge(
     self._settings,
     extra_hooks=sub_hooks,
     agents=sub_agents,
 )
+self._picker_bridge = ClaudeBridge(
+    self._settings,
+    extra_hooks=sub_hooks,
+    agents=sub_agents,
+)
 
-# Picker for CLI-spawn pickups (§3.9)
+# Picker for CLI-spawn pickups (§3.9) — uses dedicated bridge.
+self._subagent_picker: SubagentRequestPicker | None = None
 if self._settings.subagent.enabled:
-    picker = SubagentRequestPicker(self._sub_store, bridge, settings=self._settings)
-    self._subagent_picker = picker
-    self._spawn_bg(picker.run(), name="subagent_picker")
+    self._subagent_picker = SubagentRequestPicker(
+        self._sub_store,
+        self._picker_bridge,
+        settings=self._settings,
+    )
+    self._spawn_bg(self._subagent_picker.run(), name="subagent_picker")
 ```
 
 In `Daemon.stop`, between existing step 2.5 (scheduler drain) and step 3
 (adapter stop), add:
 
 ```python
-# Step 2.6 — phase-6: drain subagent notify tasks
+# Step 2.55 — phase-6: signal picker to stop (before we await its
+# dispatches via _bg_tasks drain).
+if self._subagent_picker is not None:
+    self._subagent_picker.request_stop()
+
+# Step 2.6 — phase-6: drain subagent notify tasks (GAP #12).
 if self._subagent_pending:
     updates = list(self._subagent_pending)
     self._log.info("daemon_draining_subagent_notifies", count=len(updates))
@@ -964,22 +1539,56 @@ if self._subagent_pending:
             count=len([t for t in updates if not t.done()]),
         )
 
-if getattr(self, "_subagent_picker", None):
-    self._subagent_picker.request_stop()
+# Step 2.7 — GAP #13: warn-only ps sweep for orphan `claude` CLI
+# subprocesses. Detection only; we do NOT kill — operator reads the log.
+try:
+    import subprocess
+    proc = subprocess.run(
+        ["ps", "-Ao", "pid,command"],
+        capture_output=True,
+        text=True,
+        timeout=2.0,
+        check=False,
+    )
+    claude_lines = [
+        line for line in proc.stdout.splitlines()
+        if "claude" in line and "grep" not in line
+    ]
+    if claude_lines:
+        self._log.warning(
+            "phase6_possible_orphan_claude_processes",
+            count=len(claude_lines),
+            sample=claude_lines[:3],
+        )
+except (OSError, subprocess.SubprocessError):
+    pass
 ```
 
-### 3.13 `tools/task/main.py` (commit 5)
+### 3.13 `tools/task/main.py` (commit 5) — updated wave-2
 
 stdlib-only. `sys.path.append(<root>/src)` shim (pitfall phase-5 #8
 — `append`, not `insert(0)`, inherited from phase-4 `_memlib` lesson).
 
+**Wave-2:** spawn writes a row with `status='requested'` and
+`sdk_agent_id IS NULL` (partial UNIQUE tolerates). Picker claims it
+later; Start hook patches `sdk_agent_id` via ContextVar.
+
 Subcommands:
-- `spawn --kind general --task TEXT [--callback-chat-id N]` → INSERT pending row; print `{"job_id": N, "status": "pending"}`.
+- `spawn --kind general --task TEXT [--callback-chat-id N]` →
+  `record_pending_request` → INSERT row with `status='requested'`,
+  `sdk_agent_id=NULL`, `spawned_by_kind='cli'`; print
+  `{"job_id": N, "status": "requested"}`.
 - `list [--status S] [--kind K] [--limit 20]` → print JSON array.
-- `status <job_id>` → full row or exit 7.
+  `--status` accepts any of the 8 status enum values.
+- `status <job_id>` → full row or exit 7 if missing.
 - `cancel <job_id>` → `set_cancel_requested(id)` through store; print
   `{"cancel_requested": true}` or `{"already_terminal": "<status>"}`.
-- `wait <job_id> [--timeout-s 60]` → poll DB until terminal; exit 0/5.
+- `wait <job_id> [--timeout-s 60]` → poll DB until status IN
+  `('completed','failed','stopped','interrupted','error','dropped')`;
+  exit 0/5 (0 on 'completed', 5 otherwise).
+
+`--callback-chat-id` in phase 6 defaults to `OWNER_CHAT_ID` from env.
+Explicit param reserved for phase-8 multi-chat.
 
 ### 3.14 `skills/task/SKILL.md` (commit 5)
 
@@ -1075,135 +1684,200 @@ See §3.15.
 
 ---
 
-## 5. Spike citations
+## 5. Spike citations — updated wave-2
 
-Every non-trivial decision has an S-6-0 anchor:
+Every non-trivial decision has a spike anchor:
 
-- **§3.1** schema `sdk_agent_id UNIQUE`: **S-6-0 Q12** — `agent_id`
-  stable across Start/Stop; `session_id` asymmetric.
-- **§3.5** `build_agents` omits `"Task"` from child `tools`: **S-6-0 Q4**
-  — recursion gated by child tools; structural cap.
+- **§3.1** schema `sdk_agent_id` nullable + partial UNIQUE: **S-6-0
+  Q12** (`agent_id` stable across Start/Stop) + **wave-2 B-W2-3**
+  (option A).
+- **§3.1** `'requested'` pre-picker status + `'dropped'` terminal:
+  **wave-2 B-W2-7**.
+- **§3.5** `build_agents` omits `"Task"` from child `tools`: **S-6-0
+  Q4** (empirically not observed; wave-2 wording fix).
 - **§3.5** `model="inherit"` in all three: **S-6-0 Q10** — runtime-valid.
 - **§3.5** per-kind `prompt` is full system prompt: **S-6-0 Q9** — FULL,
   not appended; haiku test confirmed.
-- **§3.8** on_subagent_stop reads `raw["last_assistant_message"]`:
-  **S-6-0 Q5** — direct hook field; no transcript parse needed.
-- **§3.8** on_pretool_cancel_gate flag-poll: **S-6-0 Q7** FAIL →
-  fallback required.
-- **§3.8** `set[asyncio.Task]` + shield: **phase-5** B-W2-3 / HIGH #5.
-- **§3.8** throttle 500ms: plan §4.5 Q4-locked.
+- **§3.5** `background=True` flag — **kept for forward-compat, no
+  runtime effect on 0.1.59**: **wave-2 Q1-BG re-run** (FAIL_BG_BLOCKS_MAIN_TURN).
+- **§3.8** on_subagent_stop reads `raw.get("last_assistant_message")`
+  with 250 ms JSONL fallback: **S-6-0 Q5** raw verdict PARTIAL +
+  **wave-2 B-W2-2** static types.py cross-check (not in TypedDict).
+- **§3.8** on_pretool_cancel_gate flag-poll reads `raw.get("agent_id")`:
+  **S-6-0 Q7** FAIL (cancel-via-SDK doesn't work) + **wave-2 S-2**
+  PASS (5/5 subagent PreToolUse fires had `agent_id` on input_data).
+- **§3.8** ContextVar `CURRENT_REQUEST_ID`: **wave-2 S-1** PASS
+  (`spikes/phase6_s1_contextvar_report.json`).
+- **§3.8** hook returns `{}` without awaiting delivery: **wave-2 GAP #12**.
+- **§3.8** LRU-bounded throttle dict: **wave-2 GAP #15**.
 - **§3.10** shared-factory hooks work across bridges: **S-6-0 Q6** —
   PASS, distinct agent_ids seen on shared callback.
-- **§3.10** `"Task"` must be in `allowed_tools` explicitly: **S-6-0 Q2**
-  — we tested with explicit; untested without.
+- **§3.10** `"Task"` in `_GLOBAL_BASELINE` via `baseline_extras`:
+  **wave-2 B-W2-8** option A.
+- **§3.11** `_validate_task_argv` spec: **wave-2 GAP #14** mirrors
+  `_validate_schedule_argv` from phase-5.
+- **§3.12** dedicated `picker_bridge`: **wave-2 B-W2-6**.
+- **§3.12** recover_orphans differentiated notify: **wave-2 B-W2-7**.
+- **§3.12** SDK version pin log-warn: **wave-2 B-W2-2**.
 - **§3.12** recover_orphans before bridge accepts turns:
-  **phase-5** invariant (CleanState for scheduler).
+  **phase-5** invariant.
 - **§3.12** `drain subagent_pending` between scheduler drain and
   adapter.stop: **phase-5** HIGH #5.
-- **§0 pitfall 5**: **S-6-0 Q1** — main turn wall ≈ subagent wall.
+- **§3.12** ps-sweep on Daemon.stop: **wave-2 GAP #13** (warn-only).
+- **§0 pitfall 5**: **S-6-0 Q1** + **wave-2 Q1-BG re-run** — main
+  turn wall ≈ subagent wall regardless of `background=`.
+- **§0 pitfall 17 (subagent sandbox traversal)**: **wave-2 S-2** PASS
+  (5/5 subagent Bash calls denied by parent's phase-3 hooks).
 
 ---
 
-## 6. Open questions for devil wave-2
+## 6. Open questions — wave-2 closures
 
-1. **Cancel flag-poll context** (§3.8, `on_pretool_cancel_gate`): I
-   speculated that `HookContext` or `input_data` on PreToolUse from a
-   SUBAGENT will contain `agent_id` — but S-6-0 did NOT verify this.
-   **If PreToolUse from subagent has no `agent_id` in scope**, the
-   cancel gate must fall back to `session_id → SELECT agent_id` lookup
-   via store — slower and racy. Coder's first task in commit 4 should
-   log a PreToolUse invocation from a subagent tool call (a spike-inside-
-   implementation) and confirm which field carries the subagent identity.
-2. **Main-turn "reply 'launched' and stop" realism** (§0 pitfall 5). If
-   the model doesn't comply and always summarises child output, the main
-   turn blocks for minutes. Does phase-6 accept this UX, or does it need
-   a bridge-level workaround (e.g. `ClaudeSDKClient` with `cancel_current`
-   after TaskStartedMessage)? Devil should weigh whether to tighten E2E
-   scenarios 1/2 in `description.md` or add a bridge escape hatch.
-3. **SubagentRequestPicker pickup → agent_id matching** (§3.9). Picker
-   claims a pending row and launches a main turn; that turn spawns a
-   Task → SubagentStart fires. How does the hook know the just-started
-   agent_id corresponds to the picker-claimed request id? Options: (a)
-   picker injects a task-text marker like `TASK_REQUEST_ID=42`, Start
-   hook parses the initial user message to pick it out (fragile); (b)
-   picker uses a scratch text file and matches on session_id (also
-   fragile — S-6-0 Q12 says Start.session_id = parent session, not
-   subagent); (c) picker lays down a flag in-memory and correlates by
-   wallclock (racy). **Need a concrete answer before commit 6.** Default
-   fallback: drop picker's `spawned_by_kind='cli'` attribution — just
-   track the kind='cli' in the Start hook via a shared registry keyed
-   on parent_session_id from picker's own bridge turn.
-4. **Cost accounting** (§3.1 `cost_usd`). S-6-0 showed
-   `ResultMessage.total_cost_usd` on the MAIN turn; subagent cost is
-   not surfaced in `SubagentStopHookInput`. `TaskUsage.total_tokens`
-   exists on `TaskNotificationMessage` but not in hook. Open: should we
-   read `ResultMessage` on main turn after subagent ends to get child
-   cost? That means tracking which child contributed what — out of
-   scope phase-6. Devil: is `cost_usd=NULL` acceptable for phase 6, or
-   must we compute it?
-5. **Subagent sees the parent's PreToolUse hooks?** Plan invariant §17
-   claims "Subagent's Bash/file/web tools go through SAME PreToolUse
-   hooks — Q15 cheap". S-6-0 did not explicitly probe this. It's
-   implicit in the cancel-gate hook design (we assume subagent tool
-   calls trigger PreToolUse). Devil should ask: do we need a spike-6.5
-   that confirms, or is it safe to assume from SDK docs?
+**All 5 v1 open questions are now RESOLVED.**
+
+1. ~~Cancel flag-poll context~~ — **CLOSED by B-W2-5 / S-2.** Static
+   evidence: SDK types.py:246-262 documents `_SubagentContextMixin`
+   with `agent_id: str` "Present only when the hook fires from inside
+   a Task-spawned sub-agent". Empirical evidence: S-2 observed 5/5
+   subagent PreToolUse fires had `agent_id` populated. Hook reads
+   `raw.get("agent_id")` directly.
+2. ~~Main-turn "reply 'launched'" realism~~ — **CLOSED by B-W2-1
+   re-run.** `background=True` has no effect on 0.1.59. Accepted: main
+   turn wall ≈ subagent wall in all scenarios. Description.md
+   scenarios 1+2 must be read "notify arrives at child completion via
+   Telegram, main turn closes shortly after". No bridge workaround;
+   consider `ClaudeSDKClient` escape hatch as phase-7 topic.
+3. ~~Picker → agent_id matching~~ — **CLOSED by B-W2-4 / S-1.**
+   ContextVar propagation empirically PASS (1001/1002 match in two
+   back-to-back runs). Implementation: picker sets
+   `CURRENT_REQUEST_ID` ContextVar; `on_subagent_start` reads it; calls
+   `update_sdk_agent_id_for_claimed_request(job_id, agent_id, ...)`.
+4. ~~Cost accounting~~ — **DEFERRED TO PHASE 9.** GAP #11: raw Q1 main
+   run shows `cost_usd=0.1244035` in the main ResultMessage, but this
+   is aggregate (parent + child). Per-subagent attribution requires
+   either per-child `TaskNotificationMessage.usage` read
+   (`TaskUsage.total_tokens`, not cost) OR a bridge-level counter that
+   diff's main-turn cost before/after each child. Out of scope phase-6.
+   Schema keeps `cost_usd REAL` column nullable for phase-9 fill.
+5. ~~Subagent PreToolUse traversal~~ — **CLOSED by B-W2-5 / S-2.**
+   Confirmed 5/5 denies at parent's phase-3 sandbox (bash metachar +
+   allowlist); `agent_id` on every fire. No phase-6 sandbox
+   regression.
 
 ---
 
-## 7. Invariants (phase 6 canonical)
+## 7. Invariants (phase 6 canonical) — updated wave-2
 
-1. **`subagent_jobs.sdk_agent_id` is the single identity key.** Every
-   ledger operation keys on it. Never key on `session_id`.
+1. **`subagent_jobs.sdk_agent_id` is the single identity key (when
+   present).** Every ledger operation keys on it. Never key on
+   `session_id`. Pending CLI rows carry NULL; partial UNIQUE index
+   handles it.
 2. **Subagent `tools` list NEVER includes `"Task"` in phase 6.**
-   Recursion cap is structural. Tests assert.
+   Recursion cap is empirical (S-6-0 Q4). Regression test
+   `test_subagent_no_recursion_lock` asserts.
 3. **`record_finished` is status-preconditioned.** `WHERE
    sdk_agent_id=? AND status='started'`. Duplicate or out-of-order
    Stop hooks are no-ops with a skew log.
 4. **`recover_orphans` runs exactly once at `Daemon.start` BEFORE
-   picker or bridge accepts new turns.**
+   picker or bridge accepts new turns.** Two branches: `interrupted`
+   (started + finished_at IS NULL) and `dropped` (requested + >1h
+   stale). Notify splits the two in the owner-facing message.
 5. **`Daemon.stop` drains `_subagent_pending` before `adapter.stop()`
-   and `conn.close()`.**
+   and `conn.close()`.** Picker stop signalled BEFORE drain so no new
+   dispatches land mid-drain.
 6. **Subagent notify body uses `last_assistant_message` first,
-   transcript parse only as fallback.**
+   JSONL transcript parse with 250 ms retry as fallback.** Runtime-only
+   field; SDK version pin logs a warning on drift but doesn't crash.
 7. **Cancel works via PreToolUse flag-poll only.** No SDK cancel API.
    Tool-free subagents are uncancellable (documented in skill).
-8. **One hook factory per Daemon; passed to every ClaudeBridge instance.**
-   Ensures cross-bridge subagent events flow through the same ledger.
+   PreToolUse fires with `agent_id` populated for subagent-origin
+   calls (S-2 verified).
+8. **One hook factory per Daemon; passed to BOTH ClaudeBridge instances
+   (user + picker).** Q6 PASS guarantees cross-bridge SubagentStop
+   still fires through the same ledger.
+9. **Picker bridge and user-chat bridge are DISTINCT instances** with
+   independent `asyncio.Semaphore`s. Prevents picker flood from
+   starving user turns (B-W2-6 + GAP #17).
+10. **Hook body is non-blocking.** `on_subagent_stop` creates the
+    shielded delivery task and returns `{}` — never awaits delivery
+    (GAP #12).
 
 ---
 
-## 8. Testing plan (details)
+## 8. Testing plan (details) — updated wave-2
 
 ### 8.1 Unit tests
 
-- `test_db_migrations_v4`: v3→v4 applies; subagent_jobs columns present.
-- `test_subagent_definitions`: 3 kinds, tools lists correct, NO "Task"
-  in any `tools`, model="inherit", background=True.
-- `test_subagent_store`: full CRUD + state machine + orphan recovery +
-  cancel flag + status-precondition skew (UPDATE on terminal row returns
-  rowcount=0).
+- `test_db_migrations_v4`: v3→v4 applies; subagent_jobs columns
+  present; partial UNIQUE index on sdk_agent_id allows multiple NULL
+  rows; `PRAGMA user_version = 4`.
+- `test_subagent_definitions`: 3 kinds, tools lists correct,
+  **`"Task"` NOT in any `tools` list** (pitfall #2 lock),
+  model="inherit", background=True.
+- `test_subagent_store`: full CRUD + state machine (requested →
+  started → completed/stopped/interrupted/dropped) + recover_orphans
+  branch matrix (interrupted vs dropped by age bucket) + cancel flag +
+  status-precondition skew + partial UNIQUE tolerates NULL.
 - `test_subagent_format`: notify footer exactly matches locked format;
   truncation at `max_body_bytes` respects UTF-8 char boundaries.
-- `test_subagent_hooks`: mocked `input_data` dicts for Start/Stop/
-  PreToolUse-cancel-gate; adapter.send_text called with formatted text;
-  shield-on-cancel protects DB write.
+- `test_subagent_hooks`: mocked `input_data` dicts for
+  Start/Stop/PreToolUse-cancel-gate:
+  - Stop hook returns `{}` IMMEDIATELY; delivery task is in
+    `pending_updates` set (GAP #12).
+  - Stop hook primary path reads `last_assistant_message`; empty →
+    JSONL fallback with 250 ms sleep retry.
+  - Start hook with `CURRENT_REQUEST_ID` set calls
+    `update_sdk_agent_id_for_claimed_request` (B-W2-4).
+  - Start hook without ContextVar calls `record_started`.
+  - PreToolUse cancel-gate: returns deny iff `cancel_requested=1`
+    AND `raw["agent_id"]` present.
 - `test_task_cli`: spawn/list/status/cancel/wait all branches + JSON
   shape.
 - `test_task_bash_hook`: `_validate_task_argv` accepts whitelist,
-  rejects dup flags, rejects oversize --task, rejects OOB timeout.
+  rejects dup flags, rejects oversize --task, rejects OOB --timeout-s,
+  rejects non-enum --kind.
+- `test_allowed_tools_includes_task_when_agents_registered` (B-W2-8):
+  `_effective_allowed_tools([...], baseline_extras=frozenset({"Task"}))`
+  includes `"Task"`; without extras, it does not.
+- `test_subagent_no_recursion_lock` (pitfall #2 / Q4 regression):
+  assert `build_agents(settings)["general"].tools` omits `"Task"`;
+  same for worker/researcher.
 
 ### 8.2 Integration
 
-- `test_subagent_recovery.py`: seed a `started` row → boot `Daemon` →
-  observe row transitioned to `interrupted` + owner notify fired.
-- `test_subagent_e2e.py`: only if `RUN_SDK_INT=1` env var — full SDK
+- `test_subagent_recovery.py`: seed `started` row + `requested` row
+  >1h old + `requested` row <1h → boot `Daemon` → observe
+  interrupted / dropped / untouched respectively + owner notify text
+  splits the two categories.
+- `test_subagent_picker_does_not_starve_user_chat` (GAP #17): spawn
+  10 pending requests; measure picker drain time; concurrently issue
+  a "user turn" (via fake ClaudeHandler path) through the main
+  bridge; assert user-turn latency < picker drain time / 2 (soft
+  threshold; the real guarantee is separate Semaphores, this is a
+  sanity check).
+- `test_subagent_contextvar_propagation`: unit-level; spawn a fake
+  SDK iter, set `CURRENT_REQUEST_ID`, verify hook sees it.
+- `test_subagent_e2e.py`: gated by `RUN_SDK_INT=1` env var — full SDK
   spawn via main turn with `general` agent; assert Start+Stop hooks
   fire, ledger row complete, adapter.send_text called.
+- **GAP #18:** add `RUN_SDK_INT` handling:
+
+  ```python
+  import os
+  import pytest
+  if os.environ.get("RUN_SDK_INT") != "1":
+      pytest.skip("SDK integration gated by RUN_SDK_INT=1", allow_module_level=True)
+  ```
+
+  Match phase-5 `tests/test_scheduler_e2e_sdk.py` skip pattern. The
+  test is runnable locally (`RUN_SDK_INT=1 uv run pytest
+  tests/test_subagent_e2e.py`); CI default skips.
 
 ### 8.3 Mock vs real-SDK
 
-Unit tests inject mock dicts at hook input shape. The ONE integration
-test that talks to SDK is gated by env var; CI runs it on-demand.
+Unit tests inject mock dicts at hook input shape. Integration tests
+that talk to SDK are gated by `RUN_SDK_INT` env var; CI default
+skips. Operator runs locally before merge.
 
 ---
 
@@ -1221,22 +1895,28 @@ Fields left NULL / reserved now, filled phase 9:
 Phase 6 = SDK-native subagent integration. Ledger-only DB, shared
 bridge, hook-based notify, flag-poll cancel.
 
-**Exit:**
-- [ ] S-6-0 spike committed (`spikes/phase6_s0_native_subagent.py`,
-      `spikes/phase6_s0_findings.md`, `plan/phase6/spike-findings.md`)
-- [ ] Migration v4 applied, `PRAGMA user_version=4`
-- [ ] `AgentDefinition` registry covers general/worker/researcher — no
-      "Task" in their tools
+**Exit (updated wave-2):**
+- [ ] S-6-0 + wave-2 spikes committed
+      (`spikes/phase6_s0_native_subagent.py` + Q1-BG re-run,
+      `spikes/phase6_s1_contextvar_hook.py`,
+      `spikes/phase6_s2_subagent_sandbox.py`, raw reports,
+      `plan/phase6/spike-findings.md`)
+- [ ] Migration v4 applied with partial UNIQUE on sdk_agent_id,
+      `PRAGMA user_version=4`
+- [ ] `AgentDefinition` registry covers general/worker/researcher with
+      `background=True` + no "Task" in their tools
 - [ ] SubagentStart + SubagentStop + cancel-flag PreToolUse hooks wired
-      through shared factory
-- [ ] Telegram notify uses `last_assistant_message` directly
+      through shared factory; ContextVar correlation working
+- [ ] Telegram notify uses `last_assistant_message` with JSONL fallback
 - [ ] CLI `tools/task/main.py` covers spawn/list/status/cancel/wait
 - [ ] Bash hook gate validates task argv (dup-flag deny,
-      subcmd whitelist, size caps)
-- [ ] SubagentRequestPicker running as bg task; correlation to Start
-      hook resolved (see §6 Q3)
-- [ ] Daemon orphan recovery + stop-drain integrated
-- [ ] ~30 new tests passing (~900 total)
+      subcmd whitelist, size caps); test covers all branches
+- [ ] SubagentRequestPicker running on DEDICATED bridge; correlation to
+      Start hook via CURRENT_REQUEST_ID ContextVar verified
+- [ ] Daemon orphan recovery (interrupted + dropped branches) +
+      stop-drain + ps-sweep integrated
+- [ ] SDK version pin log-warn on startup
+- [ ] ~35 new tests passing (~910 total); `RUN_SDK_INT` gates E2E
 - [ ] mypy strict clean on new modules
 - [ ] Phase-5 invariants preserved
 - [ ] E2E spawn (CLI + native Task) → notify verified
