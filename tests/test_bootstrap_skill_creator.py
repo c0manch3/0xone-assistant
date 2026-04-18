@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 
 import assistant.main as main_mod
-from assistant.config import ClaudeSettings, Settings
+from assistant.config import ClaudeSettings, Settings, SubagentSettings
 from assistant.main import Daemon
 
 
@@ -95,6 +95,10 @@ def _settings(tmp_path: Path) -> Settings:
         project_root=tmp_path,
         data_dir=tmp_path / "data",
         claude=ClaudeSettings(),
+        # Phase 6: monkeypatched `asyncio.create_subprocess_exec` mocks
+        # the bootstrap subprocess. Disable the picker so the stop-time
+        # ps-sweep does not depend on real `ps`.
+        subagent=SubagentSettings(enabled=False),
     )
 
 
@@ -201,7 +205,14 @@ async def test_bootstrap_failure_notifies_owner_once(
     # (`scheduler_*`) are infinite loops; filter them out here — they are
     # properly cancelled in `daemon.stop()` below.
     await asyncio.gather(
-        *[t for t in daemon._bg_tasks if not (t.get_name() or "").startswith("scheduler_")],
+        *[
+            t
+            for t in daemon._bg_tasks
+            if not (
+                (t.get_name() or "").startswith("scheduler_")
+                or (t.get_name() or "").startswith("subagent_")
+            )
+        ],
         return_exceptions=True,
     )
     adapter = daemon._adapter
@@ -245,7 +256,14 @@ async def test_bootstrap_failure_does_not_renotify(
     daemon = Daemon(_settings)
     await daemon.start()
     await asyncio.gather(
-        *[t for t in daemon._bg_tasks if not (t.get_name() or "").startswith("scheduler_")],
+        *[
+            t
+            for t in daemon._bg_tasks
+            if not (
+                (t.get_name() or "").startswith("scheduler_")
+                or (t.get_name() or "").startswith("subagent_")
+            )
+        ],
         return_exceptions=True,
     )
     adapter = daemon._adapter
@@ -280,7 +298,14 @@ async def test_bootstrap_happy_path_creates_skill_and_sentinel(
     daemon = Daemon(_settings)
     await daemon.start()
     await asyncio.gather(
-        *[t for t in daemon._bg_tasks if not (t.get_name() or "").startswith("scheduler_")],
+        *[
+            t
+            for t in daemon._bg_tasks
+            if not (
+                (t.get_name() or "").startswith("scheduler_")
+                or (t.get_name() or "").startswith("subagent_")
+            )
+        ],
         return_exceptions=True,
     )
     assert created["done"]

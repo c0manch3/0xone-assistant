@@ -22,7 +22,7 @@ from typing import Any
 import pytest
 
 import assistant.main as main_mod
-from assistant.config import ClaudeSettings, Settings
+from assistant.config import ClaudeSettings, Settings, SubagentSettings
 from assistant.main import Daemon
 
 
@@ -90,6 +90,11 @@ def _settings(tmp_path: Path) -> Settings:
         project_root=tmp_path,
         data_dir=tmp_path / "data",
         claude=ClaudeSettings(),
+        # Phase 6: disable the picker so the bootstrap test's globally
+        # monkeypatched `asyncio.create_subprocess_exec` iterator is not
+        # consumed by the stop-time ps-sweep (which only runs when a
+        # picker was started).
+        subagent=SubagentSettings(enabled=False),
     )
 
 
@@ -274,11 +279,19 @@ async def _drain(d: Daemon) -> None:
 
     Phase 5 added never-ending scheduler bg-tasks (`scheduler_loop`,
     `scheduler_dispatcher`, `scheduler_health`) which would block this
-    helper forever. Filter them out — this test's job is to verify the
-    bootstrap marker rotation only.
+    helper forever. Phase 6 added `subagent_picker` with the same
+    property. Filter both families out — this test's job is to verify
+    the bootstrap marker rotation only.
     """
     import asyncio as _asyncio
 
-    pending = [t for t in d._bg_tasks if not (t.get_name() or "").startswith("scheduler_")]
+    pending = [
+        t
+        for t in d._bg_tasks
+        if not (
+            (t.get_name() or "").startswith("scheduler_")
+            or (t.get_name() or "").startswith("subagent_")
+        )
+    ]
     if pending:
         await _asyncio.gather(*pending, return_exceptions=True)

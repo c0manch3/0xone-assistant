@@ -27,6 +27,15 @@ from assistant.scheduler.store import SchedulerStore
 from assistant.state.conversations import ConversationStore
 from assistant.state.db import apply_schema, connect
 from assistant.state.turns import TurnStore
+from assistant.subagent.definitions import build_agents
+from assistant.subagent.hooks import make_subagent_hooks
+from assistant.subagent.picker import SubagentRequestPicker
+from assistant.subagent.store import SubagentStore
+
+# Phase 6 B-W2-2: loudly log SDK version drift. We keep the runtime-only
+# `last_assistant_message` field as the primary result carrier; the JSONL
+# fallback inside `subagent/hooks.py` covers a future SDK that drops it.
+_EXPECTED_SDK_VERSION = "0.1.59"
 
 AUTH_PREFLIGHT_FAIL_EXIT = 3
 
@@ -104,6 +113,11 @@ class Daemon:
         # when both loop + dispatcher heartbeats become fresh again
         # (HIGH #7 extends the staleness check to both).
         self._heartbeat_notified: bool = False
+        # Phase 6 state — populated in start().
+        self._sub_store: SubagentStore | None = None
+        self._subagent_picker: SubagentRequestPicker | None = None
+        self._subagent_pending: set[asyncio.Task[Any]] = set()
+        self._picker_bridge: ClaudeBridge | None = None
 
     # ------------------------------------------------------------------
 
@@ -615,9 +629,88 @@ class Daemon:
                 hint=("marketplace features disabled. Install https://cli.github.com/ to enable."),
             )
 
-        bridge = ClaudeBridge(self._settings)
+        # Phase 6 wiring -------------------------------------------------
+        # B-W2-2: loud log-only warning on SDK version drift. We do NOT
+        # crash — the JSONL fallback inside on_subagent_stop handles a
+        # future SDK that changes `last_assistant_message`.
+        try:
+            import claude_agent_sdk as _sdk
 
+            sdk_version = getattr(_sdk, "__version__", None)
+        except Exception:  # pragma: no cover — SDK is a hard dep
+            sdk_version = None
+        if sdk_version and sdk_version != _EXPECTED_SDK_VERSION:
+            self._log.warning(
+                "sdk_version_drift_phase6",
+                expected=_EXPECTED_SDK_VERSION,
+                seen=sdk_version,
+                note=(
+                    "SubagentStop hook relies on the runtime "
+                    "'last_assistant_message' field which is not in the SDK "
+                    "TypedDict. If this version drops or changes it, the "
+                    "JSONL fallback in subagent/hooks.py picks up."
+                ),
+            )
+
+        # Subagent ledger — shares ConversationStore.lock (pitfall #8).
+        self._sub_store = SubagentStore(self._conn, lock=conv.lock)
+        recovered = await self._sub_store.recover_orphans(
+            stale_requested_after_s=self._settings.subagent.requested_stale_after_s
+        )
+        total_recovered = recovered.get("interrupted", 0) + recovered.get("dropped", 0)
+        if total_recovered:
+            self._log.warning("subagent_orphans_recovered", **recovered)
+
+        # Adapter MUST be built BEFORE the hook factory — the hooks
+        # close over it to deliver the notify. Build adapter first, then
+        # hooks, then both bridges, then register the handler.
         self._adapter = TelegramAdapter(self._settings)
+
+        # B-W2-7: the split-notify message differentiates "prior daemon
+        # crashed mid-subagent" from "pending CLI request sat past the
+        # stale window".
+        if total_recovered:
+            msg_parts: list[str] = []
+            if recovered.get("interrupted"):
+                msg_parts.append(
+                    f"{recovered['interrupted']} подагент(ов) помечено "
+                    "interrupted (предыдущий daemon упал в процессе)"
+                )
+            if recovered.get("dropped"):
+                msg_parts.append(
+                    f"{recovered['dropped']} отложенных запросов "
+                    "отброшено (CLI insert просидел >1ч без pickup)"
+                )
+            notify_body = "daemon restart: " + "; ".join(msg_parts)
+            # Use the adapter directly; bg task keeps start() non-blocking.
+            self._spawn_bg(
+                self._adapter.send_text(self._settings.owner_chat_id, notify_body),
+                name="subagent_orphan_notify",
+            )
+
+        sub_hooks = make_subagent_hooks(
+            store=self._sub_store,
+            adapter=self._adapter,
+            settings=self._settings,
+            pending_updates=self._subagent_pending,
+        )
+        sub_agents = build_agents(self._settings)
+
+        # B-W2-6: two bridges share hook factory + agents but have
+        # INDEPENDENT Semaphores so picker flood cannot starve user turns.
+        bridge = ClaudeBridge(
+            self._settings,
+            extra_hooks=sub_hooks,
+            agents=sub_agents,
+        )
+        self._picker_bridge = ClaudeBridge(
+            self._settings,
+            extra_hooks=sub_hooks,
+            agents=sub_agents,
+        )
+
+        # Adapter was built above (phase 6: hooks need it). Just wire
+        # the handler and start.
         handler = ClaudeHandler(self._settings, conv, turns, bridge)
         self._adapter.set_handler(handler)
         await self._adapter.start()
@@ -649,6 +742,17 @@ class Daemon:
         self._spawn_bg(loop_.run(), name="scheduler_loop")
         # Wave-2 G-W2-10: heartbeat watchdog.
         self._spawn_bg(self._scheduler_health_check_bg(), name="scheduler_health")
+
+        # Phase 6 picker. Uses the dedicated `self._picker_bridge` so a
+        # picker flood cannot starve user-chat turns (B-W2-6).
+        if self._settings.subagent.enabled:
+            assert self._picker_bridge is not None
+            self._subagent_picker = SubagentRequestPicker(
+                self._sub_store,
+                self._picker_bridge,
+                settings=self._settings,
+            )
+            self._spawn_bg(self._subagent_picker.run(), name="subagent_picker")
 
         # Fire-and-forget housekeeping. `Daemon.start()` must not wait on
         # GitHub or `uv sync`; bootstrap has its own 120 s timeout internally.
@@ -701,6 +805,13 @@ class Daemon:
                 self._scheduler_dispatcher.stop()
             except Exception:
                 self._log.warning("stop_step_failed", step="scheduler_dispatcher", exc_info=True)
+        # Phase 6: signal picker to stop BEFORE bg drain so no new
+        # dispatches land mid-drain.
+        if self._subagent_picker is not None:
+            try:
+                self._subagent_picker.request_stop()
+            except Exception:
+                self._log.warning("stop_step_failed", step="subagent_picker", exc_info=True)
 
         # Step 2.
         if self._bg_tasks:
@@ -742,6 +853,67 @@ class Daemon:
                         "daemon_shield_drain_timeout",
                         count=len([t for t in updates if not t.done()]),
                     )
+
+        # Step 2.6 — phase 6 (GAP #12): drain subagent notify tasks. The
+        # Stop hook register shielded `adapter.send_text` tasks onto
+        # `_subagent_pending`; we MUST finish them before `adapter.stop()`
+        # closes the aiogram session.
+        if self._subagent_pending:
+            sub_updates = list(self._subagent_pending)
+            self._log.info("daemon_draining_subagent_notifies", count=len(sub_updates))
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*sub_updates, return_exceptions=True),
+                    timeout=self._settings.subagent.drain_timeout_s,
+                )
+            except TimeoutError:
+                self._log.warning(
+                    "daemon_subagent_drain_timeout",
+                    count=len([t for t in sub_updates if not t.done()]),
+                )
+
+        # Step 2.7 — GAP #13: warn-only ps-sweep for orphan `claude` CLI
+        # subprocesses from a killed subagent. We do NOT kill; the
+        # operator reads the log and decides. Gated on the picker
+        # having actually run — no picker → no subagent subprocesses,
+        # so no orphan risk worth scanning for. Skipping in this branch
+        # also keeps the legacy bootstrap tests (which monkeypatch
+        # `create_subprocess_exec` globally with a fixed-count
+        # iterator) honest. Detection-only; uses
+        # `asyncio.create_subprocess_exec` so `stop()` stays fully
+        # cooperative (ASYNC221). Broad except: a failure here must
+        # NEVER propagate into stop()'s critical cleanup order
+        # (DB close, pidfile release).
+        if self._subagent_picker is not None:
+            try:
+                ps_proc = await asyncio.create_subprocess_exec(
+                    "ps",
+                    "-Ao",
+                    "pid,command",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                try:
+                    ps_out, _ = await asyncio.wait_for(ps_proc.communicate(), timeout=2.0)
+                except TimeoutError:
+                    ps_proc.kill()
+                    await ps_proc.wait()
+                    ps_out = b""
+                ps_text = ps_out.decode("utf-8", errors="replace")
+                my_pid = str(os.getpid())
+                claude_lines = [
+                    line
+                    for line in ps_text.splitlines()
+                    if "claude" in line and "grep" not in line and my_pid not in line
+                ]
+                if claude_lines:
+                    self._log.warning(
+                        "phase6_possible_orphan_claude_processes",
+                        count=len(claude_lines),
+                        sample=claude_lines[:3],
+                    )
+            except Exception:
+                self._log.debug("phase6_ps_sweep_skipped", exc_info=True)
 
         # Step 3.
         if self._adapter is not None:
