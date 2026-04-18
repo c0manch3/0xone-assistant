@@ -150,7 +150,11 @@ async def test_picker_dispatches_pending_and_patches_row(tmp_path: Path) -> None
     await store._conn.close()
 
 
-async def test_picker_skips_cancelled_rows(tmp_path: Path) -> None:
+async def test_picker_drops_cancelled_rows_on_first_tick(tmp_path: Path) -> None:
+    """Fix-pack HIGH #1 (CR I-3 / devil H-3): cancelled `requested`
+    rows are transitioned straight to `dropped` on the first tick
+    instead of log-spamming every tick for up to 1 h until
+    recover_orphans sweeps them."""
     store = await _mkstore(tmp_path)
     jid = await store.record_pending_request(
         agent_type="general",
@@ -165,17 +169,23 @@ async def test_picker_skips_cancelled_rows(tmp_path: Path) -> None:
     picker = SubagentRequestPicker(store, bridge, settings=_settings(tmp_path))
 
     run_task = asyncio.create_task(picker.run())
-    await asyncio.sleep(0.3)  # several ticks
+    # Poll for the transition; should happen on the first tick.
+    for _ in range(40):
+        job = await store.get_by_id(jid)
+        assert job is not None
+        if job.status == "dropped":
+            break
+        await asyncio.sleep(0.05)
     picker.request_stop()
     await asyncio.wait_for(run_task, timeout=2.0)
 
-    # Bridge NEVER called.
+    # Bridge NEVER called (no dispatch for a cancelled row).
     assert bridge.calls == []
-    # Row remains 'requested' with cancel_requested=1. recover_orphans
-    # will eventually drop it via the stale-1h bucket.
+    # Row transitioned to `dropped` + carries finished_at.
     job = await store.get_by_id(jid)
     assert job is not None
-    assert job.status == "requested"
+    assert job.status == "dropped"
+    assert job.finished_at is not None
     assert job.cancel_requested is True
     await store._conn.close()
 

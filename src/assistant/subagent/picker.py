@@ -130,7 +130,23 @@ class SubagentRequestPicker:
                 if job.id in self._inflight:
                     continue
                 if job.cancel_requested:
-                    log.info("picker_skipping_cancelled", job_id=job.id)
+                    # Fix-pack HIGH #1 (CR I-3 / devil H-3): transition
+                    # the row explicitly on first observation instead
+                    # of log-skipping it on every tick. Without this
+                    # a cancelled `requested` row produces up to 3600
+                    # log lines before `recover_orphans` drops it via
+                    # the 1-h stale bucket.
+                    try:
+                        dropped = await self._store.drop_cancelled_request(job.id)
+                    except Exception:
+                        log.warning(
+                            "picker_drop_cancelled_failed",
+                            job_id=job.id,
+                            exc_info=True,
+                        )
+                        continue
+                    if dropped:
+                        log.info("picker_dropped_cancelled", job_id=job.id)
                     continue
                 self._inflight.add(job.id)
                 task = asyncio.create_task(

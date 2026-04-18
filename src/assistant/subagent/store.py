@@ -321,6 +321,39 @@ class SubagentStore:
             return {"already_terminal": current_status}
         return {"cancel_requested": True, "previous_status": current_status}
 
+    async def drop_cancelled_request(self, job_id: int) -> bool:
+        """Transition a cancelled `requested` row straight to `dropped`.
+
+        Phase-6 fix-pack HIGH #1 (CR I-3 / devil H-3). The picker
+        previously logged `picker_skipping_cancelled` on every tick
+        for a row in `status='requested' AND cancel_requested=1` —
+        plan §3.6 promises `recover_orphans` will eventually drop
+        those via the 1-h stale bucket, but that is 3600 log lines
+        per cancelled row in the interim. With this method the
+        picker transitions the row explicitly on the first
+        observation, so subsequent ticks don't see it at all.
+
+        Status precondition: the row MUST still be `requested` AND
+        carry `cancel_requested=1`. A race where the picker already
+        flipped the row to `started` between `list_pending_requests`
+        and this call leaves `rowcount=0` — we log skew and return
+        False so the caller can fall through cleanly.
+
+        Returns True iff the row transitioned.
+        """
+        finished_at = _utcnow_iso()
+        async with self._lock:
+            cur = await self._conn.execute(
+                "UPDATE subagent_jobs SET status='dropped', finished_at=? "
+                "WHERE id=? AND status='requested' AND cancel_requested=1",
+                (finished_at, job_id),
+            )
+            await self._conn.commit()
+        dropped = (cur.rowcount or 0) > 0
+        if not dropped:
+            log.info("subagent_drop_cancelled_noop", job_id=job_id)
+        return dropped
+
     async def is_cancel_requested(self, sdk_agent_id: str) -> bool:
         """Read the cancel flag by `sdk_agent_id`.
 

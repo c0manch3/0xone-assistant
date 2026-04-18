@@ -59,7 +59,7 @@
 - Spawn через CLI (`python tools/task/main.py spawn`) возвращает `{"job_id": N, "status": "requested"}` мгновенно; picker подхватывает row'у и дисптчит subagent'а async. Native Task tool — sync RPC, main turn блокируется до завершения subagent'а (S-6-0 Q1 FAIL; documented caveat — для коротких задач приемлемо).
 - 3 параллельных subagent'а от 3 последовательных turn'ов работают взаимонезависимо; каждая имеет уникальный `session_id` и `agent_id`.
 - SubagentStop hook получает callback с `agent_transcript_path` → читает финальный assistant text → доставляет в Telegram владельцу через `adapter.send_text` (chunked).
-- Footer формат сохранён: `[job N status in Xs, kind=K, cost=$Y]` (Q4 locked).
+- Footer формат: `[job N, <status>, in Xs, kind=K(, cost=$Y)?]` (Q4 locked; fix-pack HIGH #2 / devil H-7: когда `cost_usd IS NULL` — сегмент `cost=` ОМИТ-ится, сегменты разделены `, `).
 - Scheduler-spawned subagent: ledger row хранит `callback_chat_id=OWNER_CHAT_ID`, `spawned_by_kind='scheduler'`; SubagentStop hook доставляет результат корректно.
 - `subagent_jobs.recover_orphans` на boot переводит unfinished `status='started'` в `'interrupted'` + notify владельца.
 - CLI `cancel <id>`: выставляет `cancel_requested=1`; subagent видит флаг (механизм по результатам S-6-0) → завершается с `status='stopped'`.

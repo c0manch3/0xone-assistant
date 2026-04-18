@@ -1,8 +1,11 @@
 """Phase 6 / commit 4 — notification formatter.
 
 Covers:
-  * Footer format is locked: `[job N <status> in <D>s, kind=<k>, cost=$.XXXX]`.
-  * `cost_usd=None` renders as `$?` (phase-6 default per GAP #11).
+  * Footer shape: `[job N <status> in <D>s, kind=<k>(, cost=$.XXXX)?]`.
+  * `cost_usd=None` OMITS the `cost=` segment entirely (fix-pack
+    HIGH #2 / devil H-7 — phase 6 never populates cost, so the
+    pre-fix `$?` placeholder was UX cruft on every notify).
+  * `cost_usd` set renders with 4-decimal formatting.
   * UTF-8 truncation respects character boundaries (no half-emoji).
   * Missing timestamps → duration 0s (graceful fallback, not crash).
 """
@@ -48,7 +51,28 @@ def test_footer_shape_basic() -> None:
     # Body first, then divider, then footer.
     assert out.startswith("hello world")
     assert "\n\n---\n" in out
-    assert "[job 7 completed in 17s, kind=general, cost=$?]" in out
+    # Fix-pack HIGH #2: cost segment OMITTED when NULL (phase 6
+    # default). Segments joined with ", " per the reviewer-supplied
+    # snippet. Plan §Q4's locked format required the cost segment
+    # itself; we preserve the rest of the shape and drop ONLY the
+    # NULL-cost case.
+    assert "[job 7, completed, in 17s, kind=general]" in out
+
+
+def test_footer_omits_cost_segment_when_cost_usd_is_none() -> None:
+    """Fix-pack HIGH #2 (devil H-7): NULL cost must NOT render as
+    `cost=$?`. Phase 6 always stores NULL (GAP #11), so the segment
+    would be pure cruft on every notify."""
+    job = _mkjob(cost_usd=None)
+    out = format_notification(
+        result_text="body",
+        job=job,
+        max_body_bytes=4096,
+    )
+    # No 'cost=' anywhere in the footer.
+    footer = out.split("\n\n---\n")[-1]
+    assert "cost=" not in footer, footer
+    assert "$?" not in footer, footer
 
 
 def test_footer_includes_cost_when_set() -> None:

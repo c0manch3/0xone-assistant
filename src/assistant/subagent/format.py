@@ -42,12 +42,21 @@ def format_notification(
         truncated = True
 
     duration = _compute_duration_s(job)
-    cost = f"${job.cost_usd:.4f}" if job.cost_usd is not None else "$?"
-    footer = (
-        f"\n\n---\n"
-        f"[job {job.id} {job.status} in {duration:.0f}s, "
-        f"kind={job.agent_type}, cost={cost}]"
-    )
+    # Fix-pack HIGH #2 (devil H-7): omit the `cost=` segment when the
+    # value is NULL. Phase 6 never stores a cost (GAP #11 — deferred
+    # to phase 9), so every notify was ending with `cost=$?`, a piece
+    # of cruft that added noise without conveying information. Plan
+    # §Q4's "cost=${cost}" format is preserved for the case where the
+    # value is set (phase 9).
+    segments = [
+        f"job {job.id}",
+        job.status,
+        f"in {duration:.0f}s",
+        f"kind={job.agent_type}",
+    ]
+    if job.cost_usd is not None:
+        segments.append(f"cost=${job.cost_usd:.4f}")
+    footer = f"\n\n---\n[{', '.join(segments)}]"
     if truncated:
         body += "\n\n[truncated]"
     return body + footer
