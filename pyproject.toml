@@ -10,6 +10,21 @@ dependencies = [
   "structlog>=25.1",
   "claude-agent-sdk>=0.1.59,<0.2",
   "pyyaml>=6.0",
+  # Phase 7 — media tools (shared main venv, see detailed-plan.md §9 + S-4/S-8)
+  # Pillow floor ≥10.4 is the oldest release without known RCE/decoder
+  # CVEs at time of planning (H-8); fpdf2 declares Pillow!=9.2.*,>=8.3.2
+  # so we tighten the floor further. Upper bound <13 protects against
+  # upstream API churn (Pillow 12→13 bump).
+  "Pillow>=10.4,<13",
+  "pypdf>=4.0,<7",
+  "python-docx>=1.0,<2",
+  "openpyxl>=3.1,<4",
+  "striprtf>=0.0.28",
+  "defusedxml>=0.7",
+  "fpdf2>=2.7,<3",
+  # lxml pulled in transitively by python-docx; pin explicitly so
+  # security updates are visible in this manifest (H-8).
+  "lxml>=5.0,<7",
 ]
 
 [dependency-groups]

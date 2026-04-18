@@ -488,6 +488,19 @@ hooks = make_pretool_hooks(
 
 ## 9. MediaSettings config
 
+**Dep footprint (empirical, S-4 + S-8):** phase-7 deps add **+48.75 MB**
+to the shared venv. Top contributors (on x86_64 Linux wheels, manylinux
+_2_28): lxml 18.8 MB (transitive via python-docx), Pillow 12.5 MB
+(transitive via fpdf2), fontTools 11.8 MB (transitive via fpdf2).
+Direct deps (pypdf 1.4 MB, python-docx 1.5 MB, fpdf2 1.3 MB, openpyxl
+0.8 MB, defusedxml <50 KB, striprtf <20 KB) together <5 MB.
+
+S-8 (v2 fix-pack, H-7) verified every dep ships a manylinux_2_28
+wheel (Pillow/lxml/fontTools) or py3-none-any pure-Python wheel
+(pypdf/python-docx/openpyxl/striprtf/defusedxml/fpdf2). VPS `uv
+sync` does NOT trigger a source build — no `libxml2-dev`/zlib-dev
+system requirement on the owner's Linux host.
+
 `config.py` +50 LOC:
 
 ```python
@@ -600,8 +613,8 @@ Bash hook `_PYTHON_ALLOWED_PREFIXES = ("tools/", "skills/")` — unchanged.
 | 11 | `tools/task/_lib/…` | move from `_memlib/` to `_lib/` |
 | 12 | `tools/skill_installer/_lib/__init__.py` | rename from `_memlib/__init__.py` |
 | 13 | `tools/skill_installer/_lib/…` | move from `_memlib/` to `_lib/` |
-| 14 | `tests/test_memory_cli_*.py` (7 files) | `from _memlib` → `from tools.memory._lib` |
-| 15 | `tests/test_skill_installer_*.py` (8 files) | `from _memlib` → `from tools.skill_installer._lib` |
+| 14 | `tests/` `_memlib` imports (v2 H-9 — exact list): `test_memory_lock_probe.py:11`, `test_memory_vault_dir_mode_0o700.py:8`, `test_memory_atomic_write_fsync.py:10`, `test_memory_frontmatter_roundtrip.py:7`, `test_tmp_dir_chmods_loose_perms.py:8`, `test_sanitize_body_fence_awareness.py:5`, `test_memory_wikilinks_preserved.py:7`, `test_memory_write_body_with_frontmatter_marker_sanitized.py:7` (**8 files**) | `from _memlib` → `from tools.memory._lib` |
+| 15 | (v2 H-9 correction) `tools/skill-installer/_lib/` already exists today (verified 2026-04-17); only the top-level dir is renamed `skill-installer` → `skill_installer`. No test files currently import `from _memlib` for skill-installer — they hit `_lib` via `_INSTALLER_DIR` conftest shim, which is removed. | keep `_lib`; update `_INSTALLER_DIR` removal |
 | 16 | `tests/test_task_subprocess_spawn.py` | drop embedded `sys.path.insert` hack; use canonical invocation |
 | 17 | `pyproject.toml` | drop `_lib`, `_memlib` из `[tool.ruff.isort] known-first-party` |
 | 18 | `tests/conftest.py` | drop `_INSTALLER_DIR`, `_MEMORY_DIR` shims |
@@ -708,12 +721,21 @@ Scheduler-turn → `attachments=None` (scheduler никогда не инжек�
 
 ## 13. File tree
 
-### 13.1. New (~2000 LOC)
+### 13.1. New (~2000 LOC) — v2 fix-pack (C-1)
+
+**v2 fix-pack (C-1, Q-7-5 alignment):** per-tool `pyproject.toml`
+files are NOT shipped. The shared main venv (Q-7-5) is the single
+source of truth — phase-7 deps live in the ROOT `pyproject.toml`
+`[project.dependencies]` list. Coder creates ONLY `__init__.py`
+markers under `tools/<name>/`. See `plan/phase7/implementation.md`
+commit #2b (new).
 
 | Путь | LOC | Role |
 |---|---|---|
 | `spikes/phase7_s0_multimodal_envelope.py` | 180 | Spike 0 |
 | `spikes/phase7_s0_findings.md` | (md) | Verdict + decisions |
+| `spikes/phase7_s8_x86_64_linux_wheels.py` | 110 | (v2) manylinux wheel audit |
+| `spikes/phase7_s8_report.json` | — | (v2) S-8 raw report |
 | `tools/__init__.py` | 5 | Package root |
 | `tools/memory/__init__.py` | 0 | marker |
 | `tools/schedule/__init__.py` | 0 | marker |
@@ -721,17 +743,13 @@ Scheduler-turn → `attachments=None` (scheduler никогда не инжек�
 | `tools/task/__init__.py` | 0 | marker |
 | `tools/transcribe/__init__.py` | 0 | marker |
 | `tools/transcribe/main.py` | 150 | HTTP client |
-| `tools/transcribe/pyproject.toml` | 20 | deps |
 | `tools/genimage/__init__.py` | 0 | marker |
 | `tools/genimage/main.py` | 180 | HTTP client + quota |
-| `tools/genimage/pyproject.toml` | 20 | deps |
 | `tools/extract_doc/__init__.py` | 0 | marker (underscore for Python importability) |
 | `tools/extract_doc/main.py` | 220 | Local extractor |
-| `tools/extract_doc/pyproject.toml` | 25 | deps |
 | `tools/render_doc/__init__.py` | 0 | marker (underscore for Python importability) |
 | `tools/render_doc/main.py` | 200 | Local renderer |
 | `tools/render_doc/_lib/DejaVuSans.ttf` | (binary) | ~700KB |
-| `tools/render_doc/pyproject.toml` | 25 | deps |
 | `skills/transcribe/SKILL.md` | 90 | manifest (+ §4.5 guidance) |
 | `skills/genimage/SKILL.md` | 85 | manifest (+ §4.5 guidance) |
 | `skills/extract-doc/SKILL.md` | 85 | manifest (+ §4.5 guidance) |
@@ -765,7 +783,8 @@ Scheduler-turn → `attachments=None` (scheduler никогда не инжек�
 | `tools/schedule/main.py` | -15/+15 | same |
 | `tools/skill_installer/main.py` | -15/+15 | same + dir renamed |
 | `tools/task/main.py` | -10/+12 | sys.path rewrite + pragma |
-| `pyproject.toml` | -3/+1 | drop `_lib`,`_memlib` from known-first-party |
+| `pyproject.toml` (memlib) | -3/+1 | drop `_lib`,`_memlib` from known-first-party |
+| `pyproject.toml` (v2 C-1, commit 2b) | +15 | add phase-7 deps: `Pillow>=10.4,<13`, `pypdf>=4.0,<7`, `python-docx>=1.0,<2`, `openpyxl>=3.1,<4`, `striprtf>=0.0.28`, `defusedxml>=0.7`, `fpdf2>=2.7,<3`, `lxml>=5.0,<7` |
 | `tests/conftest.py` | -8/+0 | drop `_INSTALLER_DIR`,`_MEMORY_DIR` shims |
 | `src/assistant/bridge/system_prompt.md` | ~3 | `skill-installer` → `skill_installer` references |
 
@@ -933,28 +952,44 @@ MediaAttachment+IncomingMessage (adapters/base.py) ──┐
 |---|---|---|---|
 | 1 | Spike 0 findings + report | — | standalone |
 | 2 | _memlib refactor | #1 | seq BLOCKER |
-| 3 | MediaSettings config | #2 | — |
-| 4 | MediaAttachment + IncomingMessage + adapter abstracts | #2 | — |
+| 2b | **(v2 C-1)** Root `pyproject.toml` — add phase-7 deps | #2 | seq BLOCKER |
+| 3 | MediaSettings config | #2b | — |
+| 4 | MediaAttachment + IncomingMessage + adapter abstracts | #2b | — |
 | 5 | media/ sub-package | #3 | **Wave B** |
 | 6 | adapters/dispatch_reply.py | #4 | **Wave B** (parallel #5) |
-| 7 | tools/transcribe/ + skill | #2 | **Wave A** |
-| 8 | tools/genimage/ + skill | #2 | **Wave A** |
-| 9 | tools/extract-doc/ + skill | #2 | **Wave A** |
-| 10 | tools/render-doc/ + skill | #2 | **Wave A** |
+| 7 | tools/transcribe/ + skill | #2b | **Wave A** |
+| 8 | tools/genimage/ + skill | #2b | **Wave A** |
+| 9 | tools/extract-doc/ + skill | #2b | **Wave A** |
+| 10 | tools/render-doc/ + skill | #2b | **Wave A** |
 | 11 | Bash allowlist extension | #7,#8,#9,#10 | seq after Wave A |
-| 12 | TelegramAdapter handlers + send methods | #4, #6 | — |
-| 13 | Handler + bridge multimodal envelope | #4, #11 | — |
+| 12 | TelegramAdapter handlers + send methods + attachment dedup (I-7.6, C-6) | #4, #6 | **Wave 6A** |
+| 13 | Handler + bridge multimodal envelope (path_tool branch C-4, turn-id H-10) | #4, #11 | **Wave 6B** (parallel #12) |
 | 14 | SchedulerDispatcher → dispatch_reply | #6 | **Wave C** |
-| 15 | SubagentStop → dispatch_reply | #6 | **Wave C** (parallel #14) |
+| 15 | SubagentStop → dispatch_reply (factory drops `outbox_root` H-11) | #6 | **Wave C** (parallel #14) |
 | 16 | Daemon.start integration | #3, #5, #14, #15 | seq |
 | 17 | Integration E2E tests | #11–#16 | — |
 | 18 | Unit tests (20 files) | all code | **Wave D** (per-file parallel up to 12) |
 | 19 | Documentation update | all | — |
 
-### 19.3. Parallel wave breakdown
+### 19.3. Parallel wave breakdown — v2 fix-pack (C-1, C-5)
 
-- **Wave A (post-Spike-0, post-memlib):** 4 CLI в отдельных dirs — полная изоляция. 4 agents × ~200 LOC = ~800 LOC parallel.
-- **Wave B (post-config/adapter):** media/ + dispatch_reply — 2 independent files. 2 agents.
+- **Wave 0 (v2 C-1):** commit 2b — root `pyproject.toml` dep addition.
+  Sequential BLOCKER before any tool/media commit.
+- **Wave A (post-Spike-0, post-memlib, post-2b):** 4 CLI в отдельных
+  dirs — полная изоляция. 4 agents × ~200 LOC = ~800 LOC parallel.
+- **Wave B (post-config/adapter):** media/ + dispatch_reply — 2
+  independent files. 2 agents.
+- **Wave 6A/6B (v2 C-5, split from old combined Wave 6):**
+  - **Wave 6A:** commit 12 — `adapters/telegram.py` (+200 LOC) —
+    media handlers, send_* methods, adapter-level attachment dedup
+    (I-7.6).
+  - **Wave 6B:** commit 13 — `handlers/message.py`,
+    `bridge/claude.py`, `bridge/history.py` (+105 LOC) — envelope
+    builder, path_tool branch (C-4), turn-id placeholder (H-10).
+  - File sets are disjoint (commit 12 touches `adapters/telegram.py`
+    only; commit 13 touches `handlers/`, `bridge/`). Both depend on
+    commit #4 (MediaAttachment / IncomingMessage.attachments in
+    `adapters/base.py`). Parallelisable — 2 agents.
 - **Wave C (post-dispatch-reply):** two one-line switches. 2 agents.
 - **Wave D (tests):** per-file parallelisable up to 12.
 

@@ -27,6 +27,7 @@ Each spike has a Python script + JSON raw-report under `spikes/phase7_*`.
 | S-5 | Genimage quota race | **PASS (with known jitter)** | 4/4 scenarios green: midnight rollover OK, flock prevents double-increment under 10-worker contention. NTP step-back across midnight creates ±1 extra request. | Accept known jitter; keep flock pattern from plan §3.2 |
 | S-6 | aiogram File.file_size semantics | **PASS** | `File.file_size: int \| None` confirmed across ALL 5 media classes (Voice, VideoNote, Document, PhotoSize, Audio). SizeCappedWriter pattern aborts mid-download for None-sized overruns. | Update §5.5 `media/download.py` to implement pre-flight + streaming cap |
 | S-7 | Handler partial-attachment failure | **PASS** | 3-photo middle-missing scenario produces 2 image_blocks + 3 notes (including failure-note), 1 warn recorded. | Update §6.1 pseudocode to the tested "safe" form |
+| **S-8 (v2 fix-pack, H-7)** | x86_64 manylinux_2_28 wheel availability | **PASS** | All 9 phase-7 deps ship wheels for x86_64 Linux: pillow/lxml/fonttools = manylinux_2_28; pypdf/python-docx/openpyxl/striprtf/defusedxml/fpdf2 = py3-none-any pure-python. `uv sync` on VPS does NOT trigger source build. | No action needed; documented risk (Alpine/musl would require source build) remains NA for glibc-based VPS. |
 
 Overall pipeline readiness: **GO for devil wave-2**, no blockers remain.
 
@@ -476,6 +477,127 @@ on SDK 0.1.59. Findings require incremental plan corrections (see
 | Plan §6.1 safe-handler pseudocode | tested in S-7 |
 | Plan §5.5 download cap pattern | tested in S-6 |
 | Plan §82 "no Pillow" wording correction flagged | to fix in wave-2 |
+
+## 9a. S-8 (v2 fix-pack, H-7) — x86_64 manylinux wheel audit
+
+- Script: `spikes/phase7_s8_x86_64_linux_wheels.py`
+- Raw report: `spikes/phase7_s8_report.json`
+- Method: `uv pip compile --python-platform x86_64-manylinux_2_28
+  --python-version 3.12 --only-binary=:all:` on a `requirements.in`
+  listing all phase-7 deps at their pinned floors (Pillow>=10.4,<13;
+  pypdf>=4.0; python-docx>=1.0; openpyxl>=3.1; striprtf>=0.0.28;
+  defusedxml>=0.7; fpdf2>=2.7; lxml>=5.0; fonttools>=4.34).
+
+### Per-package wheel selection
+
+| Package | Version resolved | Wheel tag |
+|---|---|---|
+| Pillow | 12.2.0 | `cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl` |
+| lxml | 6.1.0 | `cp312-cp312-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl` |
+| fonttools | 4.62.1 | `cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl` |
+| pypdf | 6.10.2 | `py3-none-any.whl` (pure) |
+| python-docx | 1.2.0 | `py3-none-any.whl` (pure) |
+| openpyxl | 3.1.5 | `py2.py3-none-any.whl` (pure) |
+| striprtf | 0.0.29 | `py3-none-any.whl` (pure) |
+| defusedxml | 0.7.1 | `py2.py3-none-any.whl` (pure) |
+| fpdf2 | 2.8.7 | `py3-none-any.whl` (pure) |
+
+Plus transitive: et-xmlfile 2.0.0 (pure), typing-extensions 4.15.0
+(pure).
+
+### Verdict
+
+**PASS** — every C-extension (Pillow, lxml, fontTools) has an
+explicit manylinux_2_28 wheel. Pure-Python packages (pypdf,
+python-docx, etc.) install on any platform. VPS `uv sync` does NOT
+require a C toolchain or system libs (libxml2-dev / libjpeg-dev
+NOT needed).
+
+### Risk note
+
+Single platform NOT verified: **Alpine Linux / musl**. None of
+Pillow/lxml/fontTools ship musllinux wheels in their 10.4+/5.0+/
+4.34+ ranges out of the box. If the owner's VPS later migrates to
+an Alpine-based distro, `uv sync` would fall back to source build
+and require `libxml2-dev`, `libjpeg-dev`, `zlib-dev`, + a working
+C toolchain. Mitigation (deferred): document Alpine as unsupported
+or add musllinux fallback wheel mirroring. NOT a blocker for current
+glibc-based VPS.
+
+## 9b. C-3 (v2 fix-pack) — aiogram 3.26 download source audit
+
+Devil wave-2 asked: does `aiogram.Bot.download_file` swallow
+exceptions raised by a custom `BinaryIO` destination's `write()`,
+bypassing our `SizeCappedWriter` size cap silently?
+
+### Method
+
+Read-only source audit of `.venv/lib/python3.12/site-packages/
+aiogram/client/bot.py` (aiogram 3.26 installed in project venv).
+
+### Findings
+
+`Bot.download_file(file_path, destination=<BinaryIO>, ...)` flow
+(lines 397-444):
+
+1. `destination is None` → instantiates `io.BytesIO()` (NOT our case).
+2. `isinstance(destination, (str, pathlib.Path))` → calls
+   `__download_file` which uses `aiofiles.open(destination, "wb")`.
+   Our `SizeCappedWriter` is a wrapper object — NOT str/Path —
+   so this branch does NOT fire.
+3. Otherwise (our case): calls `__download_file_binary_io(destination,
+   seek, stream)` — lines 371-379:
+
+```python
+async def __download_file_binary_io(
+    cls, destination: BinaryIO, seek: bool, stream: AsyncGenerator[bytes, None]
+) -> BinaryIO:
+    async for chunk in stream:
+        destination.write(chunk)
+        destination.flush()
+    if seek is True:
+        destination.seek(0)
+    return destination
+```
+
+Zero try/except. An exception raised by `destination.write(chunk)`
+propagates up the async generator, out of `__download_file_binary_io`,
+past the outer `try/finally` in `download_file` (line 435-444 — only
+closes the stream, doesn't swallow), and back to the caller.
+
+### Implications for `SizeCappedWriter`
+
+- `write(data: bytes) -> int`: MUST be implemented. Aiogram calls
+  this per chunk. Our implementation tracks cumulative bytes and
+  raises `SizeCapExceeded` on overrun.
+- `flush() -> None`: MUST be implemented. Aiogram calls `flush()`
+  after EVERY `write()`. A missing `flush` attribute would raise
+  `AttributeError` from within aiogram's loop, propagate up the
+  same way, but surface as `AttributeError` rather than our
+  semantic `SizeCapExceeded`. Safer to implement flush as a
+  pass-through to the wrapped file handle.
+- `seek(offset: int)` is called by aiogram only when `seek=True`
+  (default) on successful completion. On an overrun we raise
+  before seek — no need to implement.
+
+### Decision
+
+- `media/download.py::SizeCappedWriter` MUST implement `write` AND
+  `flush` (documented as MANDATORY in implementation.md pitfall §3
+  v2 fix-pack update).
+- Caller wraps `bot.download_file(...)` in try/except `SizeCapExceeded`;
+  on catch: `dest_path.unlink(missing_ok=True)`.
+- Post-download stat-size recheck is a defensive deferred option
+  for phase 9 — current mechanism is theoretically sound AND validated
+  by S-6 behavioural test + this source audit.
+
+### Residual risk
+
+None known. If aiogram 3.x future release changes `__download_file_
+binary_io` to add try/except swallowing write errors, our
+`test_media_download.py` cases B (None-size, 400 KB payload, cap
+100 KB → rejected mid-stream) and D would catch the regression
+immediately.
 
 ## 10. Open questions for devil wave-2
 

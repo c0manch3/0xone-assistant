@@ -1,4 +1,4 @@
-# Phase 7 — Implementation v1 (spike-verified, 2026-04-17)
+# Phase 7 — Implementation v2 (fix-pack, 2026-04-17)
 
 Thin layer over phase-6 subagent infrastructure + adapter extensions.
 Media path: Telegram voice/photo/document/audio/video_note → handler
@@ -15,6 +15,7 @@ Empirical backing:
 - `spikes/phase7_s5_quota_race.py` — flock quota race at midnight.
 - `spikes/phase7_s6_bot_download.py` — None-tolerant size cap pattern.
 - `spikes/phase7_s7_handler_partial_fail.py` — safe multi-attachment pseudocode.
+- `spikes/phase7_s8_x86_64_linux_wheels.py` — manylinux wheel audit (v2 fix-pack).
 - `plan/phase7/spike-findings.md` — consolidated verdict + evidence.
 
 Companion docs (coder **must** read first):
@@ -29,6 +30,31 @@ Companion docs (coder **must** read first):
 ## Revision history
 
 - **v1** (2026-04-17, after S-0..S-7): initial coder-ready spec.
+- **v2** (2026-04-17, fix-pack): closes devil wave-2 blockers C-1..C-6 and
+  highs H-7..H-15. Key deltas:
+  - **C-1:** root `pyproject.toml` now carries phase-7 deps (single venv,
+    Option A). Per-tool `pyproject.toml` files demoted to doc artefacts;
+    coder ships only `__init__.py` markers under `tools/<name>/`.
+  - **C-2:** real-photo fixture requirement promoted to REQUIRED in §7.
+  - **C-3:** aiogram 3.26 source-audited — `__download_file_binary_io`
+    does NOT swallow `SizeCapExceeded`; pattern validated. `SizeCappedWriter`
+    MUST implement `write()` AND `flush()` (aiogram calls both).
+  - **C-4:** `photo_mode="path_tool"` silent-drop fixed — explicit
+    `elif` branch in §3.1 handler.
+  - **C-5:** Wave 6 split into parallel Wave 6A (commit 12) + Wave 6B
+    (commit 13) — disjoint file sets.
+  - **C-6:** adapter-level dedup of `IncomingMessage.attachments` by
+    `local_path` (invariant I-7.6).
+  - **H-7/S-8:** x86_64 manylinux_2_28 wheel audit passed (9/9 packages).
+  - **H-8:** `Pillow>=10.4,<13` pinned at root; fpdf2 capped `<3`.
+  - **H-9:** exact `_memlib` test-file list (8 import-level + conftest.py).
+  - **H-10:** history placeholder now includes turn_id.
+  - **H-11:** `make_subagent_hooks` drops `outbox_root` param (derived inside).
+  - **H-12:** dedup ledger test split into real-clock (xfail-if-flaky)
+    and mock-clock (authoritative) variants.
+  - **H-13:** `colon_before` regex fallback fixed at prompt level.
+  - **H-14:** all-photos-fail scenario covered.
+  - **H-15:** wave-plan.md invalidation rule added to `parallel-split-agent.md`.
 
 ## 0. Pitfall box (MUST READ) — spike-verified
 
@@ -40,8 +66,12 @@ either has a spike citation or a phase-summary cross-ref.
    `fpdf` at any point triggers PIL module load (22 PIL submodules
    observed in `sys.modules`). **Plan `description.md` §82 is wrong and
    must be edited in the Plan-revision commit.** Accept Pillow as a
-   required transitive dep; pin `pillow>=10,<13` in
-   `tools/render_doc/pyproject.toml` per S-3.
+   required transitive dep. **(v2 fix-pack, H-8):** Pillow pinned
+   `>=10.4,<13` at root `pyproject.toml`. 10.4 is the minimum release
+   without known CVE-2023-50447/CVE-2024-28219 class decoder RCEs at
+   planning time. Upper bound `<13` protects against API churn. Review
+   Pillow CVE feed before each upgrade — it is on the hot path
+   (photo decode + fpdf2 render).
 
 2. **DO NOT** use plan §7's regex as written. S-2 found 4 real false
    positives (URL containing a `.png` path; relative `./outbox/x.png`;
@@ -61,6 +91,29 @@ either has a spike citation or a phase-summary cross-ref.
    pair it with a streaming `SizeCappedWriter` that aborts when the
    wrapped writer exceeds `cap` bytes. On abort: `dest_path.unlink
    (missing_ok=True)` to clean up the partial file.
+
+   **(v2 fix-pack, C-3):** aiogram 3.26 `Bot.download_file` source
+   audit (`.venv/lib/python3.12/site-packages/aiogram/client/bot.py`
+   lines 371-444) verified that `__download_file_binary_io` is a bare
+   `async for chunk in stream: destination.write(chunk); destination.
+   flush()` loop with NO try/except. `SizeCapExceeded` raised inside
+   `write()` propagates upward through the async generator and out of
+   `download_file` — the cap IS enforced. Implementation MUST:
+   - Pass a custom BinaryIO wrapper (NOT `str | Path`) so aiogram
+     takes the `BinaryIO` branch (line 439-441). A string/Path sink
+     would go to `__download_file` which uses `aiofiles.open(...)`
+     directly and bypasses our wrapper.
+   - Implement BOTH `write(data: bytes) -> int` AND `flush() -> None`
+     on `SizeCappedWriter` (aiogram calls both per chunk).
+   - Catch `SizeCapExceeded` in the caller, `unlink(missing_ok=True)`
+     the partial file, re-raise or reject with appropriate reply.
+   - Fallback plan documented (deferred, not implemented): if a
+     future aiogram release DOES swallow the exception, the pre-flight
+     `file.file_size` check still rejects known-oversize files; the
+     residual risk is a None-sized oversize file slipping through.
+     Mitigation: post-download `dest_path.stat().st_size > cap` check
+     with explicit unlink + reject (deferred to phase 9 unless CI
+     catches a regression).
 
 4. **DO NOT** pass plan-as-written §6.1 pseudocode into the handler;
    S-7 showed a missing-photo in position 2 of 3 would crash the turn.
@@ -91,10 +144,20 @@ either has a spike citation or a phase-summary cross-ref.
 
 8. **DO NOT** expect Spike 0's 10 MB PASS to translate to real photos.
    The spike used padded-COM JPEGs with null-byte payloads (highly
-   compressible over HTTP/2). Real 10 MB JPEGs may be rejected by
-   content-moderation or compressed-size caps the API does not publicise.
-   Keep `MEDIA_PHOTO_MAX_INLINE_BYTES=5_242_880` (plan default).
-   Integration test SHOULD include one real JPEG > 3 MB.
+   compressible over HTTP/2 HPACK + gzip; real entropy ~7.5 bits/byte
+   JPEGs wire-transfer at ~1.33× their base64-encoded size). Real
+   10 MB JPEGs may be rejected by content-moderation or compressed-size
+   caps the API does not publicise. Keep `MEDIA_PHOTO_MAX_INLINE_BYTES
+   =5_242_880` (plan default).
+
+   **(v2 fix-pack, C-2):** integration test `test_handler_multimodal
+   _real_photo.py` is now REQUIRED (not "SHOULD"). Fixture: real JPEG
+   ≥3 MB at `tests/fixtures/phase7/real_photo_3mb.jpg` (real entropy,
+   NOT null-padded). If SDK rejects real-photo, fallback to
+   `MEDIA_PHOTO_MODE=path_tool` (see pitfall 16 below). Optional bonus:
+   a Cyrillic-filename variant (`tests/fixtures/phase7/фото_3mb.jpg`)
+   to shake out UTF-8 path-handling bugs in the adapter/handler/CLI
+   chain.
 
 9. **DO NOT** dedup only in `dispatch_reply` at send-time — also add
    **prompt-level guidance** in SKILL.md §4.5 (and `system_prompt.md`)
@@ -132,35 +195,77 @@ either has a spike citation or a phase-summary cross-ref.
     `[image: <path>]` placeholder to history per S-0 Q0-6 mode-B —
     negligible byte cost.
 
-## 1. Commit plan (19 commits, parallel-wave annotated)
+16. **(v2 fix-pack, C-4) DO NOT** leave `photo_mode="path_tool"` as
+    a silent no-op. The v1 handler had only the
+    `photo_mode=="inline_base64"` branch — setting
+    `MEDIA_PHOTO_MODE=path_tool` silently dropped photo attachments
+    (no `image_block` AND no note → model had no idea a photo was
+    sent). v2 §3.1 adds an explicit `elif att.kind == "photo" and
+    photo_mode == "path_tool":` branch that emits a note-only
+    envelope steering the model to a future vision CLI (or graceful
+    acknowledgement). Covered by
+    `test_handler_photo_path_tool_fallback.py`.
+
+17. **(v2 fix-pack, C-6) DO NOT** assume Telegram delivers each
+    attachment exactly once per `IncomingMessage`. Edit-message
+    updates and media-group regrouping can re-fire the same
+    file_id/local_path in one update cycle. Dedup invariant I-7.6:
+    `TelegramAdapter` normalises `IncomingMessage.attachments` to
+    contain unique `local_path` values before dispatching. Duplicates
+    are dropped at adapter level with `log.debug("attachment_dedup",
+    path=..., chat_id=...)`. Handler code (§3.1) loops assuming the
+    invariant; re-dedup there would only hide adapter bugs.
+
+18. **(v2 fix-pack, H-13) DO** include "always put a space after `:`
+    before an outbox path" as an explicit prompt-level rule in every
+    phase-7 `SKILL.md` + `bridge/system_prompt.md`. Regex v3 rejects
+    `готово:/abs/outbox/x.png` (no space) to avoid false positives on
+    URL scheme colons; the model must compensate with a space before
+    the path. Good: `готово: /abs/outbox/x.png`. Bad: `готово:/abs/
+    outbox/x.png`. Integration test asserts regex matches the
+    space-separated form produced by the skill-guided reply.
+
+## 1. Commit plan (20 commits, parallel-wave annotated) — v2
 
 Each commit under ~500 LOC diff. Coder runs `just lint && uv run pytest -x`
 between commits. Wave markers reference `detailed-plan.md §19.3` so the
 parallel-split agent can translate them to worktree assignments.
 
+**(v2 fix-pack, C-1):** commit 2b inserted — root `pyproject.toml`
+update runs BEFORE any tool/media commit. Per-tool `pyproject.toml`
+files (listed in original §13.1) are NOT shipped; only `__init__.py`
+markers under `tools/<name>/`. Single shared venv (Q-7-5).
+
 | # | Title | Wave | Dependencies |
 |---|-------|------|--------------|
 | 1 | Spike 0 findings + spike scripts (+ this doc) | standalone | — |
 | 2 | `_memlib` → `_lib` refactor (Q9a tech debt close) | seq | #1 |
-| 3 | `MediaSettings` config (env_prefix MEDIA_) | seq | #2 |
-| 4 | `MediaAttachment` + `IncomingMessage.attachments` + adapter abstracts | seq | #2 |
+| 2b | **(v2 new, C-1)** Root `pyproject.toml` — add phase-7 deps (Pillow/pypdf/python-docx/openpyxl/striprtf/defusedxml/fpdf2/lxml) with CVE-floor pins | seq | #2 |
+| 3 | `MediaSettings` config (env_prefix MEDIA_) | seq | #2b |
+| 4 | `MediaAttachment` + `IncomingMessage.attachments` + adapter abstracts | seq | #2b |
 | 5 | `src/assistant/media/` sub-package (paths, download, sweeper, artefacts) | **Wave B** | #3 |
 | 6 | `adapters/dispatch_reply.py` + `_DedupLedger` | **Wave B** | #4 |
-| 7 | `tools/transcribe/` + skill + thin-HTTP client | **Wave A** | #2 |
-| 8 | `tools/genimage/` + skill + flock quota | **Wave A** | #2 |
-| 9 | `tools/extract_doc/` + skill + local extractor | **Wave A** | #2 |
-| 10 | `tools/render_doc/` + skill + fpdf2/docx render | **Wave A** | #2 |
+| 7 | `tools/transcribe/` + skill + thin-HTTP client | **Wave A** | #2b |
+| 8 | `tools/genimage/` + skill + flock quota | **Wave A** | #2b |
+| 9 | `tools/extract_doc/` + skill + local extractor | **Wave A** | #2b |
+| 10 | `tools/render_doc/` + skill + fpdf2/docx render | **Wave A** | #2b |
 | 11 | Bash allowlist: `_validate_transcribe_argv` / `_genimage` / `_extract_doc` / `_render_doc` + factory plumbing | seq | #7-#10 |
-| 12 | `TelegramAdapter` media handlers + `send_photo/document/audio` | seq | #4, #6 |
-| 13 | Handler + bridge multimodal envelope (safe pseudocode per S-7) | seq | #4, #11 |
+| 12 | `TelegramAdapter` media handlers + `send_photo/document/audio` + attachment-dedup (I-7.6) | **Wave 6A** | #4, #6 |
+| 13 | Handler + bridge multimodal envelope (safe pseudocode per S-7; v2: path_tool branch, turn-id placeholder) | **Wave 6B** | #4, #11 |
 | 14 | `SchedulerDispatcher._deliver` → `dispatch_reply` switch | **Wave C** | #6 |
-| 15 | `subagent/hooks.py::on_subagent_stop` → `dispatch_reply` switch | **Wave C** | #6 |
-| 16 | `Daemon.start` integration (`ensure_media_dirs`, media-sweeper bg, outbox_root plumbing, `_dedup_ledger`) | seq | #3, #5, #14, #15 |
+| 15 | `subagent/hooks.py::on_subagent_stop` → `dispatch_reply` switch (v2: factory drops `outbox_root` param — derived inside) | **Wave C** | #6 |
+| 16 | `Daemon.start` integration (`ensure_media_dirs`, media-sweeper bg, `_dedup_ledger`) | seq | #3, #5, #14, #15 |
 | 17 | Integration E2E tests | seq | #11-#16 |
 | 18 | Unit tests (~20 files) | **Wave D** (partitions of 4) | all code |
-| 19 | Documentation update (description wording fix, SKILL.md §4.5) | seq | all |
+| 19 | Documentation update (description wording fix, SKILL.md §4.5 + `:` space rule H-13) | seq | all |
 
-Total: ~2030 LOC src + ~730 LOC modified + ~1460 LOC tests = ~4220 LOC.
+Total: ~2030 LOC src + ~740 LOC modified + ~1500 LOC tests = ~4270 LOC.
+
+**(v2 fix-pack, C-5)** Wave 6 SPLIT into 6A (commit 12, `adapters/
+telegram.py` +200 LOC) and 6B (commit 13, `handlers/message.py`,
+`bridge/claude.py`, `bridge/history.py` +105 LOC). File sets are
+disjoint — parallelisable. `parallel-split-agent.md §3` wave template
+updated.
 
 ## 2. Per-file signature specs
 
@@ -522,10 +627,16 @@ stands.
 
 ## 3. Per-file edit specs
 
-### 3.1 `src/assistant/handlers/message.py` (safe multi-attachment envelope)
+### 3.1 `src/assistant/handlers/message.py` (safe multi-attachment envelope) — v2 fix-pack (C-4)
 
 Insertion point: after `system_notes` build, before `self._bridge.ask`
 call (~line 206 in current file).
+
+**v2 deltas:**
+- New explicit `elif att.kind == "photo" and photo_mode == "path_tool":`
+  branch — closes C-4 silent-drop bug.
+- Handler relies on adapter-level dedup (I-7.6, C-6); no per-call
+  `seen_paths` loop here.
 
 ```python
 import base64
@@ -533,8 +644,9 @@ import base64
 
 # Phase 7: attachments → image_blocks + notes (safe per S-7).
 image_blocks: list[dict] = []
+photo_mode = self._settings.media.photo_mode
 for att in msg.attachments or ():
-    if att.kind == "photo" and self._settings.media.photo_mode == "inline_base64":
+    if att.kind == "photo" and photo_mode == "inline_base64":
         cap = self._settings.media.photo_max_inline_bytes
         if att.file_size is not None and att.file_size > cap:
             notes.append(
@@ -566,6 +678,16 @@ for att in msg.attachments or ():
         notes.append(
             f"user attached photo at {att.local_path} ({att.width}x{att.height})"
         )
+    elif att.kind == "photo" and photo_mode == "path_tool":
+        # (v2 fix-pack, C-4) Explicit fallback branch — env flag
+        # MEDIA_PHOTO_MODE=path_tool disables inline base64. Model
+        # still gets a note so the photo isn't silently lost.
+        notes.append(
+            f"user attached photo at {att.local_path} "
+            f"({att.width}x{att.height}). Photo-inline mode disabled "
+            f"(path_tool fallback); describe via vision tool if "
+            f"available, or acknowledge receipt."
+        )
     elif att.kind in ("voice", "audio"):
         notes.append(
             f"user attached {att.kind} (duration={att.duration_s}s) at "
@@ -594,6 +716,20 @@ async for item in self._bridge.ask(
 ):
     ...
 ```
+
+**Test matrix additions (v2):**
+- `test_handler_photo_path_tool_fallback.py` — env
+  `MEDIA_PHOTO_MODE=path_tool` → photo produces note-only envelope
+  (no `image_blocks`), no silent drop. Asserts note text contains
+  "path_tool fallback".
+- `test_handler_multimodal_all_photos_fail.py` (H-14) — 3 photos,
+  every `read_bytes()` raises `FileNotFoundError` (simulate sweeper
+  eviction mid-turn). Assert envelope has 3 failure-notes + zero
+  `image_blocks`, `bridge.ask` is still invoked (no crash), 3
+  `log.warning("media_photo_read_failed", ...)` calls recorded.
+- `test_handler_multimodal_real_photo.py` (C-2) — fixture JPEG
+  ≥3 MB real entropy. Assert SDK invocation succeeds (gated by
+  `RUN_SDK_INT=1`).
 
 ### 3.2 `src/assistant/bridge/claude.py::ClaudeBridge.ask` prompt_stream
 
@@ -625,14 +761,22 @@ async def prompt_stream() -> AsyncIterator[dict[str, Any]]:
     }
 ```
 
-### 3.3 `src/assistant/bridge/history.py` (photo row → placeholder)
+### 3.3 `src/assistant/bridge/history.py` (photo row → placeholder) — v2 fix-pack (H-10)
 
 Per S-0 Q0-6 mode-B: convert historic image content blocks into a
 synthetic text note. Insertion point in `history_to_user_envelopes`
-after the `role=="user"` block-walking loop:
+after the `role=="user"` block-walking loop.
+
+**v2 fix-pack (H-10):** placeholder includes `turn_id` so the note
+anchors to its originating turn even when block order within a row
+is flaky (phase-2 `ConversationStore.append` stores blocks in
+insertion order; replay flattens them — without `turn_id`, a model
+replaying >1 image turn couldn't distinguish which image belonged
+to which turn).
 
 ```python
-# Phase 7: image blocks from prior turns → synthetic placeholder text
+# Phase 7 (v2 H-10): image blocks from prior turns → synthetic
+# placeholder text anchored to originating turn.
 for row in by_turn[turn_id]:
     if row["role"] == "user":
         for block in row["content"]:
@@ -641,15 +785,21 @@ for row in by_turn[turn_id]:
                 src = block.get("source") or {}
                 media_type = src.get("media_type", "image/?")
                 user_texts.append(
-                    f"[system-note: prior user envelope contained an "
-                    f"image ({media_type}) — raw bytes omitted from replay]"
+                    f"[system-note: in turn {turn_id} user sent image "
+                    f"({media_type}) — raw bytes omitted from replay]"
                 )
 ```
 
 Note: phase-2 `ConversationStore.append` stores `[{"type":"image", ...}]`
 on the user row; we only emit the placeholder on replay.
 
-### 3.4 `src/assistant/adapters/telegram.py` (new handlers + send methods)
+**Test additions (v2):**
+- `test_history_replay_photo_turn_ordering.py` — 2 user turns, each
+  with 1 image + 1 text. Assert replay produces 2 distinct placeholder
+  notes with correct `turn_id` embedded; notes appear in the right
+  conversational slot relative to the text block of their turn.
+
+### 3.4 `src/assistant/adapters/telegram.py` (new handlers + send methods) — v2 fix-pack (C-6, L-20, L-21)
 
 Insertion after `self._dp.message.register(self._on_text, F.text)`:
 
@@ -666,9 +816,71 @@ Each handler:
 1. Adapter-level size pre-check (reject early with "файл слишком большой").
 2. Call `media/download.download_telegram_file(bot, file_id, inbox_dir(...), suggested, max_bytes=...)`.
 3. Build `MediaAttachment(...)` tuple.
-4. Dispatch through existing handler path (emit/send).
+4. **(v2 fix-pack, C-6, I-7.6)** Before passing to handler, dedup by
+   `local_path`: if the adapter already emitted an
+   `IncomingMessage` with the same `local_path` to the same `chat_id`
+   within the current update cycle (e.g. media_group regrouping,
+   edit_message replay), skip. Implementation: keep a small
+   per-adapter LRU `_emitted_attachments: OrderedDict[tuple[int,str],
+   float] = {}` with 60 s TTL + 128 entries cap (mirrors
+   `_DedupLedger` shape but scoped to attachment ingress).
+5. Dispatch through existing handler path (emit/send).
 
-Send methods mirror `send_text`'s `TelegramRetryAfter` retry wrapper.
+```python
+# (v2 C-6) adapter-level attachment dedup — I-7.6
+key = (chat_id, str(local_path))
+now = time.monotonic()
+self._evict_expired_attachments(now)
+if key in self._emitted_attachments:
+    log.debug("attachment_dedup",
+              chat_id=chat_id, path=str(local_path),
+              last_seen=self._emitted_attachments[key])
+    return
+self._emitted_attachments[key] = now
+```
+
+**Send methods (v2 fix-pack, L-20, L-21):** mirror `send_text`'s
+`TelegramRetryAfter` retry wrapper from phase-5. Explicit spec:
+
+```python
+async def send_photo(self, chat_id: int, path: Path, *, caption: str | None = None) -> None:
+    for attempt in range(self._send_max_retries):
+        try:
+            await self._bot.send_photo(chat_id, FSInputFile(path), caption=caption)
+            return
+        except TelegramRetryAfter as exc:
+            # (L-21) Retry-After honoured — same pattern as send_text
+            await asyncio.sleep(exc.retry_after + 0.25)
+            continue
+        except TelegramNetworkError:
+            if attempt == self._send_max_retries - 1:
+                raise
+            await asyncio.sleep(2 ** attempt)
+            continue
+        except (FileNotFoundError, PermissionError, OSError) as exc:
+            # (L-20) file-read errors during send are NOT retryable;
+            # log.warning + re-raise so caller (dispatch_reply)
+            # can swallow and continue to send_text for remaining content.
+            log.warning("send_photo_read_failed",
+                        chat_id=chat_id, path=str(path),
+                        exc_info=True)
+            raise
+```
+
+Analogous structure for `send_document` / `send_audio`. The
+`dispatch_reply` caller wraps each `send_*` in try/except
+`Exception:` (already shown in §7 detailed-plan.md) and logs
+`artefact_send_failed` without aborting remaining sends or the
+cleaned-text `send_text` at the end.
+
+**Test coverage additions (v2):**
+- `test_telegram_adapter_media_handlers.py` (§14.3) — add cases:
+  - `test_send_photo_retry_after_honoured` (L-21).
+  - `test_send_document_file_not_found_logs_and_raises` (L-20).
+  - `test_send_audio_network_error_retries_twice_then_raises`.
+  - `test_attachment_ingress_dedup_within_update_cycle` (C-6,
+    I-7.6) — same `local_path` fed to `_on_photo` twice →
+    `emit` called exactly once.
 
 ### 3.5 `src/assistant/scheduler/dispatcher.py:216`
 
@@ -689,7 +901,7 @@ if joined:
 `SchedulerDispatcher.__init__` gains a `dedup_ledger: _DedupLedger`
 parameter.
 
-### 3.6 `src/assistant/subagent/hooks.py:270` (shielded)
+### 3.6 `src/assistant/subagent/hooks.py:270` (shielded) — v2 fix-pack (H-11)
 
 ```python
 # Before:
@@ -698,14 +910,41 @@ await asyncio.shield(adapter.send_text(callback_chat_id, body))
 await asyncio.shield(
     dispatch_reply(
         adapter, callback_chat_id, body,
-        outbox_root=outbox_root,
+        outbox_root=outbox_dir(settings.data_dir),  # derived inside
         dedup=dedup_ledger,
         log_ctx={"job_id": job_id},
     )
 )
 ```
 
-`make_subagent_hooks` signature gains `outbox_root: Path, dedup_ledger: _DedupLedger`.
+**v2 fix-pack (H-11):** `make_subagent_hooks` signature gains ONLY
+`dedup_ledger: _DedupLedger`. `outbox_root` is NOT added as a
+factory parameter — it is derived inside the hook closure via
+`outbox_dir(settings.data_dir)` (where `settings` is already in
+the factory's closure from phase-6). This keeps the factory
+surface minimal and avoids threading the same derived value
+through three call-sites. Rationale: `outbox_root` is a pure
+function of `settings.data_dir` which the factory already holds
+— passing it separately invites the two to drift.
+
+```python
+# make_subagent_hooks signature (v2)
+def make_subagent_hooks(
+    settings: Settings,               # already there from phase-6
+    store: SubagentStore,              # already there
+    picker: SubagentRequestPicker,    # already there
+    adapter: MessengerAdapter,         # already there
+    dedup_ledger: _DedupLedger,       # NEW (v2: only param added)
+) -> dict[str, list[HookMatcher]]:
+    ...
+```
+
+Inside `on_subagent_stop`:
+
+```python
+from assistant.media.paths import outbox_dir
+outbox_root = outbox_dir(settings.data_dir)  # derived, not passed
+```
 
 ### 3.7 `src/assistant/main.py::Daemon` (integration)
 
@@ -745,22 +984,85 @@ Tests MUST land alongside their commit where feasible (test-first).
 | Commit | Test file | Size |
 |---|---|---|
 | #2 (memlib) | `test_memlib_refactor_regression.py` | ~60 LOC |
+| #2b (root pyproject) | no new test — `uv sync` smoke in CI | — |
 | #3 (config) | `test_media_settings.py` | 40 LOC |
 | #4 (base/attachment) | `test_media_attachment_dataclass.py` | 50 LOC |
 | #5 (media/) | `test_media_paths.py`, `test_media_download.py`, `test_media_sweeper.py` | 40+100+120 LOC |
-| #6 (dispatch_reply) | `test_dispatch_reply_regex.py` (corpus from S-2), `test_dispatch_reply_classify.py`, `test_dispatch_reply_path_guard.py`, `test_dispatch_reply_integration.py`, `test_dispatch_reply_dedup_ledger.py` | 130+80+100+140+90 LOC |
+| #6 (dispatch_reply) | `test_dispatch_reply_regex.py` (corpus from S-2), `test_dispatch_reply_classify.py`, `test_dispatch_reply_path_guard.py`, `test_dispatch_reply_integration.py`, `test_dispatch_reply_dedup_ledger.py` (v2: split real-clock/mock-clock per H-12) | 130+80+100+140+110 LOC |
 | #7 (transcribe) | `test_tools_transcribe_cli.py`, `test_bash_hook_transcribe_allowlist.py` | 120+30 LOC |
 | #8 (genimage) | `test_tools_genimage_cli.py`, `test_bash_hook_genimage_allowlist.py` | 120+30 LOC |
 | #9 (extract_doc) | `test_tools_extract_doc_cli.py`, `test_bash_hook_extract_doc_allowlist.py` | 80+30 LOC |
 | #10 (render_doc) | `test_tools_render_doc_cli.py`, `test_bash_hook_render_doc_allowlist.py` | 80+50 LOC |
 | #11 (hooks) | `test_bash_hook_factory_backward_compat.py` | 40 LOC |
-| #12 (telegram) | `test_telegram_adapter_media_handlers.py` | 120 LOC |
-| #13 (handler/bridge) | `test_handler_multimodal_envelope.py` | 80 LOC |
+| #12 (telegram) | `test_telegram_adapter_media_handlers.py` (v2: + attachment-dedup + RetryAfter + send-fail cases per C-6/L-20/L-21) | 160 LOC |
+| #13 (handler/bridge) | `test_handler_multimodal_envelope.py`, `test_handler_photo_path_tool_fallback.py` (v2 C-4), `test_handler_multimodal_all_photos_fail.py` (v2 H-14), `test_handler_multimodal_real_photo.py` (v2 C-2, RUN_SDK_INT gated), `test_history_replay_photo_turn_ordering.py` (v2 H-10) | 80+60+80+90+70 LOC |
 | #14 (sched switch) | `test_scheduler_dispatch_reply_integration.py` | 40 LOC |
 | #15 (hook switch) | `test_subagent_hooks_dispatch_reply.py` | 40 LOC |
 | #16 (daemon) | `test_daemon_media_integration.py` | 60 LOC |
 | #17 (E2E) | (existing tests + smoke cross-system) | ~100 LOC |
 | (regression) | `test_task_spawn_media_worker.py` | 20 LOC |
+
+**v2 fix-pack (H-12) — dedup ledger test split:**
+`test_dispatch_reply_dedup_ledger.py` contains TWO variants:
+
+```python
+# Variant 1 — authoritative, injects mock clock
+def test_dedup_ttl_mock_clock():
+    ledger = _DedupLedger(ttl_s=10.0)
+    # Pass an explicit `now: float` parameter to mark_and_check
+    assert ledger.mark_and_check(("p", 1), now=0.0) is False
+    assert ledger.mark_and_check(("p", 1), now=5.0) is True   # within TTL
+    assert ledger.mark_and_check(("p", 1), now=15.0) is False # past TTL
+
+# Variant 2 — real-clock smoke, xfail-if-flaky
+@pytest.mark.xfail(
+    reason="real clock dependent; Variant 1 is authoritative",
+    strict=False,
+)
+def test_dedup_ttl_real_clock():
+    ledger = _DedupLedger(ttl_s=0.010)
+    import time
+    now = time.monotonic()
+    assert ledger.mark_and_check(("p", 1), now=now) is False
+    time.sleep(0.001)
+    now = time.monotonic()
+    assert ledger.mark_and_check(("p", 1), now=now) is True
+    time.sleep(0.020)
+    now = time.monotonic()
+    assert ledger.mark_and_check(("p", 1), now=now) is False
+```
+
+**v2 fix-pack (H-9) — exact `_memlib` test-file inventory:**
+
+Phase-4 imports via `sys.path` shim; current state:
+
+| File | Line | Import / Reference |
+|---|---|---|
+| `tests/test_memory_lock_probe.py` | 11 | `from _memlib import fts as fts_mod` |
+| `tests/test_memory_vault_dir_mode_0o700.py` | 8 | `from _memlib.vault import ensure_vault` |
+| `tests/test_memory_atomic_write_fsync.py` | 10 | `from _memlib.vault import atomic_write` |
+| `tests/test_memory_frontmatter_roundtrip.py` | 7 | `from _memlib.frontmatter import FrontmatterError, parse_note, serialize_note` |
+| `tests/test_tmp_dir_chmods_loose_perms.py` | 8 | `from _memlib.vault import ensure_vault` |
+| `tests/test_sanitize_body_fence_awareness.py` | 5 | `from _memlib.frontmatter import sanitize_body` |
+| `tests/test_memory_wikilinks_preserved.py` | 7 | `from _memlib.frontmatter import extract_wikilinks` |
+| `tests/test_memory_write_body_with_frontmatter_marker_sanitized.py` | 7 | `from _memlib.frontmatter import sanitize_body` |
+| `tests/conftest.py` | 14-18, 26-28 | `_INSTALLER_DIR` / `_MEMORY_DIR` `sys.path.insert` shims + comment |
+
+Total: **8 `from _memlib` import rewrites** + **1 conftest.py shim
+removal** = **9 test-side files touched** by the memlib refactor
+(commit #2). Coder search-and-replace: `from _memlib` →
+`from tools.memory._lib` in the 8 test files (fts, vault, frontmatter
+modules all live in `tools/memory/_lib/`). The `conftest.py` shims
+(`_INSTALLER_DIR`, `_MEMORY_DIR`) get removed entirely; pytest + the
+new `tools/__init__.py` make Python-package imports work without
+`sys.path` tricks.
+
+**Note on `tools/skill-installer/_lib/`:** already `_lib` in the
+current tree (verified 2026-04-17). The refactor only RENAMES the
+directory `tools/skill-installer/` → `tools/skill_installer/`
+(hyphen → underscore) — the inner `_lib/` is already correctly
+named. This simplifies commit #2: no `_memlib` → `_lib` rename
+inside `tools/skill-installer/` (it's already done).
 
 ### 4.2 Corpus ports
 
@@ -788,51 +1090,101 @@ stays gated by `RUN_SDK_INT=1` (phase-6 pattern, preserved).
 | "S-6 File.file_size nullable" | §2.3 download.py | 5/5 media kinds confirmed `int \| None` |
 | "S-7 safe partial-attachment" | §3.1 handler edit | 3 scenarios all PASS |
 
-## 6. Open questions for devil wave-2
+## 6. Open questions — v2 disposition
 
-1. **Real-PNG/WEBP fixture corpus** — S-0 Q0-2 only tested JPEG bytes
-   under all three labels. Should we add actual PNG/WEBP sample files
-   to `tests/fixtures/phase7/` and run a phase-7 integration against
-   them before shipping? Cost: ~1 hour + 2 × 10 KB fixtures.
+All v1 questions resolved by devil wave-2 + fix-pack:
 
-2. **Pillow pin upper bound** — `pillow>=10,<13` is my default. If
-   fpdf2 later tightens `!=9.2.*,>=8.3.2` to require Pillow 13, we
-   break on `uv sync`. Should we leave Pillow unpinned and rely on
-   fpdf2's declared range, or actively pin to a known-working major?
+1. ~~Real-PNG/WEBP fixture corpus~~ — **CLOSED (C-2).** Real JPEG ≥3 MB
+   fixture mandatory; Cyrillic-filename variant optional. PNG/WEBP
+   corpus deferred to phase 9 (regex v3 already handles all three
+   extensions; the SDK was Q0-2-permissive on label/magic pairs).
 
-3. **Size-capped writer + aiogram chunk_size** — aiogram defaults to
-   `chunk_size=65536`. Overrun detection latency is up to 64 KB over
-   cap. Is that acceptable or should we force `chunk_size=8192`?
+2. ~~Pillow pin upper bound~~ — **CLOSED (H-8, L-16).** `Pillow>=10.4,
+   <13` pinned at root `pyproject.toml`. `fpdf2>=2.7,<3` prevents
+   upstream tightening the Pillow range past 13.
 
-4. **IPv6 link-local (`fe80::...`) — S-1 didn't exercise.** Current
-   `is_loopback_only` would reject (correct: link-local ≠ loopback).
-   Should we document this explicitly or add a test case?
+3. ~~Size-capped writer + aiogram chunk_size~~ — **DEFERRED (L-18).**
+   64 KB overrun latency accepted. Setting `chunk_size=8192` would
+   quadruple syscalls; measurable cost without empirical pressure.
+   Revisit if production shows abuse patterns.
 
-5. **Spike-0 large size realism** — we showed 10 MB padded JPEG
-   works, but padded COMs are highly compressible. Should phase-7 CI
-   include ONE real 3-4 MB JPEG fixture to gate "real photos work"
-   before merge to main?
+4. ~~IPv6 link-local (`fe80::…`)~~ — **CLOSED.** `is_loopback_only`
+   docstring explicitly documents `fe80::/10` rejection. Test case
+   added.
 
-## 7. Acceptance checklist addendum (vs detailed-plan §20)
+5. ~~Spike-0 large size realism~~ — **CLOSED (C-2).** Real 3 MB JPEG
+   fixture + `test_handler_multimodal_real_photo.py` (RUN_SDK_INT).
+
+New v2 open items (not blocking):
+
+| # | Q | Status |
+|---|---|---|
+| Q-v2-1 | Pillow CVE monitoring cadence | documented in pitfall #1; operator responsibility |
+| Q-v2-2 | Dedup TTL=300 s rationale | deferred (L-19) — measure in phase-8 telemetry, revisit |
+| Q-v2-3 | aiogram swallow-exception regression watch | covered by `test_media_download.py` SizeCapExceeded cases + CI re-run on aiogram version bumps |
+
+## 7. Acceptance checklist addendum (vs detailed-plan §20) — v2 fix-pack
 
 Added from spike findings, over and above plan §20:
 
 - [ ] `_ARTEFACT_RE` matches the v3 pattern (S-2 verified). Corpus port
   in `test_dispatch_reply_regex.py`.
-- [ ] `fpdf2` render commit includes Pillow pin in `tools/render_doc/pyproject.toml`.
-  `description.md` §82 wording corrected.
+- [ ] **(v2 H-8)** `Pillow>=10.4,<13` pinned at root `pyproject.toml`.
+  `fpdf2>=2.7,<3` pinned. `description.md` §82 wording corrected.
 - [ ] `media/download.py` uses `_SizeCappedWriter`; 4 unit cases (S-6
   A/B/C/D) in `test_media_download.py`.
+- [ ] **(v2 C-3)** `_SizeCappedWriter` implements BOTH `write` and
+  `flush` (aiogram 3.26 source audit confirmed `flush()` is called
+  per chunk in `__download_file_binary_io`). Unit test verifies
+  both methods are exercised.
 - [ ] `_validate_endpoint` delegates to `_is_loopback_only`, NOT
   `classify_url`. 11-case port from S-1.
 - [ ] Handler safe-pseudocode (S-7) in `handlers/message.py` with 3
   scenarios in `test_handler_multimodal_envelope.py`.
+- [ ] **(v2 C-4)** `test_handler_photo_path_tool_fallback.py` covers
+  the `MEDIA_PHOTO_MODE=path_tool` branch (note-only, no silent drop).
+- [ ] **(v2 C-2, REQUIRED)** `tests/fixtures/phase7/real_photo_3mb.jpg`
+  (real entropy JPEG, NOT null-padded) + `test_handler_multimodal
+  _real_photo.py` (RUN_SDK_INT-gated). Optional Cyrillic-filename
+  variant bonus.
+- [ ] **(v2 H-14)** `test_handler_multimodal_all_photos_fail.py` —
+  3 photos all unreadable → envelope with 3 failure-notes + zero
+  `image_blocks`, model-call still invoked.
+- [ ] **(v2 C-6, I-7.6)** `test_telegram_adapter_media_handlers.py`
+  covers attachment-ingress dedup (same `local_path` emitted twice
+  within 60 s → one `IncomingMessage`).
+- [ ] **(v2 H-10)** `test_history_replay_photo_turn_ordering.py` —
+  placeholder note contains `turn_id`, anchored to its originating
+  turn.
+- [ ] **(v2 H-12)** `test_dispatch_reply_dedup_ledger.py` has
+  mock-clock authoritative variant + real-clock xfail-if-flaky
+  variant.
+- [ ] **(v2 H-13)** All 4 phase-7 SKILL.md files + `bridge/
+  system_prompt.md` contain the "always space after `:`" rule with
+  good/bad example. Integration-test assertion present.
+- [ ] **(v2 L-20)** `send_photo`/`_document`/`_audio` on
+  `FileNotFoundError` / `PermissionError` / `OSError`:
+  `log.warning("send_*_read_failed", ...)` + re-raise so
+  `dispatch_reply` swallows and continues to text.
+- [ ] **(v2 L-21)** `send_photo`/`_document`/`_audio` wrap
+  `TelegramRetryAfter` per phase-5 `send_text` pattern. Test case
+  present.
 - [ ] `genimage` quota file has 4 spike scenarios ported
   (`test_tools_genimage_cli.py`), including R-3 flock contention.
 - [ ] Spike 0 evidence references preserved in commit #1 body.
+- [ ] **(v2 H-7)** S-8 report committed (`spikes/phase7_s8_report.json`);
+  manylinux_2_28 wheels verified for all C-extension deps.
 - [ ] `detailed-plan.md §9` prose updated with real 48.75 MB venv delta.
 - [ ] `is_loopback_only` docstring explicitly documents IPv6 link-local
   (`fe80::/10`) rejection.
+- [ ] **(v2 C-5)** `parallel-split-agent.md §3` Wave 6 template shows
+  two parallel sub-agents (6A: commit 12, 6B: commit 13).
+- [ ] **(v2 H-15)** `parallel-split-agent.md §4` or §8 contains the
+  wave-plan.md invalidation rule: orchestrator must not invoke
+  parallel-split before fix-pack v2 merge; stale v1 wave-plan.md
+  (if any) is invalidated.
+- [ ] **(v2 C-1)** Commit 2b lands BEFORE any tool/media commit;
+  `uv sync` smoke-check passes in CI after commit 2b merge.
 
 ### Critical Files for Implementation
 
