@@ -103,6 +103,44 @@ class SchedulerSettings(BaseSettings):
     heartbeat_stale_multiplier: int = 10
 
 
+class SubagentSettings(BaseSettings):
+    """Phase-6 subagent pool knobs.
+
+    Intentionally small — the SDK manages lifecycle; we only tune the ledger
+    retention, notify throttle, and maxTurns per kind. Every field is
+    overridable via `ASSISTANT_SUBAGENT_<NAME>` env var.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="ASSISTANT_SUBAGENT_",
+        env_file=(str(_user_env_file()), ".env"),
+        extra="ignore",
+    )
+
+    enabled: bool = True
+    # Telegram notify throttle between consecutive subagent notifications for
+    # the SAME chat. Keeps us below the 30-msg/sec global cap even if ten
+    # subagents complete in the same second.
+    notify_throttle_ms: int = 500
+    # Max bytes of the subagent's final assistant message used as notify
+    # body BEFORE the Telegram chunker splits it. Phase-5 chunker handles
+    # >4096 chars fine; the cap prevents a pathological 1 MB output from
+    # flooding the UI.
+    result_body_max_bytes: int = 32_768
+    # maxTurns for each kind. S-6-0 Q1 showed that longer maxTurns extends
+    # wall-clock in ways the owner can't observe mid-turn.
+    max_turns_general: int = 20
+    max_turns_worker: int = 5
+    max_turns_researcher: int = 15
+    # Grace window for Daemon.stop to drain in-flight subagent notify tasks.
+    drain_timeout_s: float = 2.0
+    # Picker tick interval for CLI-spawn pickups.
+    picker_tick_s: float = 1.0
+    # Rows older than this with status='requested' are transitioned to
+    # 'dropped' by recover_orphans at Daemon.start (B-W2-7).
+    requested_stale_after_s: int = 3600
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=(str(_user_env_file()), ".env"),
@@ -117,6 +155,7 @@ class Settings(BaseSettings):
     claude: ClaudeSettings = Field(default_factory=ClaudeSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     scheduler: SchedulerSettings = Field(default_factory=SchedulerSettings)
+    subagent: SubagentSettings = Field(default_factory=SubagentSettings)
 
     @property
     def db_path(self) -> Path:
