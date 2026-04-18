@@ -32,7 +32,8 @@ skills/*
 # tools/ subdir end up here after atomic_install). Only `ping` and
 # `skill_installer` (phase 3, renamed in phase 7 from the legacy hyphenated
 # directory name to match the Python-package form), `memory` (phase 4),
-# `schedule` (phase 5), and `task` (phase 6) are tracked.
+# `schedule` (phase 5), `task` (phase 6), and the phase-7 media CLIs
+# (`transcribe`, `genimage`, `extract_doc`, `render_doc`) are tracked.
 tools/*
 !tools/__init__.py
 !tools/ping/
@@ -40,3 +41,4 @@ tools/*
 !tools/memory/
 !tools/schedule/
 !tools/task/
+!tools/transcribe/
