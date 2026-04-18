@@ -40,3 +40,4 @@ tools/*
 !tools/memory/
 !tools/schedule/
 !tools/task/
+!tools/extract_doc/
