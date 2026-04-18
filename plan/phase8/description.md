@@ -1,33 +1,35 @@
-# Phase 8 — Ops polish (health / admin / Yandex)
+# Phase 8 — GitHub tool + auto-commit
 
-**Цель:** ops-полировка; явно опциональная фаза.
+**Цель:** модель умеет работать с GitHub; vault ежедневно бэкапится.
 
-**Вход:** phases 2–7.
+**Вход:** phase 5 (scheduler), phase 4 (vault).
 
-**Выход:** health-эндпоинт с метриками, простая admin-страница (опционально), Yandex Messenger адаптер (опционально).
+**Выход:** `tools/gh` скилл доступен; дефолтный scheduled-job коммитит+пушит vault в 03:00.
 
 ## Задачи
 
-1. `src/health/metrics.py` — bridge-метрики (latency/turns/cost) + per-CLI subprocess метрики (время выполнения, RC) + IPC-сокет liveness + daemon liveness-файл + валидация всех `skills/*/SKILL.md` и `tools/*/pyproject.toml` (использует `tools/skill-creator validate`).
-2. `/health` endpoint (FastAPI или aiohttp) — JSON со статусом компонентов.
-3. Опционально: `src/web/admin.py` — простая админ-страница (JWT) с секциями:
-   - Schedules (view/enable/disable)
-   - Conversations (recent)
-   - Memory (browse vault)
-   - Tools audit (последние вызовы CLI)
-4. Опционально: `src/adapters/yandex.py` — порт из midomis, включается env-флагом `YANDEX_ENABLED`.
-5. Опционально: Docker/Caddy-конфиг.
+1. `tools/gh/main.py` — тонкая обёртка над `gh`:
+   - `status`, `commit -m --paths`, `push`, `pr create`, `issue create/list/comment`.
+   - Валидирует что repo path внутри `data/` или в whitelist репо из конфига.
+   - Использует существующий `gh auth` на хосте.
+2. `skills/github/SKILL.md` с явными примерами и предупреждениями (никогда не force-push).
+3. Bootstrap при первом запуске: `git init data/vault/`, remote из env `GITHUB_VAULT_REPO`, начальный коммит.
+4. Дефолтный schedule, засеваемый при первом старте:
+   - `cron="0 3 * * *"`
+   - `prompt="сделай git add -A и закоммить изменения vault с осмысленным сообщением, затем запушь"`
+   - Модель сама вызовет `tools/gh` — граница CLI сохранена.
+5. Guard: scheduler-originated промпты проходят обычный permission-стек (никаких спецправ).
 
 ## Критерии готовности
 
-- `/health` возвращает green при нормальной работе и показывает деградацию при падении демона или UDS-сокета.
-- (Если делаем admin) panel доступна с токеном.
-- (Если делаем Yandex) демо работает.
+- Свежий коммит появляется на remote на следующее утро.
+- Ручное "запушь память сейчас" работает.
+- Force-push отклоняется CLI'ем.
 
 ## Зависимости
 
-Phases 2–7.
+Phase 4, phase 5.
 
 ## Риск
 
-**Низкий** — в основном ported code из midomis.
+**Низкий-средний.** Управление credentials — полагаемся на `gh auth login` на хосте.

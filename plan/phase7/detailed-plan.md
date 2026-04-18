@@ -1,14 +1,14 @@
-# Phase 6 — детальный план (Media tools + multimodal bot loop)
+# Phase 7 — детальный план (Media tools + multimodal bot loop)
 
-Phase 6 раскручивает приёмный и выходной контур бота из чисто-текстового в мультимедийный: голос, фото, документы входят; картинки, документы, аудио выходят. Ключевая развилка — **где живёт "логика" (в adapter или в модели) и через что модель "видит" не-текстовый ввод**. Наш ответ: адаптер только доставляет файл на диск и собирает `MediaAttachment`; модель решает, что с ним делать, через CLI-инструменты под `tools/`. Для фото — нативный SDK multimodal (если spike 0 подтвердит), для аудио/документов — расшифровка/extract через внешние CLI.
+Phase 7 раскручивает приёмный и выходной контур бота из чисто-текстового в мультимедийный: голос, фото, документы входят; картинки, документы, аудио выходят. Ключевая развилка — **где живёт "логика" (в adapter или в модели) и через что модель "видит" не-текстовый ввод**. Наш ответ: адаптер только доставляет файл на диск и собирает `MediaAttachment`; модель решает, что с ним делать, через CLI-инструменты под `tools/`. Для фото — нативный SDK multimodal (если spike 0 подтвердит), для аудио/документов — расшифровка/extract через внешние CLI.
 
 ## 0. Spike 0 — обязательный перед coder wave
 
 Плановое допущение: `claude-agent-sdk 0.1.59` принимает user envelope с `content: list` содержащим смесь `{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"<b64>"}}` и `{"type":"text","text":"…"}`. Референс — Anthropic Messages API docs говорят "yes", но SDK может переформатировать на уровне CLI. Spike гоняет реальный turn:
 
-1. `spikes/phase6_multimodal.py` — мок-chat (`chat_id=0`), отправляем картинку 128×128 (cat.jpg), проверяем что `AssistantMessage.content[0].text` упоминает "cat" (доказательство что SDK передал image). Log на `init.skills` + SDK-ответ. Записываем в `spike-findings.md` точную форму envelope, что SDK возвращает, и — критично — **падает ли** CLI на size cap (наблюдали у midomis: 5 МБ > limit). → решает Q3.
-2. `spikes/phase6_mlx.py` — `uv run --directory tools/transcribe -- python -c "import mlx_whisper; print(mlx_whisper.transcribe('/tmp/sample.oga'))"`. Ловит (a) время cold start, (b) работает ли без API ключа, (c) потребление RAM. → решает Q1.
-3. Optional spike `spikes/phase6_genimage.py` — мерит seconds/MB на `mflux` для image 512×512. Дорого по времени (~1 минута на модели), но нужно для Q5 (local vs API).
+1. `spikes/phase7_multimodal.py` — мок-chat (`chat_id=0`), отправляем картинку 128×128 (cat.jpg), проверяем что `AssistantMessage.content[0].text` упоминает "cat" (доказательство что SDK передал image). Log на `init.skills` + SDK-ответ. Записываем в `spike-findings.md` точную форму envelope, что SDK возвращает, и — критично — **падает ли** CLI на size cap (наблюдали у midomis: 5 МБ > limit). → решает Q3.
+2. `spikes/phase7_mlx.py` — `uv run --directory tools/transcribe -- python -c "import mlx_whisper; print(mlx_whisper.transcribe('/tmp/sample.oga'))"`. Ловит (a) время cold start, (b) работает ли без API ключа, (c) потребление RAM. → решает Q1.
+3. Optional spike `spikes/phase7_genimage.py` — мерит seconds/MB на `mflux` для image 512×512. Дорого по времени (~1 минута на модели), но нужно для Q5 (local vs API).
 
 Без артефактов spike 0 coder **не стартует**. Плановое срок: 2 часа.
 
@@ -89,7 +89,7 @@ Phase 6 раскручивает приёмный и выходной конту
 
 Mode `0o700` на `media/` (как vault). Path-guard Read/Write: `<data_dir>/media/` — **outside project_root**, phase-2 file-hook по default блокирует. Добавляем allowed-prefix `<data_dir>/media/outbox` (for `send_document` / `send_photo` source path resolution) и `<data_dir>/media/inbox` (model читает через `Read` stdlib-free).
 
-**Alternative considered:** `<project_root>/data/media/`. Rejected — phase 2 установил `data_dir` = XDG_DATA_HOME; repo не должен жиреть от media. Принимаем факт "hook должен allow'ить path вне project_root" как новый инвариант phase 6.
+**Alternative considered:** `<project_root>/data/media/`. Rejected — phase 2 установил `data_dir` = XDG_DATA_HOME; repo не должен жиреть от media. Принимаем факт "hook должен allow'ить path вне project_root" как новый инвариант phase 7.
 
 ### 1.7. `IncomingMessage.attachments` shape
 
@@ -118,7 +118,7 @@ class IncomingMessage:
 
 **Почему tuple а не list:** frozen dataclass — неизменяемые поля. `list` не hashable и нарушает `frozen=True` invariant.
 
-**Почему single-attachment фото vs multi:** Telegram присылает photo как `list[PhotoSize]` (несколько разрешений) — берём `[-1]` (наибольшее) и кладём как один `MediaAttachment`. Album (`media_group_id`) — нет в scope phase 6 (одно сообщение = одно вложение; mid-album реализация ≈200 LOC, откладывается).
+**Почему single-attachment фото vs multi:** Telegram присылает photo как `list[PhotoSize]` (несколько разрешений) — берём `[-1]` (наибольшее) и кладём как один `MediaAttachment`. Album (`media_group_id`) — нет в scope phase 7 (одно сообщение = одно вложение; mid-album реализация ≈200 LOC, откладывается).
 
 ### 1.8. Photo envelope в bridge
 
@@ -164,7 +164,7 @@ ARTEFACT_RE = re.compile(r'/[^\s"<>]*/media/outbox/[^\s"<>]+')
 
 ### 1.10. Провайдер-agnosticism: per-tool venv vs monolithic
 
-Phase 6 добавляет 4 новых tool-пакета. Если каждый с pyproject.toml (`uv sync --directory tools/transcribe`), total disk footprint:
+Phase 7 добавляет 4 новых tool-пакета. Если каждый с pyproject.toml (`uv sync --directory tools/transcribe`), total disk footprint:
 
 - transcribe (mlx-whisper + torch) ≈ 2 GB
 - genimage (mflux + torch) ≈ 15 GB (overlap с transcribe торчем — нет, разные версии)
@@ -220,9 +220,9 @@ LOC impact: +40 LOC helper, +2 LOC в dispatcher. Тест `test_scheduler_deliv
 
 | Item | Описание | Закрываем в 6? |
 |---|---|---|
-| `_memlib`/`_schedlib` → `tools/__init__.py` + relative imports | Phase 4 item #4. Phase 6 добавляет 4 tool-пакета ⇒ идеальная точка. | Recommend **yes** — сделать до первого нового tool-main.py (≤40 LOC refactor). |
-| `HISTORY_MAX_SNIPPET_TOTAL` cap | Phase 4 item #7. В phase 6 tool_result'ы могут быть гигантскими (extract-doc → 50k chars). | Recommend **yes** — blow up context иначе. 15 LOC. |
-| Per-skill allowed-tools enforcement | Phase 3 debt #4, phase 4 Q8 ограничил до static union. Требует SDK 0.2+ или infra. | Recommend **no** — откладываем на phase 8. |
+| `_memlib`/`_schedlib` → `tools/__init__.py` + relative imports | Phase 4 item #4. Phase 7 добавляет 4 tool-пакета ⇒ идеальная точка. | Recommend **yes** — сделать до первого нового tool-main.py (≤40 LOC refactor). |
+| `HISTORY_MAX_SNIPPET_TOTAL` cap | Phase 4 item #7. В phase 7 tool_result'ы могут быть гигантскими (extract-doc → 50k chars). | Recommend **yes** — blow up context иначе. 15 LOC. |
+| Per-skill allowed-tools enforcement | Phase 3 debt #4, phase 4 Q8 ограничил до static union. Требует SDK 0.2+ или infra. | Recommend **no** — откладываем на phase 9. |
 | Mid-chunk Telegram send resumption | Phase 5 debt. | Recommend **no** — accept existing. |
 
 ## 2. DB schema — v4 migration (optional)
@@ -230,7 +230,7 @@ LOC impact: +40 LOC helper, +2 LOC в dispatcher. Тест `test_scheduler_deliv
 Если делаем quota на genimage:
 
 ```sql
--- 0004_media.sql — phase 6
+-- 0004_media.sql — phase 7
 CREATE TABLE IF NOT EXISTS media_quota (
     tool        TEXT NOT NULL,          -- 'genimage' / 'transcribe' / ...
     day         TEXT NOT NULL,          -- 'YYYY-MM-DD' UTC
@@ -340,7 +340,7 @@ Output: {"ok":true,"data":{"text":"...","language":"ru","duration_s":12.3}}
 В `src/assistant/bridge/hooks.py`:
 
 ```python
-# Phase 6 prefixes already allowed by H-1 (`tools/` + `skills/`).
+# Phase 7 prefixes already allowed by H-1 (`tools/` + `skills/`).
 # Add per-script validators following `_validate_schedule_argv` pattern.
 
 _MEDIA_TOOL_SCRIPTS: frozenset[str] = frozenset({
@@ -529,7 +529,7 @@ def media_stage_dir(self) -> Path: return self.media.stage_dir or self.data_dir 
 
 1. **Q1: Transcribe backend.** `mlx-whisper` (Apple M-series only, fast, local, 500MB) vs `whisper.cpp` (CPU cross-platform, 2x slower) vs OpenAI API ($0.006/min, needs key, network).
    **Recommended:** mlx-whisper default, env-swappable to whisper_cpp/openai via `MEDIA_TRANSCRIBE_BACKEND`.
-   **Alternative:** whisper_cpp first (cross-platform baseline) — если phase 8 ops polish хочет Docker-deploy.
+   **Alternative:** whisper_cpp first (cross-platform baseline) — если phase 9 ops polish хочет Docker-deploy.
 
 2. **Q2: Image generation backend.** `mflux` (Apple-only, 15 GB on disk, ~30s/img, free) vs OpenAI `gpt-image-1` ($0.04-0.08/img, fast) vs Replicate FLUX API ($0.003/img).
    **Recommended:** mflux default (consistency с midomis, no external cost); env-swap.
@@ -539,7 +539,7 @@ def media_stage_dir(self) -> Path: return self.media.stage_dir or self.data_dir 
    **Recommended:** `inline` if spike 0 success; fallback `path_tool`. Spike 0 — blocker.
 
 4. **Q4: `IncomingMessage.attachments` shape** — tuple (frozen dc), list (break frozen), или separate `media_path: Path | None` (scalar, ломается на album).
-   **Recommended:** `attachments: tuple[MediaAttachment, ...] | None` — держит frozen=True, future-proof для album в phase 8.
+   **Recommended:** `attachments: tuple[MediaAttachment, ...] | None` — держит frozen=True, future-proof для album в phase 9.
 
 5. **Q5: Skill granularity.** 4 separate skills (`transcribe`, `genimage`, `extract-doc`, `render-doc`) vs umbrella `media`.
    **Recommended:** 4 separate — less manifest noise per-skill, phase 4 Q8 union не ломается.
@@ -550,7 +550,7 @@ def media_stage_dir(self) -> Path: return self.media.stage_dir or self.data_dir 
    **Alternative:** no sweep, но total cap check в download (reject newincoming).
 
 7. **Q7: PDF extraction library.** `pypdf` (stdlib-like, MIT, weak OCR) vs `pymupdf` (AGPL/commercial, strong) vs `docling` (MIT, ML-heavy, 500 MB).
-   **Recommended:** `pypdf` для MVP — нет AGPL, нет ML-моделей. Если качество недостаточно — phase 8 swap на `docling`.
+   **Recommended:** `pypdf` для MVP — нет AGPL, нет ML-моделей. Если качество недостаточно — phase 9 swap на `docling`.
    **Alternative:** `pymupdf` для single-user personal bot (AGPL ок).
 
 8. **Q8: Outbound artefact detection mechanism.** Regex on final text (простой) vs структурированный модельный JSON (требует SDK change) vs model-driven (модель сама зовёт `adapter send`).
@@ -558,7 +558,7 @@ def media_stage_dir(self) -> Path: return self.media.stage_dir or self.data_dir 
    **Alternative:** отсутствие detection'а — модель шлёт путь, владелец копирует руками (UX плохой).
 
 9. **Q9: Close phase-5 tech debt.** (a) `_memlib`/`_schedlib` → `tools/__init__.py` relative imports? (b) `HISTORY_MAX_SNIPPET_TOTAL` cap? (c) per-skill `allowed-tools` enforcement?
-   **Recommended:** (a) yes — phase 6 хорошая точка; (b) yes — extract-doc'овские 50k symbols blowup context без cap; (c) **no** — требует SDK 0.2+, откладываем на phase 8.
+   **Recommended:** (a) yes — phase 7 хорошая точка; (b) yes — extract-doc'овские 50k symbols blowup context без cap; (c) **no** — требует SDK 0.2+, откладываем на phase 9.
 
 10. **Q10: Per-tool venv vs shared.** Per-tool `uv sync --directory tools/<name>` (heavy для transcribe+genimage, ~17 GB) vs один монолит (меньше ~3-5 GB, но ломает torch-pin изоляцию).
     **Recommended:** per-tool venv для transcribe+genimage (large ML deps); shared (main venv) для extract-doc+render-doc (легкие). CLI падает с exit 8 если venv не собран.
@@ -567,7 +567,7 @@ def media_stage_dir(self) -> Path: return self.media.stage_dir or self.data_dir 
     **Recommended:** cap=20 default — защита от бесконечного model loop. Владелец overridable.
 
 12. **Q12: Album / media_group (Telegram multi-photo).** In-scope (buffer 1.5s flush как midomis) или out-of-scope (один фото → один attachment).
-    **Recommended:** out-of-scope phase 6 — +200 LOC, откладываем.
+    **Recommended:** out-of-scope phase 7 — +200 LOC, откладываем.
 
 13. **Q13: Scheduler может генерить media?** Если scheduler job генерит PDF — доставлять через `dispatch_reply` (автомат) ИЛИ запрещать artefact в scheduler-turn'е (текст-only reply).
     **Recommended:** разрешить — `dispatch_reply` helper общий, инфра бесплатная. Regression test обязателен.
@@ -589,18 +589,18 @@ def media_stage_dir(self) -> Path: return self.media.stage_dir or self.data_dir 
 
 ## 11. Tech debt явно отложенный (если Q&A says)
 
-1. **Per-skill `allowed-tools` enforcement.** Phase 3 debt #4 / phase 4 Q8 static union ограничение. Требует SDK 0.2+ или infra переход. **→ phase 8.**
-2. **Telegram media_group / album** (multi-photo sharing). **→ phase 8.**
-3. **Real-time streaming transcription** (edit placeholder с промежуточным текстом). **→ phase 8.**
-4. **OCR для сканированных PDF / image-to-text без SDK multimodal.** Требует `docling` / `marker-pdf` / Tesseract. **→ phase 8.**
-5. **TTS (voice-reply).** Piper / ElevenLabs / OpenAI audio. **→ phase 8+.**
+1. **Per-skill `allowed-tools` enforcement.** Phase 3 debt #4 / phase 4 Q8 static union ограничение. Требует SDK 0.2+ или infra переход. **→ phase 9.**
+2. **Telegram media_group / album** (multi-photo sharing). **→ phase 9.**
+3. **Real-time streaming transcription** (edit placeholder с промежуточным текстом). **→ phase 9.**
+4. **OCR для сканированных PDF / image-to-text без SDK multimodal.** Требует `docling` / `marker-pdf` / Tesseract. **→ phase 9.**
+5. **TTS (voice-reply).** Piper / ElevenLabs / OpenAI audio. **→ phase 9+.**
 6. **Per-user isolation.** Single-user scope фиксирован, не наш case.
-7. **Scheduler-triggered media pipeline** (еженедельный email-like digest с PDF). **→ phase 7** (gh + scheduler + render-doc composability).
-8. **pandoc backend** вместо fpdf2+python-docx. **→ phase 8** если UX типографии жалуется.
-9. **VLM custom skill** если `path_tool` mode выбран в Q3 — доп skill `vision-describe`. **→ phase 7.**
-10. **DB migration для media_attachments** (если phase 8 захочет хранить в БД вместо filesystem). Не делаем — единственный reference на filesystem paths в `conversations.content_json`.
+7. **Scheduler-triggered media pipeline** (еженедельный email-like digest с PDF). **→ phase 8** (gh + scheduler + render-doc composability).
+8. **pandoc backend** вместо fpdf2+python-docx. **→ phase 9** если UX типографии жалуется.
+9. **VLM custom skill** если `path_tool` mode выбран в Q3 — доп skill `vision-describe`. **→ phase 8.**
+10. **DB migration для media_attachments** (если phase 9 захочет хранить в БД вместо filesystem). Не делаем — единственный reference на filesystem paths в `conversations.content_json`.
 11. **Mid-chunk Telegram send resumption** (phase 5 debt, accepted).
-12. **`TelegramAdapter` rollback/retry при rate-limit на send_photo/send_document.** Phase 5 сделал для send_text; расширяем на все media send'ы как `G-W2-1` analog — возможно в phase 6, решается в Q&A.
+12. **`TelegramAdapter` rollback/retry при rate-limit на send_photo/send_document.** Phase 5 сделал для send_text; расширяем на все media send'ы как `G-W2-1` analog — возможно в phase 7, решается в Q&A.
 
 ## 12. Risk register
 
@@ -616,7 +616,7 @@ def media_stage_dir(self) -> Path: return self.media.stage_dir or self.data_dir 
 | 8 | Model в loop генерит 100 картинок → compute wasted | 🟡 | Daily cap `MEDIA_GENIMAGE_DAILY_CAP=20`, exit 6 при превышении |
 | 9 | Photo >5 MB blows up context / SDK rejects | 🟡 | `MEDIA_PHOTO_MAX_INLINE_BYTES=5MB`, oversized → skip + system-note |
 | 10 | User sends URL yt video = 2h → transcribe занимает 40 мин → turn timeout | 🟡 | `--duration-limit` в CLI (default 1h); `MEDIA_MAX_VOICE_DURATION_S` |
-| 11 | Concurrent transcribe + genimage на одной GPU → OOM | 🟡 | Shared `<data_dir>/run/gpu.lock` flock (phase-6 description уже упомянуто) |
+| 11 | Concurrent transcribe + genimage на одной GPU → OOM | 🟡 | Shared `<data_dir>/run/gpu.lock` flock (phase-7 description уже упомянуто) |
 | 12 | `IncomingMessage.attachments` шейп проникает в `conversations.content_json` как сырой blob | 🟢 | Explicit — пишем string `"[<kind>: <path>]"`, а не base64 |
 | 13 | Artefact-detection regex ложно срабатывает на строку в чужом тексте | 🟢 | Path-guard `.is_relative_to(outbox)` + file existence check — false-positive не пошлёт вложение |
 | 14 | Fonts DejaVu в git blob'ом → repo weight | 🟢 | ~700 KB — приемлемо; или git-lfs (overhead) |
@@ -624,22 +624,22 @@ def media_stage_dir(self) -> Path: return self.media.stage_dir or self.data_dir 
 | 16 | Per-tool venv install drift → CI не может воспроизвести | 🟡 | `pyproject.toml` + `uv.lock` commit в репо per-tool; CI runs `uv sync --directory` для каждого |
 | 17 | Scheduler-turn с attachments (не должно быть None) | 🟢 | `SchedulerDispatcher` hardcode `attachments=None`; test regression |
 | 18 | Model ignores `allowed-tools` restriction (host has permissive perms) | 🟡 | Inherited от phase 4; Bash hook argv validator независим от SDK enforce |
-| 19 | `MEDIA_PHOTO_MODE=path_tool` требует новый custom skill `vision-describe` — scope creep | 🟡 | Если spike 0 fail — отдельный mini-task, но фаза 6 сохраняет в scope |
+| 19 | `MEDIA_PHOTO_MODE=path_tool` требует новый custom skill `vision-describe` — scope creep | 🟡 | Если spike 0 fail — отдельный mini-task, но фаза 7 сохраняет в scope |
 | 20 | Telegram rate-limit на send_photo/send_document — 429 без retry | 🟡 | Повтор паттерна phase-5 `TelegramRetryAfter` на новые отправки |
 
 ## 13. Scope discipline notes
 
-Что хочется, но не в phase 6:
+Что хочется, но не в phase 7:
 
 - **Livestreaming audio** (user начал voice → мы показываем partial text live). Sync streaming через aiogram нехорошо ложится; откладываем.
 - **Video transcription** (MP4 → text). Video полноценный файл — отдельный pipeline (ffmpeg extract audio track). Можно простым wrapper'ом, но scope.
 - **OCR сканированных PDF** (image-based). Требует Tesseract / docling / marker. Не MVP.
-- **Voice cloning / TTS reply back.** Piper / OpenAI TTS. Phase 8+.
+- **Voice cloning / TTS reply back.** Piper / OpenAI TTS. Phase 9+.
 - **Image editing** (img2img, inpainting через mflux). mflux поддерживает; но scope.
-- **Document search** (semantic search по PDF vault'а). Memory-скилл не для этого; нужен отдельный index. Phase 8.
+- **Document search** (semantic search по PDF vault'а). Memory-скилл не для этого; нужен отдельный index. Phase 9.
 - **Multi-step file pipelines** (transcribe → summarize → render as PDF одним composite tool). Модель должна сама orchestrate — это by-design по принципу "модель — агент, не код". Композитный CLI неверный паттерн.
 - **Media-group (album)** — многокомпонентное сообщение. Откладываем.
-- **GPU scheduling** (несколько параллельных turn'ов делят одну GPU). Sem+flock делают, но более тонкая stress-test — phase 8.
+- **GPU scheduling** (несколько параллельных turn'ов делят одну GPU). Sem+flock делают, но более тонкая stress-test — phase 9.
 - **Marketplace install media skills from URL.** Модель умеет через phase-3 skill-installer; но мы кладём 4 скила in-repo сразу, не полагаемся на marketplace для core media.
 
 ## 14. Invariants (новый раздел)
@@ -671,7 +671,7 @@ def media_stage_dir(self) -> Path: return self.media.stage_dir or self.data_dir 
 - Новые скилы: ~320 LOC.
 - Изменения в существующих: ~650 LOC.
 - Тесты: ~1800 LOC в ~30 файлах.
-- **Итого phase 6:** ~4995 LOC кода + ~1800 LOC тестов.
+- **Итого phase 7:** ~4995 LOC кода + ~1800 LOC тестов.
 
 Порядок коммитов рекомендованный:
 

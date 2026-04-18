@@ -39,9 +39,10 @@
 3. **Skill-creator & skill-installer** — бот сам создаёт новые скилы и ставит по URL
 4. Memory tool + skill (Obsidian vault + FTS5)
 5. Scheduler daemon + UDS IPC
-6. Media tools (transcribe / genimage / extract-doc / render-doc)
-7. GitHub tool + daily vault auto-commit
-8. Ops polish: health metrics / admin panel / Yandex (opt-in)
+6. Subagent infrastructure (универсальный фоновый пул для долгих задач)
+7. Media tools (transcribe / genimage / extract-doc / render-doc)
+8. GitHub tool + daily vault auto-commit
+9. Ops polish: health metrics / admin panel / Yandex (opt-in)
 
 ## Развилки для обсуждения до старта
 
