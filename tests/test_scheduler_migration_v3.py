@@ -26,13 +26,16 @@ async def _column_names(conn: aiosqlite.Connection, table: str) -> list[str]:
 
 
 async def test_v3_bumps_user_version(tmp_path: Path) -> None:
+    """After phase 6 schema bump, `apply_schema` continues past v3 to the
+    current SCHEMA_VERSION. We only need to prove v3 ran (tables exist);
+    the final `user_version` reflects the current max, not 3."""
     conn = await connect(tmp_path / "m3.db")
     try:
         await apply_schema(conn)
         async with conn.execute("PRAGMA user_version") as cur:
             row = await cur.fetchone()
         assert row is not None
-        assert row[0] == 3
+        assert row[0] >= 3
     finally:
         await conn.close()
 
@@ -136,6 +139,7 @@ async def test_v3_apply_is_idempotent(tmp_path: Path) -> None:
         async with conn.execute("PRAGMA user_version") as cur:
             row = await cur.fetchone()
         assert row is not None
-        assert row[0] == 3
+        # Idempotent across all migrations up to the current SCHEMA_VERSION.
+        assert row[0] >= 3
     finally:
         await conn.close()
