@@ -89,9 +89,36 @@ class SubagentRequestPicker:
         """Expose the inflight snapshot for integration tests."""
         return set(self._inflight)
 
+    def dispatch_tasks(self) -> set[asyncio.Task[None]]:
+        """Expose the currently-in-flight dispatch tasks.
+
+        Phase-6 fix-pack C-3 / devil C-3: `Daemon.stop()` must drain
+        these BEFORE closing the aiosqlite connection. Without this
+        the SDK subprocess keeps running, the Stop hook's
+        `record_finished` UPDATE runs against a closed connection
+        (`ProgrammingError: Cannot operate on a closed database`),
+        AND the shielded `adapter.send_text` notify fails because
+        the adapter was already stopped. Mirrors the phase-5
+        `SchedulerDispatcher.pending_updates()` accessor pattern.
+
+        Returns a snapshot `set` so the caller can iterate safely
+        while the discard callback continues to mutate the underlying
+        `self._dispatch_tasks`.
+        """
+        return set(self._dispatch_tasks)
+
     async def run(self) -> None:
-        """Cooperative poll loop. Returns when the stop_event is set and
-        all in-flight dispatches have been cancelled or drained."""
+        """Cooperative poll loop. Returns when the stop_event is set.
+
+        Note: individual `_dispatch_one` tasks created during the
+        loop's lifetime are NOT awaited here — they live on
+        `self._dispatch_tasks` (discarded by the done callback). The
+        authoritative drain lives in `Daemon.stop()`, which calls
+        `dispatch_tasks()` and gathers them with a timeout BEFORE
+        closing the DB connection and stopping the adapter. Closing
+        them here would double the shutdown latency (one drain inside
+        run()'s finally, another in Daemon.stop's gather), without
+        the benefit of ordered DB close ahead of anything else."""
         tick = self._settings.subagent.picker_tick_s
         while not self._stop_event.is_set():
             try:

@@ -854,6 +854,39 @@ class Daemon:
                         count=len([t for t in updates if not t.done()]),
                     )
 
+        # Step 2.57 — phase-6 fix-pack C-3 (devil C-3 / CR I-1):
+        # drain the picker's in-flight `_dispatch_one` tasks BEFORE
+        # the subagent-notify drain AND the DB close. The picker
+        # spawns these via `asyncio.create_task(self._dispatch_one(job))`
+        # and they outlive `picker.run()` — a bare `_bg_tasks` drain
+        # only closes `picker.run()` itself, leaving `_dispatch_one`
+        # coroutines racing `conn.close()` (ProgrammingError:
+        # Cannot operate on a closed database) and
+        # `adapter.stop()` (notify drops because adapter gone).
+        #
+        # We use a short-ish 5 s timeout — each dispatch is an SDK
+        # turn that can legitimately take that long mid-message; on
+        # timeout we cancel the stragglers and a final gather lets
+        # their CancelledError propagate cleanly.
+        if self._subagent_picker is not None:
+            dispatches = list(self._subagent_picker.dispatch_tasks())
+            if dispatches:
+                self._log.info("daemon_draining_picker_dispatches", count=len(dispatches))
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*dispatches, return_exceptions=True),
+                        timeout=_STOP_DRAIN_TIMEOUT_S,
+                    )
+                except TimeoutError:
+                    stuck = [t for t in dispatches if not t.done()]
+                    self._log.warning(
+                        "daemon_picker_dispatch_drain_timeout",
+                        count=len(stuck),
+                    )
+                    for t in stuck:
+                        t.cancel()
+                    await asyncio.gather(*dispatches, return_exceptions=True)
+
         # Step 2.6 — phase 6 (GAP #12): drain subagent notify tasks. The
         # Stop hook register shielded `adapter.send_text` tasks onto
         # `_subagent_pending`; we MUST finish them before `adapter.stop()`
