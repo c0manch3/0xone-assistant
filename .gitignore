@@ -42,3 +42,4 @@ tools/*
 !tools/schedule/
 !tools/task/
 !tools/transcribe/
+!tools/genimage/
