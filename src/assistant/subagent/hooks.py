@@ -106,6 +106,15 @@ def make_subagent_hooks(
             return {}
 
         # Wave-2 B-W2-4 + S-1: ContextVar set by the picker?
+        # Fix-pack HIGH #4 (CR I-5): default fall-through uses
+        # `spawned_by_kind='user'` only when the Start hook legitimately
+        # fires for a native-Task spawn (no ContextVar). If the
+        # ContextVar IS set (picker path) but the claim UPDATE fails,
+        # we preserve the original row's `spawned_by_kind` so a CLI
+        # spawn never gets silently relabelled as a user turn.
+        fallback_spawned_by_kind = "user"
+        fallback_spawned_by_ref: str | None = None
+        fallback_callback_chat_id = settings.owner_chat_id
         request_id = CURRENT_REQUEST_ID.get()
         if request_id is not None:
             patched = await store.update_sdk_agent_id_for_claimed_request(
@@ -121,14 +130,30 @@ def make_subagent_hooks(
                     agent_type=agent_type,
                 )
                 return {}
-            # If we couldn't patch, fall through to record_started as a
-            # defensive INSERT. The warning was already logged inside the
-            # store.
+            # Claim UPDATE failed — patched=False. Look up the
+            # original requested row so the defensive INSERT below
+            # preserves its attribution. If the row has vanished
+            # (truly unusual — a DELETE between CLI insert and Start
+            # hook), we log and fall through with a distinct
+            # `'unknown'` marker so observability still flags the
+            # drift instead of quietly mis-attributing to 'user'.
             log.warning(
                 "subagent_start_picker_claim_failed_fallback_insert",
                 request_id=request_id,
                 agent_id=agent_id,
             )
+            original = await store.get_by_id(request_id)
+            if original is None:
+                log.warning(
+                    "subagent_claim_row_vanished",
+                    request_id=request_id,
+                    agent_id=agent_id,
+                )
+                fallback_spawned_by_kind = "unknown"
+            else:
+                fallback_spawned_by_kind = original.spawned_by_kind
+                fallback_spawned_by_ref = original.spawned_by_ref
+                fallback_callback_chat_id = original.callback_chat_id
 
         # Native-Task spawn (or picker-mismatch fallback): plain INSERT.
         try:
@@ -136,9 +161,9 @@ def make_subagent_hooks(
                 sdk_agent_id=agent_id,
                 agent_type=agent_type,
                 parent_session_id=parent_session,
-                callback_chat_id=settings.owner_chat_id,
-                spawned_by_kind="user",
-                spawned_by_ref=None,
+                callback_chat_id=fallback_callback_chat_id,
+                spawned_by_kind=fallback_spawned_by_kind,
+                spawned_by_ref=fallback_spawned_by_ref,
             )
         except Exception:
             log.warning(

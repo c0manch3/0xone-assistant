@@ -23,6 +23,7 @@ blocking double-start on the same SDK-assigned id.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -78,6 +79,71 @@ _SELECT_COLS = (
     "cost_usd, callback_chat_id, spawned_by_kind, spawned_by_ref, depth, "
     "created_at, started_at, finished_at"
 )
+
+
+def cancel_sync(conn: sqlite3.Connection, job_id: int) -> dict[str, str | bool]:
+    """Cancel a subagent job using a plain sqlite3 connection.
+
+    Phase-6 fix-pack HIGH #3 (CR I-4): factored out of
+    `SubagentStore.set_cancel_requested` so the CLI command
+    `tools/task/main.py cancel` can reuse the exact same SQL
+    (including the status precondition) without duplicating the
+    logic. Wrapped in `BEGIN IMMEDIATE` so the SELECT + UPDATE are
+    atomic — without it, a concurrent writer could flip the row's
+    status between the two statements, giving a stale `previous_
+    status` report or missing a transition entirely.
+
+    Returns a dict with the same shape as
+    `SubagentStore.set_cancel_requested`:
+      * `{"cancel_requested": True, "previous_status": <str>}` — ok
+      * `{"already_terminal": <str>}` — row is past terminal OR the
+        row vanished (missing id treated the same as already-terminal
+        so the caller surfaces a single "no-op" branch; CLI layer
+        maps a missing row to EXIT_NOT_FOUND before calling this).
+
+    `conn` MUST be a connection with `PRAGMA foreign_keys=ON` and a
+    reasonable `busy_timeout`. We do NOT set pragmas here; that's
+    the caller's responsibility so they can share the connection
+    across commands.
+    """
+    # BEGIN IMMEDIATE — acquire the reserved lock upfront so another
+    # writer can't slip in between SELECT and UPDATE.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        sel_cur = conn.execute(
+            "SELECT status FROM subagent_jobs WHERE id=?",
+            (job_id,),
+        )
+        row = sel_cur.fetchone()
+        if row is None:
+            conn.commit()
+            return {"already_terminal": "missing"}
+        current_status = str(row[0])
+        if current_status in _TERMINAL_STATUSES:
+            conn.commit()
+            return {"already_terminal": current_status}
+        upd_cur = conn.execute(
+            "UPDATE subagent_jobs SET cancel_requested=1 "
+            "WHERE id=? AND status IN ('requested', 'started')",
+            (job_id,),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    if (upd_cur.rowcount or 0) == 0:
+        # Race: status flipped between SELECT (under the IMMEDIATE
+        # lock, this is nearly impossible — but defensively we
+        # re-read and return the current terminal state).
+        re_cur = conn.execute(
+            "SELECT status FROM subagent_jobs WHERE id=?",
+            (job_id,),
+        )
+        re_row = re_cur.fetchone()
+        if re_row is None:
+            return {"already_terminal": "missing"}
+        return {"already_terminal": str(re_row[0])}
+    return {"cancel_requested": True, "previous_status": current_status}
 
 
 def _row_to_job(row: Sequence[Any]) -> SubagentJob:
@@ -361,11 +427,23 @@ class SubagentStore:
         False if the row is missing — a race where the PreToolUse fires
         before the ledger writes the row (shouldn't happen — Start hook
         runs before any tool call — but defensive).
+
+        Fix-pack HIGH #5 (devil H-6): wrapped in `async with
+        self._lock` for consistency with the rest of the module. The
+        read is safe without the lock under WAL, but mixing locked
+        and un-locked access is a footgun — a future change that
+        moves the read into a multi-statement transaction would be a
+        silent regression. The lock acquisition cost is negligible
+        (p99 3.4 ms per S-1) and the invariant "all DB access goes
+        through _lock" is worth preserving.
         """
-        async with self._conn.execute(
-            "SELECT cancel_requested FROM subagent_jobs WHERE sdk_agent_id=?",
-            (sdk_agent_id,),
-        ) as cur:
+        async with (
+            self._lock,
+            self._conn.execute(
+                "SELECT cancel_requested FROM subagent_jobs WHERE sdk_agent_id=?",
+                (sdk_agent_id,),
+            ) as cur,
+        ):
             row = await cur.fetchone()
         if row is None:
             return False

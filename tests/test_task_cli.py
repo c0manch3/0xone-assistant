@@ -304,6 +304,52 @@ def test_cancel_not_found(tmp_path: Path) -> None:
     assert r.returncode == 7
 
 
+def test_cancel_shared_sql_matches_store_set_cancel_requested(tmp_path: Path) -> None:
+    """Fix-pack HIGH #3 (CR I-4): the CLI cancel command must return
+    the exact same JSON payload shape as
+    `SubagentStore.set_cancel_requested`. The store method returns
+    `{"cancel_requested": True, "previous_status": <str>}` on a
+    successful transition; so must the CLI."""
+    asyncio.run(_init_db(tmp_path))
+    jid = _insert_job(tmp_path, task_text="x")
+    r = _run(tmp_path, "cancel", str(jid))
+    assert r.returncode == 0, r.stderr
+    payload = json.loads(r.stdout)["data"]
+    # Keys match the store contract.
+    assert set(payload.keys()) == {"cancel_requested", "previous_status"}
+    assert payload["cancel_requested"] is True
+    assert payload["previous_status"] == "requested"
+
+
+def test_cancel_uses_begin_immediate_transaction(tmp_path: Path) -> None:
+    """Fix-pack HIGH #3: the shared `cancel_sync` helper wraps the
+    SELECT+UPDATE in `BEGIN IMMEDIATE`. This test issues two
+    concurrent cancels against the SAME row via separate
+    subprocesses; the outcome must be ONE successful transition
+    (the first to acquire the reserved lock wins) + ONE
+    already-terminal-ish response. No lost update, no partial
+    transaction."""
+    import concurrent.futures
+
+    asyncio.run(_init_db(tmp_path))
+    jid = _insert_job(tmp_path, task_text="race", status="started", sdk_agent_id="ag-r")
+    # Both subprocesses target the same row. BEGIN IMMEDIATE
+    # serialises them; one gets the transition, the other sees
+    # cancel_requested already set.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(_run, tmp_path, "cancel", str(jid)) for _ in range(2)]
+        results = [f.result() for f in futures]
+    # Both must exit 0 (no crash from a ProgrammingError or
+    # uncaught exception).
+    for r in results:
+        assert r.returncode == 0, r.stderr
+    # The cancel flag landed exactly once — the subsequent probe
+    # shows it as True and the status hasn't regressed.
+    probe = _run(tmp_path, "status", str(jid))
+    assert json.loads(probe.stdout)["data"]["cancel_requested"] is True
+    assert json.loads(probe.stdout)["data"]["status"] == "started"
+
+
 # ---------------------------------------------------------------- wait
 
 

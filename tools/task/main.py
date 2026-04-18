@@ -245,35 +245,36 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_cancel(args: argparse.Namespace) -> int:
+    """Cancel a subagent job.
+
+    Fix-pack HIGH #3 (CR I-4): delegates the SQL to the shared
+    `assistant.subagent.store.cancel_sync` helper so the CLI and
+    the async `SubagentStore.set_cancel_requested` path cannot
+    drift. The helper wraps the SELECT+UPDATE in `BEGIN IMMEDIATE`
+    — the pre-fix CLI ran the two statements without a transaction,
+    letting a concurrent daemon writer slip between them and
+    produce an inconsistent `previous_status` report.
+
+    CLI-specific wrapping: we first check for a missing row and
+    return `EXIT_NOT_FOUND` (7) so the operator sees the distinct
+    exit code rather than the shared helper's
+    `{"already_terminal": "missing"}`.
+    """
+    from assistant.subagent.store import cancel_sync
+
     conn = _connect()
     try:
-        cur = conn.execute(
-            "SELECT status FROM subagent_jobs WHERE id=?",
+        # Distinct "not found" exit code: probe first so we can
+        # surface EXIT_NOT_FOUND before the cancel_sync helper maps
+        # the missing row to `already_terminal=missing`.
+        probe = conn.execute(
+            "SELECT 1 FROM subagent_jobs WHERE id=?",
             (args.id,),
         )
-        row = cur.fetchone()
-        if row is None:
+        if probe.fetchone() is None:
             return _fail(EXIT_NOT_FOUND, f"job {args.id} not found")
-        current = str(row[0])
-        if current in _TERMINAL_STATUSES:
-            return _ok({"already_terminal": current})
-        upd_cur = conn.execute(
-            "UPDATE subagent_jobs SET cancel_requested=1 "
-            "WHERE id=? AND status IN ('requested', 'started')",
-            (args.id,),
-        )
-        conn.commit()
-        if (upd_cur.rowcount or 0) == 0:
-            # Row transitioned between SELECT and UPDATE — re-read.
-            re_cur = conn.execute(
-                "SELECT status FROM subagent_jobs WHERE id=?",
-                (args.id,),
-            )
-            re_row = re_cur.fetchone()
-            if re_row is not None:
-                return _ok({"already_terminal": str(re_row[0])})
-            return _fail(EXIT_NOT_FOUND, f"job {args.id} not found")
-        return _ok({"cancel_requested": True, "previous_status": current})
+        result = cancel_sync(conn, args.id)
+        return _ok(result)
     finally:
         conn.close()
 

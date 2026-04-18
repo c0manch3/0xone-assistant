@@ -155,6 +155,120 @@ async def test_start_hook_native_task_path_inserts_row(tmp_path: Path) -> None:
     await store._conn.close()
 
 
+async def test_start_hook_fallthrough_preserves_cli_attribution(
+    tmp_path: Path,
+) -> None:
+    """Fix-pack HIGH #4 (CR I-5): if
+    `update_sdk_agent_id_for_claimed_request` fails (e.g. the row
+    was already transitioned by a racy recover_orphans run, or a
+    status-precondition skew) the Start hook previously fell
+    through to `record_started` with a hard-coded
+    `spawned_by_kind='user'`. A CLI spawn would silently lose its
+    'cli' attribution and show up in list output as if the owner
+    had typed "use Task" inline. This test seeds a CLI-pending
+    row, simulates the claim UPDATE failing (we set its status to
+    `started` so the precondition `WHERE status='requested'`
+    doesn't fire), then calls the Start hook with the ContextVar
+    set to that row's id. The fallback INSERT must preserve
+    `spawned_by_kind='cli'` from the original row.
+    """
+    store = await _mkstore(tmp_path)
+    adapter = _FakeAdapter()
+    pending: set[asyncio.Task[object]] = set()
+    settings = _settings(tmp_path)
+    hooks = make_subagent_hooks(
+        store=store,
+        adapter=adapter,
+        settings=settings,
+        pending_updates=pending,
+    )
+    start_cb = hooks["SubagentStart"][0].hooks[0]
+
+    request_id = await store.record_pending_request(
+        agent_type="researcher",
+        task_text="find stuff",
+        callback_chat_id=999,  # distinct from owner_chat_id (42)
+        spawned_by_kind="cli",
+        spawned_by_ref="test-ref",
+    )
+    # Force the claim UPDATE to fail by pre-transitioning the row
+    # to `started` via raw SQL — the `WHERE status='requested'`
+    # precondition will now see no rows to update.
+    async with store._lock:
+        await store._conn.execute(
+            "UPDATE subagent_jobs SET status='started' WHERE id=?",
+            (request_id,),
+        )
+        await store._conn.commit()
+
+    token = CURRENT_REQUEST_ID.set(request_id)
+    try:
+        out = await start_cb(
+            {
+                "agent_id": "agent-fallthrough-1",
+                "agent_type": "researcher",
+                "session_id": "sess-parent",
+            },
+            None,
+            None,
+        )
+    finally:
+        CURRENT_REQUEST_ID.reset(token)
+
+    assert out == {}
+    # Fallthrough INSERT landed a NEW row with the ORIGINAL CLI
+    # attribution — not `'user'`.
+    inserted = await store.get_by_agent_id("agent-fallthrough-1")
+    assert inserted is not None
+    assert inserted.spawned_by_kind == "cli", inserted
+    assert inserted.spawned_by_ref == "test-ref", inserted
+    # Callback chat id also preserved from the original row.
+    assert inserted.callback_chat_id == 999
+    await store._conn.close()
+
+
+async def test_start_hook_fallthrough_vanished_row_uses_unknown_marker(
+    tmp_path: Path,
+) -> None:
+    """Fix-pack HIGH #4 (CR I-5) edge case: if the original row has
+    vanished between CLI insert and Start hook (a DELETE truly out
+    of nowhere), the fallback must use `'unknown'` — a distinct
+    marker that observability can flag, rather than silently
+    mis-attributing to 'user'.
+    """
+    store = await _mkstore(tmp_path)
+    adapter = _FakeAdapter()
+    pending: set[asyncio.Task[object]] = set()
+    settings = _settings(tmp_path)
+    hooks = make_subagent_hooks(
+        store=store,
+        adapter=adapter,
+        settings=settings,
+        pending_updates=pending,
+    )
+    start_cb = hooks["SubagentStart"][0].hooks[0]
+
+    # Set the ContextVar to a row id that doesn't exist anywhere.
+    token = CURRENT_REQUEST_ID.set(99999)
+    try:
+        await start_cb(
+            {
+                "agent_id": "agent-vanished-1",
+                "agent_type": "general",
+                "session_id": "s",
+            },
+            None,
+            None,
+        )
+    finally:
+        CURRENT_REQUEST_ID.reset(token)
+
+    inserted = await store.get_by_agent_id("agent-vanished-1")
+    assert inserted is not None
+    assert inserted.spawned_by_kind == "unknown", inserted
+    await store._conn.close()
+
+
 async def test_start_hook_no_agent_id_is_noop(tmp_path: Path) -> None:
     store = await _mkstore(tmp_path)
     adapter = _FakeAdapter()
