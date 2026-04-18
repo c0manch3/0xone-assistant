@@ -9,10 +9,12 @@ imported lazily where needed to keep package import cheap (the CLI at
 from __future__ import annotations
 
 from assistant.subagent.context import CURRENT_REQUEST_ID
+from assistant.subagent.definitions import build_agents
 from assistant.subagent.store import SubagentJob, SubagentStore
 
 __all__ = [
     "CURRENT_REQUEST_ID",
     "SubagentJob",
     "SubagentStore",
+    "build_agents",
 ]
