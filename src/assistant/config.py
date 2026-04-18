@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -141,6 +142,59 @@ class SubagentSettings(BaseSettings):
     requested_stale_after_s: int = 3600
 
 
+class MediaSettings(BaseSettings):
+    """Phase-7 media pipeline knobs (photo/voice/audio/document/transcribe/
+    genimage/extract/render/retention).
+
+    All fields overridable via `MEDIA_<NAME>` env var. Defaults are
+    spike-verified (S-0 Q0-3 for 5 MB photo inline cap; S-6 for the
+    15 MB voice cap, kept below the 20 MB Bot-API limit).
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="MEDIA_",
+        env_file=".env",
+        extra="ignore",
+    )
+
+    # Photo path
+    photo_mode: Literal["inline_base64", "path_tool"] = "inline_base64"  # S-0 PASS default
+    photo_max_inline_bytes: int = 5_242_880  # 5 MB (S-0 Q0-3)
+    photo_download_max_bytes: int = 10_485_760  # 10 MB
+
+    # Voice / audio
+    voice_max_sec: int = 1800
+    voice_inline_threshold_sec: int = 30
+    voice_max_bytes: int = 15_000_000  # S-6: below 20 MB Bot-API cap
+    audio_max_bytes: int = 50_000_000
+
+    # Document
+    document_max_bytes: int = 20_971_520
+
+    # Transcribe (HTTP client)
+    transcribe_endpoint: str = "http://localhost:9100/transcribe"
+    transcribe_language_default: str = "auto"
+    transcribe_timeout_s: int = 60
+    transcribe_max_input_bytes: int = 25_000_000
+
+    # Genimage (HTTP client + quota)
+    genimage_endpoint: str = "http://localhost:9101/generate"
+    genimage_daily_cap: int = 1
+    genimage_steps_default: int = 8
+    genimage_timeout_s: int = 120
+
+    # Extract / Render
+    extract_max_input_bytes: int = 20_000_000
+    render_max_body_bytes: int = 512_000
+    render_max_output_bytes: int = 10_485_760
+
+    # Retention
+    retention_inbox_days: int = 14
+    retention_outbox_days: int = 7
+    retention_total_cap_bytes: int = 2_147_483_648  # 2 GB
+    sweep_interval_s: int = 3600
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=(str(_user_env_file()), ".env"),
@@ -156,6 +210,7 @@ class Settings(BaseSettings):
     memory: MemorySettings = Field(default_factory=MemorySettings)
     scheduler: SchedulerSettings = Field(default_factory=SchedulerSettings)
     subagent: SubagentSettings = Field(default_factory=SubagentSettings)
+    media: MediaSettings = Field(default_factory=MediaSettings)
 
     @property
     def db_path(self) -> Path:
