@@ -1,0 +1,94 @@
+{
+  "verdict": "PASS",
+  "cases": [
+    {
+      "url": "http://localhost:9100/transcribe",
+      "expected_loopback_only": true,
+      "loopback_only_ok": true,
+      "loopback_only_reason": "localhost loopback-only",
+      "classify_url_reason": "hostname 'localhost' resolves to non-public address ::1 (SSRF defence)",
+      "match_expectation": true
+    },
+    {
+      "url": "http://127.0.0.1:9100/transcribe",
+      "expected_loopback_only": true,
+      "loopback_only_ok": true,
+      "loopback_only_reason": "ip literal is loopback",
+      "classify_url_reason": "IP literal targets non-public range: 127.0.0.1",
+      "match_expectation": true
+    },
+    {
+      "url": "http://127.0.0.2:9100/transcribe",
+      "expected_loopback_only": true,
+      "loopback_only_ok": true,
+      "loopback_only_reason": "ip literal is loopback",
+      "classify_url_reason": "IP literal targets non-public range: 127.0.0.2",
+      "match_expectation": true
+    },
+    {
+      "url": "http://[::1]:9100/transcribe",
+      "expected_loopback_only": true,
+      "loopback_only_ok": true,
+      "loopback_only_reason": "ip literal is loopback",
+      "classify_url_reason": "IP literal targets non-public range: ::1",
+      "match_expectation": true
+    },
+    {
+      "url": "http://localhost.localdomain:9100/transcribe",
+      "expected_loopback_only": null,
+      "loopback_only_ok": false,
+      "loopback_only_reason": "DNS resolve failed: [Errno 8] nodename nor servname provided, or not known",
+      "classify_url_reason": "cannot resolve host 'localhost.localdomain': [Errno 8] nodename nor servname provided, or not known",
+      "match_expectation": true
+    },
+    {
+      "url": "http://169.254.169.254/",
+      "expected_loopback_only": false,
+      "loopback_only_ok": false,
+      "loopback_only_reason": "ip literal 169.254.169.254 is not loopback",
+      "classify_url_reason": "IP literal targets non-public range: 169.254.169.254",
+      "match_expectation": true
+    },
+    {
+      "url": "http://10.0.0.1:9100/",
+      "expected_loopback_only": false,
+      "loopback_only_ok": false,
+      "loopback_only_reason": "ip literal 10.0.0.1 is not loopback",
+      "classify_url_reason": "IP literal targets non-public range: 10.0.0.1",
+      "match_expectation": true
+    },
+    {
+      "url": "http://192.168.1.1:9100/",
+      "expected_loopback_only": false,
+      "loopback_only_ok": false,
+      "loopback_only_reason": "ip literal 192.168.1.1 is not loopback",
+      "classify_url_reason": "IP literal targets non-public range: 192.168.1.1",
+      "match_expectation": true
+    },
+    {
+      "url": "https://api.telegram.org/",
+      "expected_loopback_only": false,
+      "loopback_only_ok": false,
+      "loopback_only_reason": "hostname 'api.telegram.org' resolves to non-loopback: [IPv4Address('149.154.166.110')]",
+      "classify_url_reason": null,
+      "match_expectation": true
+    },
+    {
+      "url": "ftp://localhost/",
+      "expected_loopback_only": false,
+      "loopback_only_ok": false,
+      "loopback_only_reason": "scheme must be http(s), got 'ftp'",
+      "classify_url_reason": "only http(s) is allowed; got scheme 'ftp'",
+      "match_expectation": true
+    },
+    {
+      "url": "http://:9100/",
+      "expected_loopback_only": false,
+      "loopback_only_ok": false,
+      "loopback_only_reason": "URL has no hostname",
+      "classify_url_reason": "URL has no hostname",
+      "match_expectation": true
+    }
+  ],
+  "decision": "CLI `_validate_endpoint(url)` should delegate to a narrow `is_loopback_only(url)` wrapper — NOT to `classify_url` which permits ALL non-public (loopback OR 10.x OR 192.168.x OR link-local). Private-LAN endpoints are disallowed too: host machine in phase-7 architecture is reached via SSH reverse tunnel on 127.0.0.1:<port>, so rejecting non-loopback is strictly correct."
+}

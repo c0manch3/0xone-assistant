@@ -1,0 +1,33 @@
+{
+  "scenario": "3_photos_middle_missing",
+  "image_blocks_count": 2,
+  "notes_count": 3,
+  "warns_recorded": [
+    {
+      "kind": "photo",
+      "path": "/var/folders/mr/br0y736x2wdgzmqxvxmdpsp40000gn/T/phase7_s7_95x5d2zr/photo2.jpg",
+      "error": "FileNotFoundError(2, 'No such file or directory')",
+      "index": 1
+    }
+  ],
+  "notes": [
+    "user attached photo at /var/folders/mr/br0y736x2wdgzmqxvxmdpsp40000gn/T/phase7_s7_95x5d2zr/photo1.jpg (64x64)",
+    "user attempted to attach photo at /var/folders/mr/br0y736x2wdgzmqxvxmdpsp40000gn/T/phase7_s7_95x5d2zr/photo2.jpg but read failed: FileNotFoundError.",
+    "user attached photo at /var/folders/mr/br0y736x2wdgzmqxvxmdpsp40000gn/T/phase7_s7_95x5d2zr/photo3.jpg (64x64)"
+  ],
+  "shape_ok": true,
+  "oversize_scenario": {
+    "image_blocks_count": 1,
+    "notes_count": 2,
+    "first_note_has_skip": true,
+    "second_image_present": true
+  },
+  "mixed_kind_scenario": {
+    "image_blocks_count": 0,
+    "notes_count": 3,
+    "failure_note_present_for_photo": true,
+    "voice_note_clean": true,
+    "doc_note_clean": true
+  },
+  "verdict": "PASS"
+}

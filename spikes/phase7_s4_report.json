@@ -1,0 +1,92 @@
+{
+  "deps_requested": [
+    "pypdf>=4.0",
+    "python-docx>=1.0",
+    "openpyxl>=3.1",
+    "striprtf>=0.0.28",
+    "defusedxml>=0.7",
+    "fpdf2>=2.7"
+  ],
+  "platform": "darwin",
+  "python": "3.12.13",
+  "baseline_venv_bytes": 30143,
+  "install_returncode": 0,
+  "install_stderr_tail": "Using Python 3.12.13 environment at: /private/var/folders/mr/br0y736x2wdgzmqxvxmdpsp40000gn/T/phase7_s4_12da_vhl/venv\nResolved 11 packages in 344ms\nDownloading lxml (8.2MiB)\n Downloaded lxml\nPrepared 6 packages in 6.61s\nInstalled 11 packages in 21ms\n + defusedxml==0.7.1\n + et-xmlfile==2.0.0\n + fonttools==4.62.1\n + fpdf2==2.8.7\n + lxml==6.1.0\n + openpyxl==3.1.5\n + pillow==12.2.0\n + pypdf==6.10.2\n + python-docx==1.2.0\n + striprtf==0.0.29\n + typing-extensions==4.15.0\n",
+  "install_stdout_tail": "",
+  "after_install_venv_bytes": 51149800,
+  "delta_bytes": 51119657,
+  "delta_mb": 48.75,
+  "site_packages_sizes_bytes": {
+    "lxml": 19736298,
+    "PIL": 13091263,
+    "fontTools": 12409645,
+    "docx": 1537846,
+    "pypdf": 1431014,
+    "fpdf": 1318108,
+    "openpyxl": 843554,
+    "fonttools-4.62.1.dist-info": 170329,
+    "fpdf2-2.8.7.dist-info": 92442,
+    "pillow-12.2.0.dist-info": 88092,
+    "et_xmlfile": 39648,
+    "defusedxml-0.7.1.dist-info": 36501,
+    "defusedxml": 32332,
+    "lxml-6.1.0.dist-info": 22192,
+    "openpyxl-3.1.5.dist-info": 20464,
+    "et_xmlfile-2.0.0.dist-info": 19737,
+    "typing_extensions-4.15.0.dist-info": 17902,
+    "pypdf-6.10.2.dist-info": 13969,
+    "python_docx-1.2.0.dist-info": 13632,
+    "striprtf": 12124,
+    "striprtf-0.0.29.dist-info": 4890
+  },
+  "lxml_present": true,
+  "pillow_present": true,
+  "fonttools_present": true,
+  "installed_packages": [
+    {
+      "name": "defusedxml",
+      "version": "0.7.1"
+    },
+    {
+      "name": "et-xmlfile",
+      "version": "2.0.0"
+    },
+    {
+      "name": "fonttools",
+      "version": "4.62.1"
+    },
+    {
+      "name": "fpdf2",
+      "version": "2.8.7"
+    },
+    {
+      "name": "lxml",
+      "version": "6.1.0"
+    },
+    {
+      "name": "openpyxl",
+      "version": "3.1.5"
+    },
+    {
+      "name": "pillow",
+      "version": "12.2.0"
+    },
+    {
+      "name": "pypdf",
+      "version": "6.10.2"
+    },
+    {
+      "name": "python-docx",
+      "version": "1.2.0"
+    },
+    {
+      "name": "striprtf",
+      "version": "0.0.29"
+    },
+    {
+      "name": "typing-extensions",
+      "version": "4.15.0"
+    }
+  ],
+  "verdict": "PASS"
+}

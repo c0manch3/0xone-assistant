@@ -1,0 +1,48 @@
+{
+  "setup": {
+    "font_source": "local: /Users/agent2/Documents/midomis-bot/document-server/fonts/DejaVuSans.ttf",
+    "font_size_bytes": 757076
+  },
+  "render": {
+    "returncode": 0,
+    "stderr_tail": "Downloading fonttools (2.7MiB)\n Downloaded fonttools\nInstalled 4 packages in 17ms\n<string>:27: DeprecationWarning: \"uni\" parameter is deprecated since v2.5.1 and will be removed in a future release\n",
+    "inner": {
+      "errors": [],
+      "info": {
+        "fpdf_version": "2.8.7",
+        "fpdf_file": "/Users/agent2/.cache/uv/archive-v0/5EV7M-I2mTmAV89QL5iRU/lib/python3.12/site-packages/fpdf/__init__.py",
+        "PIL_present_pre": true,
+        "output_size_bytes": 11446,
+        "PIL_present_post": true,
+        "loaded_modules_count": 465,
+        "PIL_modules_loaded": [
+          "PIL",
+          "PIL.ExifTags",
+          "PIL.GimpGradientFile",
+          "PIL.GimpPaletteFile",
+          "PIL.Image",
+          "PIL.ImageCms",
+          "PIL.ImageColor",
+          "PIL.ImageFile",
+          "PIL.ImageMode",
+          "PIL.ImageOps",
+          "PIL.ImagePalette",
+          "PIL.PaletteFile",
+          "PIL.TiffImagePlugin",
+          "PIL.TiffTags",
+          "PIL._binary",
+          "PIL._deprecate",
+          "PIL._imaging",
+          "PIL._imagingcms",
+          "PIL._typing",
+          "PIL._util",
+          "PIL._version",
+          "PIL.features"
+        ]
+      }
+    }
+  },
+  "verdict": "PARTIAL_PIL_IMPORTED",
+  "output_pdf_bytes": 11446,
+  "pdf_path": "/var/folders/mr/br0y736x2wdgzmqxvxmdpsp40000gn/T/phase7_s3_k5imhp_u/out.pdf"
+}

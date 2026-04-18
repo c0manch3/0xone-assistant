@@ -1,0 +1,1540 @@
+{
+  "corpus_size": 46,
+  "v1_regex": "(?<![\\w/])(/[^\\s`\\\"'<>()\\[\\]]+(?:\\.png|\\.jpg|\\.jpeg|\\.webp|\\.mp3|\\.ogg|\\.oga|\\.wav|\\.m4a|\\.flac|\\.pdf|\\.docx|\\.txt|\\.xlsx|\\.rtf))(?![\\w/])",
+  "v1_results": {
+    "passed": 42,
+    "total": 46,
+    "failures": [
+      {
+        "id": "url_with_ext",
+        "text": "https://host.com/abs/outbox/x.png",
+        "expected": [],
+        "actual": [
+          "//host.com/abs/outbox/x.png"
+        ],
+        "pass": false
+      },
+      {
+        "id": "url_pdf",
+        "text": "https://example.com/docs/report.pdf",
+        "expected": [],
+        "actual": [
+          "//example.com/docs/report.pdf"
+        ],
+        "pass": false
+      },
+      {
+        "id": "adjacent_paths",
+        "text": "/abs/x.png/abs/y.pdf",
+        "expected": [],
+        "actual": [
+          "/abs/x.png/abs/y.pdf"
+        ],
+        "pass": false
+      },
+      {
+        "id": "dot_slash",
+        "text": "see ./outbox/x.png please",
+        "expected": [],
+        "actual": [
+          "/outbox/x.png"
+        ],
+        "pass": false
+      }
+    ]
+  },
+  "v2_regex": "(?<![\\w/])(/[^\\s`\\\"'<>()\\[\\]]+?(?:\\.png|\\.jpg|\\.jpeg|\\.webp|\\.mp3|\\.ogg|\\.oga|\\.wav|\\.m4a|\\.flac|\\.pdf|\\.docx|\\.txt|\\.xlsx|\\.rtf))(?=[\\s`\\\"'<>()\\[\\].,;:!?]|$)",
+  "v2_results": {
+    "passed": 42,
+    "total": 46,
+    "failures": [
+      {
+        "id": "url_with_ext",
+        "text": "https://host.com/abs/outbox/x.png",
+        "expected": [],
+        "actual": [
+          "//host.com/abs/outbox/x.png"
+        ],
+        "pass": false
+      },
+      {
+        "id": "url_pdf",
+        "text": "https://example.com/docs/report.pdf",
+        "expected": [],
+        "actual": [
+          "//example.com/docs/report.pdf"
+        ],
+        "pass": false
+      },
+      {
+        "id": "adjacent_paths",
+        "text": "/abs/x.png/abs/y.pdf",
+        "expected": [],
+        "actual": [
+          "/abs/x.png/abs/y.pdf"
+        ],
+        "pass": false
+      },
+      {
+        "id": "dot_slash",
+        "text": "see ./outbox/x.png please",
+        "expected": [],
+        "actual": [
+          "/outbox/x.png"
+        ],
+        "pass": false
+      }
+    ]
+  },
+  "v3_regex": "(?<![\\w/.:])(/[^\\s`\\\"'<>()\\[\\]]+?(?:\\.png|\\.jpg|\\.jpeg|\\.webp|\\.mp3|\\.ogg|\\.oga|\\.wav|\\.m4a|\\.flac|\\.pdf|\\.docx|\\.txt|\\.xlsx|\\.rtf))(?=[\\s`\\\"'<>()\\[\\].,;:!?/]|$)",
+  "v3_results": {
+    "passed": 43,
+    "total": 46,
+    "failures": [
+      {
+        "id": "adjacent_paths",
+        "text": "/abs/x.png/abs/y.pdf",
+        "expected": [],
+        "actual": [
+          "/abs/x.png"
+        ],
+        "pass": false
+      },
+      {
+        "id": "colon_before",
+        "text": "готово:/abs/outbox/x.png",
+        "expected": [
+          "/abs/outbox/x.png"
+        ],
+        "actual": [],
+        "pass": false
+      },
+      {
+        "id": "nested_path",
+        "text": "/abs/outbox/x.png/y",
+        "expected": [],
+        "actual": [
+          "/abs/outbox/x.png"
+        ],
+        "pass": false
+      }
+    ]
+  },
+  "all_details_v1": [
+    {
+      "id": "basic_png",
+      "text": "готово: /abs/outbox/file.png",
+      "expected": [
+        "/abs/outbox/file.png"
+      ],
+      "actual": [
+        "/abs/outbox/file.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "basic_pdf",
+      "text": "см /abs/outbox/report.pdf",
+      "expected": [
+        "/abs/outbox/report.pdf"
+      ],
+      "actual": [
+        "/abs/outbox/report.pdf"
+      ],
+      "pass": true
+    },
+    {
+      "id": "basic_docx",
+      "text": "document at /abs/outbox/doc.docx",
+      "expected": [
+        "/abs/outbox/doc.docx"
+      ],
+      "actual": [
+        "/abs/outbox/doc.docx"
+      ],
+      "pass": true
+    },
+    {
+      "id": "basic_mp3",
+      "text": "audio /abs/outbox/voice.mp3",
+      "expected": [
+        "/abs/outbox/voice.mp3"
+      ],
+      "actual": [
+        "/abs/outbox/voice.mp3"
+      ],
+      "pass": true
+    },
+    {
+      "id": "basic_txt",
+      "text": "text at /abs/outbox/note.txt",
+      "expected": [
+        "/abs/outbox/note.txt"
+      ],
+      "actual": [
+        "/abs/outbox/note.txt"
+      ],
+      "pass": true
+    },
+    {
+      "id": "trailing_period",
+      "text": "готово: /abs/outbox/x.png.",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "trailing_comma",
+      "text": "вот /abs/outbox/x.png, готово",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "trailing_excl",
+      "text": "смотри /abs/outbox/x.pdf!",
+      "expected": [
+        "/abs/outbox/x.pdf"
+      ],
+      "actual": [
+        "/abs/outbox/x.pdf"
+      ],
+      "pass": true
+    },
+    {
+      "id": "trailing_qmark",
+      "text": "это /abs/outbox/x.pdf?",
+      "expected": [
+        "/abs/outbox/x.pdf"
+      ],
+      "actual": [
+        "/abs/outbox/x.pdf"
+      ],
+      "pass": true
+    },
+    {
+      "id": "md_link",
+      "text": "[caption](/abs/outbox/x.png)",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "md_link_pdf",
+      "text": "see [the PDF](/abs/outbox/report.pdf) attached",
+      "expected": [
+        "/abs/outbox/report.pdf"
+      ],
+      "actual": [
+        "/abs/outbox/report.pdf"
+      ],
+      "pass": true
+    },
+    {
+      "id": "parenthesised",
+      "text": "(cf. /abs/outbox/x.png)",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "backtick_wrap",
+      "text": "path: `/abs/outbox/x.png`",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "angle_wrap",
+      "text": "<path>/abs/outbox/x.png</path>",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "double_quote",
+      "text": "path: \"/abs/outbox/x.png\"",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "single_quote",
+      "text": "path: '/abs/outbox/x.png'",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "url_with_ext",
+      "text": "https://host.com/abs/outbox/x.png",
+      "expected": [],
+      "actual": [
+        "//host.com/abs/outbox/x.png"
+      ],
+      "pass": false
+    },
+    {
+      "id": "url_pdf",
+      "text": "https://example.com/docs/report.pdf",
+      "expected": [],
+      "actual": [
+        "//example.com/docs/report.pdf"
+      ],
+      "pass": false
+    },
+    {
+      "id": "code_fence_triple",
+      "text": "```\n/abs/outbox/x.png\n```",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "two_paths_newline",
+      "text": "first /abs/outbox/a.png\nsecond /abs/outbox/b.pdf",
+      "expected": [
+        "/abs/outbox/a.png",
+        "/abs/outbox/b.pdf"
+      ],
+      "actual": [
+        "/abs/outbox/a.png",
+        "/abs/outbox/b.pdf"
+      ],
+      "pass": true
+    },
+    {
+      "id": "two_paths_comma",
+      "text": "паки: /abs/outbox/a.png, /abs/outbox/b.pdf",
+      "expected": [
+        "/abs/outbox/a.png",
+        "/abs/outbox/b.pdf"
+      ],
+      "actual": [
+        "/abs/outbox/a.png",
+        "/abs/outbox/b.pdf"
+      ],
+      "pass": true
+    },
+    {
+      "id": "adjacent_paths",
+      "text": "/abs/x.png/abs/y.pdf",
+      "expected": [],
+      "actual": [
+        "/abs/x.png/abs/y.pdf"
+      ],
+      "pass": false
+    },
+    {
+      "id": "cyrillic_filename",
+      "text": "готово: /abs/outbox/документ.pdf",
+      "expected": [
+        "/abs/outbox/документ.pdf"
+      ],
+      "actual": [
+        "/abs/outbox/документ.pdf"
+      ],
+      "pass": true
+    },
+    {
+      "id": "cyrillic_surrounding",
+      "text": "результат: /abs/outbox/отчёт.docx — всё готово",
+      "expected": [
+        "/abs/outbox/отчёт.docx"
+      ],
+      "actual": [
+        "/abs/outbox/отчёт.docx"
+      ],
+      "pass": true
+    },
+    {
+      "id": "path_with_space",
+      "text": "готово: /abs/outbox/my file.png",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "relative_path",
+      "text": "see outbox/x.png please",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "dot_slash",
+      "text": "see ./outbox/x.png please",
+      "expected": [],
+      "actual": [
+        "/outbox/x.png"
+      ],
+      "pass": false
+    },
+    {
+      "id": "double_ext_tar_gz",
+      "text": "archive /abs/out/x.tar.gz",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "zip_upper",
+      "text": "file /abs/out/X.ZIP",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "emoji_before",
+      "text": "🎉 /abs/outbox/party.png готово",
+      "expected": [
+        "/abs/outbox/party.png"
+      ],
+      "actual": [
+        "/abs/outbox/party.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "emoji_in_filename",
+      "text": "/abs/outbox/party🎉.png",
+      "expected": [
+        "/abs/outbox/party🎉.png"
+      ],
+      "actual": [
+        "/abs/outbox/party🎉.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "ext_upper",
+      "text": "see /abs/outbox/X.PNG now",
+      "expected": [
+        "/abs/outbox/X.PNG"
+      ],
+      "actual": [
+        "/abs/outbox/X.PNG"
+      ],
+      "pass": true
+    },
+    {
+      "id": "ext_mixed",
+      "text": "see /abs/outbox/X.Png now",
+      "expected": [
+        "/abs/outbox/X.Png"
+      ],
+      "actual": [
+        "/abs/outbox/X.Png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "colon_before",
+      "text": "готово:/abs/outbox/x.png",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "zero_width_before",
+      "text": "​/abs/outbox/x.png",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "ipv6_url_with_path",
+      "text": "from http://[::1]:9100/abs/outbox/x.png",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "multiline_triple",
+      "text": "первый: /abs/outbox/a.png\nвторой: /abs/outbox/b.pdf\nтретий: /abs/outbox/c.mp3",
+      "expected": [
+        "/abs/outbox/a.png",
+        "/abs/outbox/b.pdf",
+        "/abs/outbox/c.mp3"
+      ],
+      "actual": [
+        "/abs/outbox/a.png",
+        "/abs/outbox/b.pdf",
+        "/abs/outbox/c.mp3"
+      ],
+      "pass": true
+    },
+    {
+      "id": "mixed_cyr_ascii",
+      "text": "документ сохранён /abs/outbox/report_2026-04-17.pdf и готов",
+      "expected": [
+        "/abs/outbox/report_2026-04-17.pdf"
+      ],
+      "actual": [
+        "/abs/outbox/report_2026-04-17.pdf"
+      ],
+      "pass": true
+    },
+    {
+      "id": "no_artefact",
+      "text": "просто текст без путей",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "slash_but_no_ext",
+      "text": "/abs/outbox/file",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "abs_path_unsupported_ext",
+      "text": "/abs/outbox/binary.exe",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "scheduler_with_path",
+      "text": "[system-note: owner sent /abs/outbox/x.png]",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "ext_inside_word",
+      "text": "file.png notation",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "ext_inside_word_abs_word",
+      "text": "/file.pngword",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "path_with_query",
+      "text": "/abs/outbox/x.png?foo=1",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "nested_path",
+      "text": "/abs/outbox/x.png/y",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    }
+  ],
+  "all_details_v2": [
+    {
+      "id": "basic_png",
+      "text": "готово: /abs/outbox/file.png",
+      "expected": [
+        "/abs/outbox/file.png"
+      ],
+      "actual": [
+        "/abs/outbox/file.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "basic_pdf",
+      "text": "см /abs/outbox/report.pdf",
+      "expected": [
+        "/abs/outbox/report.pdf"
+      ],
+      "actual": [
+        "/abs/outbox/report.pdf"
+      ],
+      "pass": true
+    },
+    {
+      "id": "basic_docx",
+      "text": "document at /abs/outbox/doc.docx",
+      "expected": [
+        "/abs/outbox/doc.docx"
+      ],
+      "actual": [
+        "/abs/outbox/doc.docx"
+      ],
+      "pass": true
+    },
+    {
+      "id": "basic_mp3",
+      "text": "audio /abs/outbox/voice.mp3",
+      "expected": [
+        "/abs/outbox/voice.mp3"
+      ],
+      "actual": [
+        "/abs/outbox/voice.mp3"
+      ],
+      "pass": true
+    },
+    {
+      "id": "basic_txt",
+      "text": "text at /abs/outbox/note.txt",
+      "expected": [
+        "/abs/outbox/note.txt"
+      ],
+      "actual": [
+        "/abs/outbox/note.txt"
+      ],
+      "pass": true
+    },
+    {
+      "id": "trailing_period",
+      "text": "готово: /abs/outbox/x.png.",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "trailing_comma",
+      "text": "вот /abs/outbox/x.png, готово",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "trailing_excl",
+      "text": "смотри /abs/outbox/x.pdf!",
+      "expected": [
+        "/abs/outbox/x.pdf"
+      ],
+      "actual": [
+        "/abs/outbox/x.pdf"
+      ],
+      "pass": true
+    },
+    {
+      "id": "trailing_qmark",
+      "text": "это /abs/outbox/x.pdf?",
+      "expected": [
+        "/abs/outbox/x.pdf"
+      ],
+      "actual": [
+        "/abs/outbox/x.pdf"
+      ],
+      "pass": true
+    },
+    {
+      "id": "md_link",
+      "text": "[caption](/abs/outbox/x.png)",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "md_link_pdf",
+      "text": "see [the PDF](/abs/outbox/report.pdf) attached",
+      "expected": [
+        "/abs/outbox/report.pdf"
+      ],
+      "actual": [
+        "/abs/outbox/report.pdf"
+      ],
+      "pass": true
+    },
+    {
+      "id": "parenthesised",
+      "text": "(cf. /abs/outbox/x.png)",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "backtick_wrap",
+      "text": "path: `/abs/outbox/x.png`",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "angle_wrap",
+      "text": "<path>/abs/outbox/x.png</path>",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "double_quote",
+      "text": "path: \"/abs/outbox/x.png\"",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "single_quote",
+      "text": "path: '/abs/outbox/x.png'",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "url_with_ext",
+      "text": "https://host.com/abs/outbox/x.png",
+      "expected": [],
+      "actual": [
+        "//host.com/abs/outbox/x.png"
+      ],
+      "pass": false
+    },
+    {
+      "id": "url_pdf",
+      "text": "https://example.com/docs/report.pdf",
+      "expected": [],
+      "actual": [
+        "//example.com/docs/report.pdf"
+      ],
+      "pass": false
+    },
+    {
+      "id": "code_fence_triple",
+      "text": "```\n/abs/outbox/x.png\n```",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "two_paths_newline",
+      "text": "first /abs/outbox/a.png\nsecond /abs/outbox/b.pdf",
+      "expected": [
+        "/abs/outbox/a.png",
+        "/abs/outbox/b.pdf"
+      ],
+      "actual": [
+        "/abs/outbox/a.png",
+        "/abs/outbox/b.pdf"
+      ],
+      "pass": true
+    },
+    {
+      "id": "two_paths_comma",
+      "text": "паки: /abs/outbox/a.png, /abs/outbox/b.pdf",
+      "expected": [
+        "/abs/outbox/a.png",
+        "/abs/outbox/b.pdf"
+      ],
+      "actual": [
+        "/abs/outbox/a.png",
+        "/abs/outbox/b.pdf"
+      ],
+      "pass": true
+    },
+    {
+      "id": "adjacent_paths",
+      "text": "/abs/x.png/abs/y.pdf",
+      "expected": [],
+      "actual": [
+        "/abs/x.png/abs/y.pdf"
+      ],
+      "pass": false
+    },
+    {
+      "id": "cyrillic_filename",
+      "text": "готово: /abs/outbox/документ.pdf",
+      "expected": [
+        "/abs/outbox/документ.pdf"
+      ],
+      "actual": [
+        "/abs/outbox/документ.pdf"
+      ],
+      "pass": true
+    },
+    {
+      "id": "cyrillic_surrounding",
+      "text": "результат: /abs/outbox/отчёт.docx — всё готово",
+      "expected": [
+        "/abs/outbox/отчёт.docx"
+      ],
+      "actual": [
+        "/abs/outbox/отчёт.docx"
+      ],
+      "pass": true
+    },
+    {
+      "id": "path_with_space",
+      "text": "готово: /abs/outbox/my file.png",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "relative_path",
+      "text": "see outbox/x.png please",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "dot_slash",
+      "text": "see ./outbox/x.png please",
+      "expected": [],
+      "actual": [
+        "/outbox/x.png"
+      ],
+      "pass": false
+    },
+    {
+      "id": "double_ext_tar_gz",
+      "text": "archive /abs/out/x.tar.gz",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "zip_upper",
+      "text": "file /abs/out/X.ZIP",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "emoji_before",
+      "text": "🎉 /abs/outbox/party.png готово",
+      "expected": [
+        "/abs/outbox/party.png"
+      ],
+      "actual": [
+        "/abs/outbox/party.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "emoji_in_filename",
+      "text": "/abs/outbox/party🎉.png",
+      "expected": [
+        "/abs/outbox/party🎉.png"
+      ],
+      "actual": [
+        "/abs/outbox/party🎉.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "ext_upper",
+      "text": "see /abs/outbox/X.PNG now",
+      "expected": [
+        "/abs/outbox/X.PNG"
+      ],
+      "actual": [
+        "/abs/outbox/X.PNG"
+      ],
+      "pass": true
+    },
+    {
+      "id": "ext_mixed",
+      "text": "see /abs/outbox/X.Png now",
+      "expected": [
+        "/abs/outbox/X.Png"
+      ],
+      "actual": [
+        "/abs/outbox/X.Png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "colon_before",
+      "text": "готово:/abs/outbox/x.png",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "zero_width_before",
+      "text": "​/abs/outbox/x.png",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "ipv6_url_with_path",
+      "text": "from http://[::1]:9100/abs/outbox/x.png",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "multiline_triple",
+      "text": "первый: /abs/outbox/a.png\nвторой: /abs/outbox/b.pdf\nтретий: /abs/outbox/c.mp3",
+      "expected": [
+        "/abs/outbox/a.png",
+        "/abs/outbox/b.pdf",
+        "/abs/outbox/c.mp3"
+      ],
+      "actual": [
+        "/abs/outbox/a.png",
+        "/abs/outbox/b.pdf",
+        "/abs/outbox/c.mp3"
+      ],
+      "pass": true
+    },
+    {
+      "id": "mixed_cyr_ascii",
+      "text": "документ сохранён /abs/outbox/report_2026-04-17.pdf и готов",
+      "expected": [
+        "/abs/outbox/report_2026-04-17.pdf"
+      ],
+      "actual": [
+        "/abs/outbox/report_2026-04-17.pdf"
+      ],
+      "pass": true
+    },
+    {
+      "id": "no_artefact",
+      "text": "просто текст без путей",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "slash_but_no_ext",
+      "text": "/abs/outbox/file",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "abs_path_unsupported_ext",
+      "text": "/abs/outbox/binary.exe",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "scheduler_with_path",
+      "text": "[system-note: owner sent /abs/outbox/x.png]",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "ext_inside_word",
+      "text": "file.png notation",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "ext_inside_word_abs_word",
+      "text": "/file.pngword",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "path_with_query",
+      "text": "/abs/outbox/x.png?foo=1",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "nested_path",
+      "text": "/abs/outbox/x.png/y",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    }
+  ],
+  "all_details_v3": [
+    {
+      "id": "basic_png",
+      "text": "готово: /abs/outbox/file.png",
+      "expected": [
+        "/abs/outbox/file.png"
+      ],
+      "actual": [
+        "/abs/outbox/file.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "basic_pdf",
+      "text": "см /abs/outbox/report.pdf",
+      "expected": [
+        "/abs/outbox/report.pdf"
+      ],
+      "actual": [
+        "/abs/outbox/report.pdf"
+      ],
+      "pass": true
+    },
+    {
+      "id": "basic_docx",
+      "text": "document at /abs/outbox/doc.docx",
+      "expected": [
+        "/abs/outbox/doc.docx"
+      ],
+      "actual": [
+        "/abs/outbox/doc.docx"
+      ],
+      "pass": true
+    },
+    {
+      "id": "basic_mp3",
+      "text": "audio /abs/outbox/voice.mp3",
+      "expected": [
+        "/abs/outbox/voice.mp3"
+      ],
+      "actual": [
+        "/abs/outbox/voice.mp3"
+      ],
+      "pass": true
+    },
+    {
+      "id": "basic_txt",
+      "text": "text at /abs/outbox/note.txt",
+      "expected": [
+        "/abs/outbox/note.txt"
+      ],
+      "actual": [
+        "/abs/outbox/note.txt"
+      ],
+      "pass": true
+    },
+    {
+      "id": "trailing_period",
+      "text": "готово: /abs/outbox/x.png.",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "trailing_comma",
+      "text": "вот /abs/outbox/x.png, готово",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "trailing_excl",
+      "text": "смотри /abs/outbox/x.pdf!",
+      "expected": [
+        "/abs/outbox/x.pdf"
+      ],
+      "actual": [
+        "/abs/outbox/x.pdf"
+      ],
+      "pass": true
+    },
+    {
+      "id": "trailing_qmark",
+      "text": "это /abs/outbox/x.pdf?",
+      "expected": [
+        "/abs/outbox/x.pdf"
+      ],
+      "actual": [
+        "/abs/outbox/x.pdf"
+      ],
+      "pass": true
+    },
+    {
+      "id": "md_link",
+      "text": "[caption](/abs/outbox/x.png)",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "md_link_pdf",
+      "text": "see [the PDF](/abs/outbox/report.pdf) attached",
+      "expected": [
+        "/abs/outbox/report.pdf"
+      ],
+      "actual": [
+        "/abs/outbox/report.pdf"
+      ],
+      "pass": true
+    },
+    {
+      "id": "parenthesised",
+      "text": "(cf. /abs/outbox/x.png)",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "backtick_wrap",
+      "text": "path: `/abs/outbox/x.png`",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "angle_wrap",
+      "text": "<path>/abs/outbox/x.png</path>",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "double_quote",
+      "text": "path: \"/abs/outbox/x.png\"",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "single_quote",
+      "text": "path: '/abs/outbox/x.png'",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "url_with_ext",
+      "text": "https://host.com/abs/outbox/x.png",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "url_pdf",
+      "text": "https://example.com/docs/report.pdf",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "code_fence_triple",
+      "text": "```\n/abs/outbox/x.png\n```",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "two_paths_newline",
+      "text": "first /abs/outbox/a.png\nsecond /abs/outbox/b.pdf",
+      "expected": [
+        "/abs/outbox/a.png",
+        "/abs/outbox/b.pdf"
+      ],
+      "actual": [
+        "/abs/outbox/a.png",
+        "/abs/outbox/b.pdf"
+      ],
+      "pass": true
+    },
+    {
+      "id": "two_paths_comma",
+      "text": "паки: /abs/outbox/a.png, /abs/outbox/b.pdf",
+      "expected": [
+        "/abs/outbox/a.png",
+        "/abs/outbox/b.pdf"
+      ],
+      "actual": [
+        "/abs/outbox/a.png",
+        "/abs/outbox/b.pdf"
+      ],
+      "pass": true
+    },
+    {
+      "id": "adjacent_paths",
+      "text": "/abs/x.png/abs/y.pdf",
+      "expected": [],
+      "actual": [
+        "/abs/x.png"
+      ],
+      "pass": false
+    },
+    {
+      "id": "cyrillic_filename",
+      "text": "готово: /abs/outbox/документ.pdf",
+      "expected": [
+        "/abs/outbox/документ.pdf"
+      ],
+      "actual": [
+        "/abs/outbox/документ.pdf"
+      ],
+      "pass": true
+    },
+    {
+      "id": "cyrillic_surrounding",
+      "text": "результат: /abs/outbox/отчёт.docx — всё готово",
+      "expected": [
+        "/abs/outbox/отчёт.docx"
+      ],
+      "actual": [
+        "/abs/outbox/отчёт.docx"
+      ],
+      "pass": true
+    },
+    {
+      "id": "path_with_space",
+      "text": "готово: /abs/outbox/my file.png",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "relative_path",
+      "text": "see outbox/x.png please",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "dot_slash",
+      "text": "see ./outbox/x.png please",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "double_ext_tar_gz",
+      "text": "archive /abs/out/x.tar.gz",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "zip_upper",
+      "text": "file /abs/out/X.ZIP",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "emoji_before",
+      "text": "🎉 /abs/outbox/party.png готово",
+      "expected": [
+        "/abs/outbox/party.png"
+      ],
+      "actual": [
+        "/abs/outbox/party.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "emoji_in_filename",
+      "text": "/abs/outbox/party🎉.png",
+      "expected": [
+        "/abs/outbox/party🎉.png"
+      ],
+      "actual": [
+        "/abs/outbox/party🎉.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "ext_upper",
+      "text": "see /abs/outbox/X.PNG now",
+      "expected": [
+        "/abs/outbox/X.PNG"
+      ],
+      "actual": [
+        "/abs/outbox/X.PNG"
+      ],
+      "pass": true
+    },
+    {
+      "id": "ext_mixed",
+      "text": "see /abs/outbox/X.Png now",
+      "expected": [
+        "/abs/outbox/X.Png"
+      ],
+      "actual": [
+        "/abs/outbox/X.Png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "colon_before",
+      "text": "готово:/abs/outbox/x.png",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [],
+      "pass": false
+    },
+    {
+      "id": "zero_width_before",
+      "text": "​/abs/outbox/x.png",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "ipv6_url_with_path",
+      "text": "from http://[::1]:9100/abs/outbox/x.png",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "multiline_triple",
+      "text": "первый: /abs/outbox/a.png\nвторой: /abs/outbox/b.pdf\nтретий: /abs/outbox/c.mp3",
+      "expected": [
+        "/abs/outbox/a.png",
+        "/abs/outbox/b.pdf",
+        "/abs/outbox/c.mp3"
+      ],
+      "actual": [
+        "/abs/outbox/a.png",
+        "/abs/outbox/b.pdf",
+        "/abs/outbox/c.mp3"
+      ],
+      "pass": true
+    },
+    {
+      "id": "mixed_cyr_ascii",
+      "text": "документ сохранён /abs/outbox/report_2026-04-17.pdf и готов",
+      "expected": [
+        "/abs/outbox/report_2026-04-17.pdf"
+      ],
+      "actual": [
+        "/abs/outbox/report_2026-04-17.pdf"
+      ],
+      "pass": true
+    },
+    {
+      "id": "no_artefact",
+      "text": "просто текст без путей",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "slash_but_no_ext",
+      "text": "/abs/outbox/file",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "abs_path_unsupported_ext",
+      "text": "/abs/outbox/binary.exe",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "scheduler_with_path",
+      "text": "[system-note: owner sent /abs/outbox/x.png]",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "ext_inside_word",
+      "text": "file.png notation",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "ext_inside_word_abs_word",
+      "text": "/file.pngword",
+      "expected": [],
+      "actual": [],
+      "pass": true
+    },
+    {
+      "id": "path_with_query",
+      "text": "/abs/outbox/x.png?foo=1",
+      "expected": [
+        "/abs/outbox/x.png"
+      ],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": true
+    },
+    {
+      "id": "nested_path",
+      "text": "/abs/outbox/x.png/y",
+      "expected": [],
+      "actual": [
+        "/abs/outbox/x.png"
+      ],
+      "pass": false
+    }
+  ],
+  "recommendation": "v3",
+  "scores": {
+    "v1": 42,
+    "v2": 42,
+    "v3": 43
+  },
+  "verdict": "PARTIAL",
+  "remaining_failures_acceptable": [
+    {
+      "id": "adjacent_paths",
+      "text": "/abs/x.png/abs/y.pdf",
+      "v3_actual": [
+        "/abs/x.png"
+      ],
+      "reasoning": "Model output '/abs/x.png/abs/y.pdf' is pathological — a real assistant reply would insert whitespace or a newline between two abs paths. If the model DID emit this, v3 extracts the first path; path-guard + exists() would deny the second since '/abs/x.png/abs/y.pdf' won't be a file. Accept as second-line-of-defense."
+    },
+    {
+      "id": "colon_before",
+      "text": "готово:/abs/outbox/x.png",
+      "v3_actual": [],
+      "reasoning": "v3 rejects the colon prefix (to avoid URL false positives). Real assistant replies will almost always include a space after ':' — sampling shows this. Accept as minor false-negative; cost is one missed send, recoverable via re-prompt."
+    },
+    {
+      "id": "nested_path",
+      "text": "/abs/outbox/x.png/y",
+      "v3_actual": [
+        "/abs/outbox/x.png"
+      ],
+      "reasoning": "v3 extracts '/abs/outbox/x.png' as the artefact; 'y' is treated as trailing noise. Path-guard + exists() passes if x.png is a real file. If the model genuinely meant '/abs/outbox/x.png/y' as a nested path, that won't exist either way. Accept."
+    }
+  ]
+}

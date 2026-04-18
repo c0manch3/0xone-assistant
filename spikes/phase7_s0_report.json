@@ -1,0 +1,263 @@
+{
+  "sdk_version": "0.1.59",
+  "claude_cli_version": "2.1.114 (Claude Code)",
+  "cwd": "/Users/agent2/Documents/0xone-assistant",
+  "q0_1_mixed_content": {
+    "verdict": "PASS",
+    "image_size_bytes": 2290,
+    "block_count": 3,
+    "trace": {
+      "wall_s": 6.998,
+      "assistant_text": "Flag of Hungary (red, white, green horizontal stripes).",
+      "assistant_text_len": 55,
+      "result_meta": {
+        "stop_reason": "end_turn",
+        "duration_ms": 2410,
+        "num_turns": 1,
+        "cost_usd": 0.009327000000000002,
+        "subtype": "success"
+      },
+      "init_meta": {
+        "model": "claude-opus-4-6[1m]",
+        "cwd": "/Users/agent2/Documents/0xone-assistant"
+      },
+      "error": null
+    }
+  },
+  "q0_2_media_types": {
+    "verdict": "PASS",
+    "per_type": {
+      "image/jpeg": {
+        "wall_s": 8.086,
+        "assistant_text": "ok image/jpeg",
+        "assistant_text_len": 13,
+        "result_meta": {
+          "stop_reason": "end_turn",
+          "duration_ms": 3008,
+          "num_turns": 1,
+          "cost_usd": 0.009084499999999999,
+          "subtype": "success"
+        },
+        "init_meta": {
+          "model": "claude-opus-4-6[1m]",
+          "cwd": "/Users/agent2/Documents/0xone-assistant"
+        },
+        "error": null
+      },
+      "image/png": {
+        "wall_s": 5.822,
+        "assistant_text": "ok image/png",
+        "assistant_text_len": 12,
+        "result_meta": {
+          "stop_reason": "end_turn",
+          "duration_ms": 2212,
+          "num_turns": 1,
+          "cost_usd": 0.0090745,
+          "subtype": "success"
+        },
+        "init_meta": {
+          "model": "claude-opus-4-6[1m]",
+          "cwd": "/Users/agent2/Documents/0xone-assistant"
+        },
+        "error": null
+      },
+      "image/webp": {
+        "wall_s": 5.242,
+        "assistant_text": "ok image/webp",
+        "assistant_text_len": 13,
+        "result_meta": {
+          "stop_reason": "end_turn",
+          "duration_ms": 2033,
+          "num_turns": 1,
+          "cost_usd": 0.009111000000000001,
+          "subtype": "success"
+        },
+        "init_meta": {
+          "model": "claude-opus-4-6[1m]",
+          "cwd": "/Users/agent2/Documents/0xone-assistant"
+        },
+        "error": null
+      }
+    },
+    "note": "We passed real JPEG bytes under all three labels; SDK/backend may validate magic vs label. Record per-type outcome."
+  },
+  "q0_3_size_boundaries": {
+    "per_size": {
+      "100KB": {
+        "raw_bytes": 102400,
+        "b64_bytes": 136536,
+        "trace": {
+          "wall_s": 5.244,
+          "assistant_text": "ok 100KB",
+          "assistant_text_len": 8,
+          "result_meta": {
+            "stop_reason": "end_turn",
+            "duration_ms": 1985,
+            "num_turns": 1,
+            "cost_usd": 0.03071025,
+            "subtype": "success"
+          },
+          "init_meta": {
+            "model": "claude-opus-4-6[1m]",
+            "cwd": "/Users/agent2/Documents/0xone-assistant"
+          },
+          "error": null
+        }
+      },
+      "1MB": {
+        "raw_bytes": 1048576,
+        "b64_bytes": 1398104,
+        "trace": {
+          "wall_s": 5.466,
+          "assistant_text": "ok 1MB",
+          "assistant_text_len": 6,
+          "result_meta": {
+            "stop_reason": "end_turn",
+            "duration_ms": 2277,
+            "num_turns": 1,
+            "cost_usd": 0.0307125,
+            "subtype": "success"
+          },
+          "init_meta": {
+            "model": "claude-opus-4-6[1m]",
+            "cwd": "/Users/agent2/Documents/0xone-assistant"
+          },
+          "error": null
+        }
+      },
+      "3MB": {
+        "raw_bytes": 3145728,
+        "b64_bytes": 4194304,
+        "trace": {
+          "wall_s": 5.256,
+          "assistant_text": "ok 3MB",
+          "assistant_text_len": 6,
+          "result_meta": {
+            "stop_reason": "end_turn",
+            "duration_ms": 2079,
+            "num_turns": 1,
+            "cost_usd": 0.0302895,
+            "subtype": "success"
+          },
+          "init_meta": {
+            "model": "claude-opus-4-6[1m]",
+            "cwd": "/Users/agent2/Documents/0xone-assistant"
+          },
+          "error": null
+        }
+      },
+      "5MB": {
+        "raw_bytes": 5242880,
+        "b64_bytes": 6990508,
+        "trace": {
+          "wall_s": 4.976,
+          "assistant_text": "ok 5MB",
+          "assistant_text_len": 6,
+          "result_meta": {
+            "stop_reason": "end_turn",
+            "duration_ms": 1942,
+            "num_turns": 1,
+            "cost_usd": 0.0307225,
+            "subtype": "success"
+          },
+          "init_meta": {
+            "model": "claude-opus-4-6[1m]",
+            "cwd": "/Users/agent2/Documents/0xone-assistant"
+          },
+          "error": null
+        }
+      },
+      "10MB": {
+        "raw_bytes": 10485760,
+        "b64_bytes": 13981016,
+        "trace": {
+          "wall_s": 5.242,
+          "assistant_text": "ok 10MB",
+          "assistant_text_len": 7,
+          "result_meta": {
+            "stop_reason": "end_turn",
+            "duration_ms": 1953,
+            "num_turns": 1,
+            "cost_usd": 0.0302895,
+            "subtype": "success"
+          },
+          "init_meta": {
+            "model": "claude-opus-4-6[1m]",
+            "cwd": "/Users/agent2/Documents/0xone-assistant"
+          },
+          "error": null
+        }
+      }
+    },
+    "largest_pass": "10MB",
+    "all_sizes_passed": [
+      "100KB",
+      "10MB",
+      "1MB",
+      "3MB",
+      "5MB"
+    ]
+  },
+  "q0_4_multi_photo": {
+    "verdict": "PASS",
+    "image_count": 3,
+    "trace": {
+      "wall_s": 4.871,
+      "assistant_text": "got 3",
+      "assistant_text_len": 5,
+      "result_meta": {
+        "stop_reason": "end_turn",
+        "duration_ms": 1987,
+        "num_turns": 1,
+        "cost_usd": 0.009077,
+        "subtype": "success"
+      },
+      "init_meta": {
+        "model": "claude-opus-4-6[1m]",
+        "cwd": "/Users/agent2/Documents/0xone-assistant"
+      },
+      "error": null
+    },
+    "note": "Phase-7 Q12 decided OUT-OF-SCOPE; this probe confirms SDK capability for a later phase."
+  },
+  "q0_5_order": null,
+  "q0_5b_scheduler_url_image_combined": {
+    "verdict": "PASS",
+    "block_count": 5,
+    "trace": {
+      "wall_s": 8.107,
+      "assistant_text": "The attached image shows a flag with two horizontal stripes — red on top and green on the bottom (resembles the Hungarian flag).\n\nFor the URL, let me fetch it:",
+      "assistant_text_len": 159,
+      "result_meta": {
+        "stop_reason": "tool_use",
+        "duration_ms": 5013,
+        "num_turns": 2,
+        "cost_usd": 0.012686,
+        "subtype": "error_max_turns"
+      },
+      "init_meta": {
+        "model": "claude-opus-4-6[1m]",
+        "cwd": "/Users/agent2/Documents/0xone-assistant"
+      },
+      "error": null
+    }
+  },
+  "q0_6_history_replay": {
+    "mode_a": {
+      "tag": "mode_a_raw_image",
+      "wall_s": 6.88,
+      "assistant_text": "I see the image — it shows the flag of Hungary (red, white, and green horizontal stripes). How can I help you?",
+      "assistant_text_len": 110,
+      "error": null
+    },
+    "mode_b": {
+      "tag": "mode_b_placeholder",
+      "wall_s": 6.748,
+      "assistant_text": "\n\nI acknowledge that you sent a photo earlier in the conversation. How can I help you with it?",
+      "assistant_text_len": 94,
+      "error": null
+    },
+    "verdict": "PASS",
+    "note": "Phase-7 plan chose mode B (placeholder) to avoid re-uploading bytes. Mode A remains SDK-valid fallback."
+  }
+}
