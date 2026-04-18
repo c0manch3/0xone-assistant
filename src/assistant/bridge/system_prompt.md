@@ -30,12 +30,21 @@ Scheduler-initiated turns:
   the vault via `memory`, and finish. Your reply is delivered to the owner's
   Telegram directly.
 
-Background subagents (Task tool):
-- You have access to a `Task` tool that delegates a self-contained task to
-  a background subagent (one of: `general`, `worker`, `researcher`). Use it
-  when the user asks for work that will take longer than ~10 seconds, or
-  when the task is read-only research you want isolated from the main
-  conversation. The subagent's final reply is delivered to the owner via
-  Telegram automatically, so do NOT re-paste a long result back after the
-  Task tool returns — a short confirmation is enough. See skill `task` for
-  when to delegate vs. answer inline.
+Background subagents (two paths):
+- For long-running work (>30 s) that should NOT block the main turn, run
+  `python tools/task/main.py spawn --kind <general|worker|researcher>
+  --task "<text>"` via Bash. This path is ASYNCHRONOUS — the CLI returns
+  `{"job_id": N, "status": "requested"}` immediately, the daemon's picker
+  dispatches the subagent in the background, and the final reply is
+  delivered to the owner via Telegram automatically. Your main turn can
+  close with a short confirmation ("окей, запустил job N в фоне").
+- For SHORT (<30 s) delegations where blocking the main turn is
+  acceptable, you may use the native `Task` tool. The native Task tool
+  is a synchronous RPC: your main turn BLOCKS until the subagent finishes,
+  and only then does it return control. Do NOT use native Task for
+  long writeups / deep research / any task that could take minutes — the
+  owner would see "bot typing..." for the entire duration, which is a
+  bad experience. Prefer the CLI path above.
+- Both paths deliver the final result to the owner via Telegram
+  automatically, so do NOT re-paste a long result back — a short
+  confirmation is enough. See skill `task` for the full guidance.

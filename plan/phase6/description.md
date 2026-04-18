@@ -16,7 +16,23 @@
 
 ## Выход — пользовательские сценарии (E2E)
 
-1. **Делегация "напиши длинный пост".** Владелец: *«напиши пост в Telegram про историю OAuth 2.0, глубоко, 500+ слов»*. Модель в основном turn'е использует SDK-native Task tool (или CLI `python tools/task/main.py spawn ...` как fallback) → SDK инстанцирует `general` AgentDefinition в фоне, возвращает `task_id` сразу. Главный turn заканчивается за ~3 сек. Владелец продолжает чатиться. Через ~2 мин SubagentStop hook вычитывает `agent_transcript_path`, экстрагирует финальный assistant text, форматирует с footer, дёргает `adapter.send_text(OWNER_CHAT_ID, ...)`.
+1. **Делегация "напиши длинный пост" — CLI path (non-blocking).**
+   Владелец: *«напиши пост в Telegram про историю OAuth 2.0, глубоко,
+   500+ слов»*. Модель в основном turn'е запускает
+   `python tools/task/main.py spawn --kind general --task ...` через
+   Bash → CLI возвращает `{"job_id": N, "status": "requested"}` сразу.
+   Главный turn заканчивается за ~3 сек. Владелец продолжает чатиться.
+   Daemon picker подхватывает `requested`-row'у, стартует SDK-subagent,
+   Start hook patch'ит `sdk_agent_id`. Через ~2 мин SubagentStop hook
+   вычитывает `agent_transcript_path`, экстрагирует финальный assistant
+   text, форматирует с footer, дёргает `adapter.send_text(OWNER_CHAT_ID, ...)`.
+
+   **Caveat для native Task tool.** S-6-0 Q1 / wave-2 Q1-BG FAIL: на
+   SDK 0.1.59 + CLI 2.1.114 флаг `background=True` не асинхронизует
+   — native Task tool остаётся синхронным RPC, и main turn блокируется
+   до завершения subagent'а. Native Task ОК только для коротких (<30 s)
+   делегаций, где блокировка приемлема. Для всего остального — CLI
+   (scenario выше).
 2. **Параллельные задачи.** Владелец последовательно просит 3 задачи в отдельных turn'ах. SDK сам запускает все три в фоне (concurrency cap проверим в S-6-0); каждая получает свой `agent_id` + `session_id`; результаты приходят по мере готовности.
 3. **Spawn from scheduler.** Cron-trigger в 09:00 → scheduler-инициированный turn → модель решает делегировать в `researcher` subagent → SDK запускает; результат доставляется владельцу через тот же SubagentStop hook (callback chat_id хранится в нашем job ledger по `agent_id`).
 4. **Subagent failure.** SDK эмитит `TaskNotificationMessage(status='failed')` → SubagentStop hook читает, помечает `subagent_jobs.status='failed'`, отправляет владельцу: *«job failed: <summary>»*. Никакого auto-retry (lesson phase-5 retry-pipeline CRITICAL).
@@ -40,7 +56,7 @@
 
 ## Критерии готовности
 
-- Spawn через native Task tool в main turn'е возвращает `task_id` без блокирования turn'а (turn завершается до завершения subagent'а).
+- Spawn через CLI (`python tools/task/main.py spawn`) возвращает `{"job_id": N, "status": "requested"}` мгновенно; picker подхватывает row'у и дисптчит subagent'а async. Native Task tool — sync RPC, main turn блокируется до завершения subagent'а (S-6-0 Q1 FAIL; documented caveat — для коротких задач приемлемо).
 - 3 параллельных subagent'а от 3 последовательных turn'ов работают взаимонезависимо; каждая имеет уникальный `session_id` и `agent_id`.
 - SubagentStop hook получает callback с `agent_transcript_path` → читает финальный assistant text → доставляет в Telegram владельцу через `adapter.send_text` (chunked).
 - Footer формат сохранён: `[job N status in Xs, kind=K, cost=$Y]` (Q4 locked).
