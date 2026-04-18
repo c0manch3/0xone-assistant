@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from _memlib.frontmatter import FrontmatterError, parse_note, serialize_note
+from tools.memory._lib.frontmatter import FrontmatterError, parse_note, serialize_note
 
 
 def test_tags_string_normalizes_to_list() -> None:

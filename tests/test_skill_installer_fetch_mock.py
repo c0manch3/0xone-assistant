@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-import _lib.fetch as fetch_mod
+import tools.skill_installer._lib.fetch as fetch_mod
 
 
 def test_git_repo_https_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

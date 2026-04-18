@@ -78,7 +78,7 @@ def _manifest_mtime(skills_dir: Path) -> float:
 def build_manifest(skills_dir: Path) -> str:
     """Return a markdown-list manifest of discovered skills, mtime-cached.
 
-    Phase-3 invalidation contract — the skill-installer:
+    Phase-3 invalidation contract — the skill_installer:
 
     1. Writes/replaces `<skills_dir>/<name>/SKILL.md` via atomic rename.
     2. Touches `<data_dir>/run/skills.dirty`; the bridge's
@@ -132,7 +132,7 @@ def build_manifest(skills_dir: Path) -> str:
 def invalidate_manifest_cache() -> None:
     """Drop the module-level manifest cache.
 
-    Call from phase-3 skill-installer after add / remove / replace so the
+    Call from phase-3 skill_installer after add / remove / replace so the
     next `build_manifest()` rebuilds without waiting for mtime detection.
     """
     _MANIFEST_CACHE.clear()
@@ -141,7 +141,7 @@ def invalidate_manifest_cache() -> None:
 def touch_skills_dir(skills_dir: Path) -> None:
     """Bump `skills_dir` mtime so `_manifest_mtime` picks up the change.
 
-    Useful from phase-3 skill-installer when individual file mtimes alone may
+    Useful from phase-3 skill_installer when individual file mtimes alone may
     not propagate (FS granularity, atomic-rename semantics on some FSes).
     """
     if skills_dir.exists():

@@ -6,7 +6,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from _lib.validate import sha256_of_tree
+from tools.skill_installer._lib.validate import sha256_of_tree
 
 
 def _write(path: Path, content: bytes = b"") -> None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import importlib
 
-installer_main = importlib.import_module("main")
+installer_main = importlib.import_module("tools.skill_installer.main")
 _canonicalize_url = installer_main._canonicalize_url
 
 

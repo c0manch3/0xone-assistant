@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-import _lib.fetch as fetch_mod
+import tools.skill_installer._lib.fetch as fetch_mod
 
 
 class _Redirect302To(BaseHTTPRequestHandler):

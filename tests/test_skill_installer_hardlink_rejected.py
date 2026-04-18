@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from _lib.validate import ValidationError, validate_bundle
+from tools.skill_installer._lib.validate import ValidationError, validate_bundle
 
 
 def _minimal_skill(tmp_path: Path) -> Path:

@@ -57,11 +57,13 @@ select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF", "ASYNC"]
 ignore = ["ASYNC240"]
 
 [tool.ruff.lint.isort]
-# Phase 3/4: installer and memory CLIs inject their `_lib/` / `_memlib/`
-# directories onto sys.path via tests/conftest.py. Tell isort those are
-# first-party so imports land in the right section rather than getting
-# grouped with pytest/pyyaml.
-known-first-party = ["assistant", "_lib", "_memlib", "tests"]
+# Phase 7 (Q9a tech-debt close): `tools/` is a real Python package, so
+# `tools.memory._lib.*` and `tools.skill_installer._lib.*` are first-party
+# by virtue of `assistant` + `tools` living in the same repo. The legacy
+# bare-name `_lib` package imports were removed; tests now address the
+# canonical fully-qualified paths and `tests/conftest.py` no longer
+# carries the historical `sys.path` shim.
+known-first-party = ["assistant", "tools", "tests"]
 
 [tool.mypy]
 strict = true

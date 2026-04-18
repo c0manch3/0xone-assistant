@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from _lib.validate import ValidationError, validate_bundle
+from tools.skill_installer._lib.validate import ValidationError, validate_bundle
 
 
 def test_missing_skill_md_rejected(tmp_path: Path) -> None:

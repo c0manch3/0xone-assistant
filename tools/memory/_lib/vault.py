@@ -10,7 +10,7 @@ import os
 import tempfile
 from pathlib import Path
 
-from _memlib.paths import should_skip_vault_path
+from .paths import should_skip_vault_path
 
 
 def ensure_vault(vault_dir: Path) -> list[str]:

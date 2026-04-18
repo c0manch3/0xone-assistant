@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-import _lib.fetch as fetch_mod
+import tools.skill_installer._lib.fetch as fetch_mod
 
 
 def _allow_everything(monkeypatch: pytest.MonkeyPatch) -> None:

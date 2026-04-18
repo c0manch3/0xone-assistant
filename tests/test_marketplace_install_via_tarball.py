@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-import _lib.fetch as fetch_mod
+import tools.skill_installer._lib.fetch as fetch_mod
 
 
 def _build_fake_tarball(*, prefix: str, files: dict[str, bytes]) -> bytes:

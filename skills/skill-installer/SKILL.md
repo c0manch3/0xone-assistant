@@ -1,6 +1,6 @@
 ---
 name: skill-installer
-description: "Install new skills from a URL or from the Anthropic marketplace. Invoke when the user asks to add/install a skill, shares a git/github URL pointing at a SKILL.md, or asks what skills are available in the marketplace. Run via Bash: `python tools/skill-installer/main.py <cmd>`."
+description: "Install new skills from a URL or from the Anthropic marketplace. Invoke when the user asks to add/install a skill, shares a git/github URL pointing at a SKILL.md, or asks what skills are available in the marketplace. Run via Bash: `python tools/skill_installer/main.py <cmd>`."
 allowed-tools: [Bash]
 ---
 
@@ -15,27 +15,27 @@ user wants to design a fresh skill, not this one.
 
 Ad-hoc URL install:
 
-- `python tools/skill-installer/main.py preview <URL>` — fetch bundle,
+- `python tools/skill_installer/main.py preview <URL>` — fetch bundle,
   run static validation, print a human-readable preview with the bundle
   SHA. The cache is keyed by URL, so running preview twice on the same
   URL is idempotent.
-- `python tools/skill-installer/main.py install --confirm --url <URL>` —
+- `python tools/skill_installer/main.py install --confirm --url <URL>` —
   re-fetch the bundle and compare SHA against the cached preview. On
   mismatch, exit code is `7` ("bundle on source changed since preview"
   — ask the user to re-preview). On match, copy files into `skills/`
   (and `tools/` if the bundle carried a top-level `tools/` subdir) and
   touch the manifest-cache sentinel.
-- `python tools/skill-installer/main.py status <NAME>` — phase-3 stub;
+- `python tools/skill_installer/main.py status <NAME>` — phase-3 stub;
   returns `{"status": "unknown"}`.
 
 Marketplace (Anthropic's public skills repo, hardcoded):
 
-- `python tools/skill-installer/main.py marketplace list` — JSON list
+- `python tools/skill_installer/main.py marketplace list` — JSON list
   of skills under `skills/` in `github.com/anthropics/skills`.
-- `python tools/skill-installer/main.py marketplace info <NAME>` —
+- `python tools/skill_installer/main.py marketplace info <NAME>` —
   print the full `SKILL.md` for one marketplace skill so you can
   summarise it before asking the user to confirm.
-- `python tools/skill-installer/main.py marketplace install <NAME>` —
+- `python tools/skill_installer/main.py marketplace install <NAME>` —
   preview-only by default; add `--confirm` to install.
 
 ## Flow

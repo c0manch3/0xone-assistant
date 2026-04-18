@@ -11,7 +11,7 @@ re-enable a TOCTOU bypass by re-emitting the flag.
 We cannot run a real LLM turn here (billed + non-deterministic). The
 test instead asserts two downstream guardrails:
 
-1. The installer CLI (`tools/skill-installer/main.py install ...`)
+1. The installer CLI (`tools/skill_installer/main.py install ...`)
    rejects `--bundle-sha` with argparse exit 2 — no silent acceptance.
 2. A Bash argv containing `--bundle-sha` still passes the bash hook
    (the hook's job is to validate the program + argv surface, not the
@@ -29,7 +29,7 @@ from pathlib import Path
 from assistant.bridge.hooks import check_bash_command
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
-_INSTALLER = _PROJECT_ROOT / "tools" / "skill-installer" / "main.py"
+_INSTALLER = _PROJECT_ROOT / "tools" / "skill_installer" / "main.py"
 
 
 def test_cli_rejects_unknown_bundle_sha_flag() -> None:

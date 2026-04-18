@@ -20,7 +20,7 @@ import socket
 from urllib.parse import urlparse
 
 
-# --- SSRF_MIRROR_START (mirrored to tools/skill-installer/_lib/_net_mirror.py) ---
+# --- SSRF_MIRROR_START (mirrored to tools/skill_installer/_lib/_net_mirror.py) ---
 def is_private_address(
     addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
 ) -> bool:

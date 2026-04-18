@@ -1,4 +1,4 @@
-"""B-CRIT-3: skill-installer warns when a SKILL.md declares >3 tools.
+"""B-CRIT-3: skill_installer warns when a SKILL.md declares >3 tools.
 
 Unknown tool names are still a hard reject (pre-existing behaviour);
 oversize permitted tool-sets get a warning surfaced in the preview so
@@ -11,8 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from _lib import preview as preview_mod
-from _lib import validate as validate_mod
+from tools.skill_installer._lib import preview as preview_mod
+from tools.skill_installer._lib import validate as validate_mod
 
 
 def _mk_bundle(tmp_path: Path, frontmatter: str) -> Path:

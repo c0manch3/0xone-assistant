@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from _memlib.frontmatter import sanitize_body
 from tests._helpers.memory_cli import run_memory
+from tools.memory._lib.frontmatter import sanitize_body
 
 
 def test_sanitize_indents_dashes() -> None:

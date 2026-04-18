@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from _memlib.vault import ensure_vault
+from tools.memory._lib.vault import ensure_vault
 
 
 def test_existing_loose_tmp_gets_tightened(tmp_path: Path) -> None:

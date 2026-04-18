@@ -163,7 +163,7 @@ _GH_AUTH_ALLOWED_SUBSUB: frozenset[str] = frozenset({"status"})
 
 # Endpoints the model is allowed to hit via `gh api`. Must stay read-only —
 # `/repos/<owner>/<repo>/contents[...]` and `/repos/<owner>/<repo>/tarball[...]`
-# are the only shapes the skill-installer actually needs for marketplace flow.
+# are the only shapes the skill_installer actually needs for marketplace flow.
 # Query strings are tolerated (`?ref=main` etc.) but must not contain
 # whitespace. Any other endpoint (`/graphql`, `/user`, `/search/...`) — deny.
 _GH_API_SAFE_ENDPOINT_RE = re.compile(

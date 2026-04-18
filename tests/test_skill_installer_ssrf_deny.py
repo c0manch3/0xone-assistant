@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from _lib.fetch import FetchError, fetch_bundle
+from tools.skill_installer._lib.fetch import FetchError, fetch_bundle
 
 
 @pytest.mark.parametrize(

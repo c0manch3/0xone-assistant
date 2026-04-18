@@ -24,20 +24,23 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-# Put this tool's `_lib/` on sys.path so subcommand modules can import it
-# without making `tools/memory/` a python package (keeps stdlib-only).
-_HERE = Path(__file__).resolve().parent
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
+# Phase-7 (Q9a tech debt close): `tools` is now a real Python package, so
+# imports resolve as `tools.memory._lib.*`. When launched as
+# `python tools/memory/main.py`, `__package__` is empty and the project root
+# is not on sys.path by default — the short pragma below restores it so both
+# invocation forms (cwd-launch + `python -m tools.memory.main`) work.
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
-from _memlib.frontmatter import (  # noqa: E402 — sys.path tweak above
+from tools.memory._lib.frontmatter import (  # noqa: E402 — sys.path pragma above
     FrontmatterError,
     extract_wikilinks,
     parse_note,
     sanitize_body,
     serialize_note,
 )
-from _memlib.fts import (  # noqa: E402
+from tools.memory._lib.fts import (  # noqa: E402
     delete_from_index,
     ensure_index,
     reindex_all,
@@ -45,11 +48,11 @@ from _memlib.fts import (  # noqa: E402
     upsert_index,
     vault_lock,
 )
-from _memlib.paths import (  # noqa: E402
+from tools.memory._lib.paths import (  # noqa: E402
     PathValidationError,
     validate_rel_path,
 )
-from _memlib.vault import (  # noqa: E402
+from tools.memory._lib.vault import (  # noqa: E402
     atomic_write,
     ensure_vault,
     list_notes,
@@ -67,10 +70,9 @@ EXIT_NOT_FOUND = 7
 _DEFAULT_SEARCH_LIMIT = 10
 _MAX_BODY_BYTES_DEFAULT = 1_048_576
 
-# Project root resolved once at import: memory/main.py → ../../ .
-# Used to path-guard `--body-file`, mirroring phase-2 file-hook semantics
-# (bodies staged outside the repo would defeat that guard).
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# Project root already resolved above (sys.path pragma). Re-used below to
+# path-guard `--body-file`, mirroring phase-2 file-hook semantics (bodies
+# staged outside the repo would defeat that guard).
 # Staging area for body-files written by the model via the Write tool and
 # consumed by `memory write --body-file`. Daemon.start() pre-creates it
 # with mode 0o700; CLI auto-cleans after successful write.

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from _memlib.vault import atomic_write
+from tools.memory._lib.vault import atomic_write
 
 
 def test_rename_failure_cleans_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

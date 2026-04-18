@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from _lib.validate import (
+from tools.skill_installer._lib.validate import (
     MAX_FILES,
     MAX_SINGLE_FILE,
     MAX_TOTAL_SIZE,

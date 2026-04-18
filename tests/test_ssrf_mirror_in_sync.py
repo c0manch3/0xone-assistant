@@ -15,7 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src" / "assistant" / "bridge" / "net.py"
-DST = ROOT / "tools" / "skill-installer" / "_lib" / "_net_mirror.py"
+DST = ROOT / "tools" / "skill_installer" / "_lib" / "_net_mirror.py"
 
 # Anchor on the full comment-line prefix so we don't match the sentinel
 # names that also appear inside the surrounding docstrings / references.
@@ -51,7 +51,7 @@ def test_ssrf_mirror_byte_identical_bidirectional() -> None:
     dst_block = _extract_between_sentinels(dst_text)
     assert src_block == dst_block, (
         "SSRF mirror drift between src/assistant/bridge/net.py and "
-        "tools/skill-installer/_lib/_net_mirror.py: re-copy the block "
+        "tools/skill_installer/_lib/_net_mirror.py: re-copy the block "
         f"verbatim.\n\nsrc bytes ({len(src_block)}):\n{src_block!r}\n\n"
         f"dst bytes ({len(dst_block)}):\n{dst_block!r}"
     )

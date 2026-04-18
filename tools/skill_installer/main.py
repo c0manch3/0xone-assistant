@@ -1,7 +1,7 @@
-"""skill-installer CLI — preview / install / status / marketplace.
+"""skill_installer CLI — preview / install / status / marketplace.
 
 Stdlib-only (B-4). Runs under the main project interpreter via
-`python tools/skill-installer/main.py <cmd>`. No `pyproject.toml`, no
+`python tools/skill_installer/main.py <cmd>`. No `pyproject.toml`, no
 external deps; the installer imports only from the stdlib and from its
 own `_lib/` subpackage.
 
@@ -31,23 +31,35 @@ from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
-# `tools/skill-installer/` is not a package — importing from `_lib` requires
-# the directory to be on sys.path. A direct insert is simpler than plumbing
-# a console-script entrypoint through an `uv` project (which B-4 forbids).
-_HERE = Path(__file__).resolve().parent
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
+# Phase-7 (Q9a tech debt close): `tools/skill_installer/` is now a real
+# Python sub-package (rename from the legacy hyphenated dir name). Imports resolve
+# as `tools.skill_installer._lib.*`. When launched as
+# `python tools/skill_installer/main.py`, `__package__` is empty and the
+# project root is not on sys.path by default — the short pragma below
+# restores it so both invocation forms (cwd-launch +
+# `python -m tools.skill_installer.main`) work.
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
-from _lib.fetch import FetchError, fetch_bundle  # noqa: E402
-from _lib.install import InstallError, atomic_install, diff_trees  # noqa: E402
-from _lib.marketplace import (  # noqa: E402
+from tools.skill_installer._lib.fetch import FetchError, fetch_bundle  # noqa: E402
+from tools.skill_installer._lib.install import (  # noqa: E402
+    InstallError,
+    atomic_install,
+    diff_trees,
+)
+from tools.skill_installer._lib.marketplace import (  # noqa: E402
     MARKETPLACE_REPO,
     MarketplaceError,
     fetch_skill_md,
     install_tree_url,
     list_skills,
 )
-from _lib.validate import ValidationError, sha256_of_tree, validate_bundle  # noqa: E402
+from tools.skill_installer._lib.validate import (  # noqa: E402
+    ValidationError,
+    sha256_of_tree,
+    validate_bundle,
+)
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -63,7 +75,7 @@ EXIT_MARKETPLACE = 9
 
 
 def _project_root() -> Path:
-    # tools/skill-installer/main.py → parents[2] = project root.
+    # tools/skill_installer/main.py → parents[2] = project root.
     return Path(__file__).resolve().parents[2]
 
 
@@ -147,7 +159,7 @@ def _utcnow_iso() -> str:
 
 
 def cmd_preview(args: argparse.Namespace) -> int:
-    from _lib.preview import render_preview
+    from tools.skill_installer._lib.preview import render_preview
 
     cdir = _cache_dir_for(args.url)
     with _cache_lock(cdir):
@@ -188,7 +200,7 @@ def cmd_install(args: argparse.Namespace) -> int:
     mpath = cdir / "manifest.json"
     if not mpath.is_file():
         sys.stderr.write(
-            f"no cached preview for {args.url!r}; run `skill-installer preview <URL>` first\n"
+            f"no cached preview for {args.url!r}; run `skill_installer preview <URL>` first\n"
         )
         return EXIT_NO_CACHE
     manifest = json.loads(mpath.read_text(encoding="utf-8"))
@@ -320,7 +332,7 @@ def cmd_marketplace_install(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="skill-installer",
+        prog="skill_installer",
         description=(
             f"Install new skills from a URL or from the Anthropic marketplace ({MARKETPLACE_REPO})."
         ),

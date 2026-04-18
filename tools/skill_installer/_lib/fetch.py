@@ -1,4 +1,4 @@
-"""URL → bundle/dir fetcher for skill-installer.
+"""URL → bundle/dir fetcher for skill_installer.
 
 Stdlib-only. Supported URL shapes:
 
@@ -36,7 +36,7 @@ from ._net_mirror import classify_url_sync
 
 FETCH_TIMEOUT = 30.0
 _TARBALL_TIMEOUT = 60.0  # larger — bundles up to 10 MB + tar overhead
-_HTTP_USER_AGENT = "0xone-assistant-skill-installer/0.1"
+_HTTP_USER_AGENT = "0xone-assistant-skill_installer/0.1"
 
 # URL-shape regexes ----------------------------------------------------------
 #

@@ -193,7 +193,7 @@ class ClaudeHandler:
             notes.append(
                 f"user message contains URL(s): {urls!r}. "
                 "If the user appears to want a skill installed, run "
-                "`python tools/skill-installer/main.py preview <URL>` "
+                "`python tools/skill_installer/main.py preview <URL>` "
                 "first; otherwise reply as usual."
             )
             log.info(

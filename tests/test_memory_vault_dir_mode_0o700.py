@@ -5,7 +5,7 @@ from __future__ import annotations
 import stat
 from pathlib import Path
 
-from _memlib.vault import ensure_vault
+from tools.memory._lib.vault import ensure_vault
 
 
 def test_fresh_dir_gets_mode_0o700(tmp_path: Path) -> None:

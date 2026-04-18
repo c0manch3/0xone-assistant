@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from _memlib.frontmatter import extract_wikilinks
 from tests._helpers.memory_cli import run_memory
+from tools.memory._lib.frontmatter import extract_wikilinks
 
 
 def test_wikilinks_round_trip(tmp_path: Path) -> None:

@@ -189,7 +189,7 @@ class Daemon:
             return
 
         self._log.info("skill_creator_bootstrap_starting")
-        installer = self._settings.project_root / "tools" / "skill-installer" / "main.py"
+        installer = self._settings.project_root / "tools" / "skill_installer" / "main.py"
         env = {**os.environ, "ASSISTANT_BOOTSTRAP": "1"}
         try:
             proc = await asyncio.create_subprocess_exec(

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from _memlib.frontmatter import sanitize_body
+from tools.memory._lib.frontmatter import sanitize_body
 
 
 def test_dashes_inside_code_fence_preserved() -> None:

@@ -8,11 +8,11 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
-import main as installer_main
 import pytest
 
-import _lib.fetch as fetch_mod
-import _lib.marketplace as mkt
+import tools.skill_installer._lib.fetch as fetch_mod
+import tools.skill_installer._lib.marketplace as mkt
+import tools.skill_installer.main as installer_main
 
 
 def _write_bundle(dest: Path) -> None:

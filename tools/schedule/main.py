@@ -13,8 +13,10 @@ Exit codes:
 Import discipline: the cron parser is the single source of truth in
 `src/assistant/scheduler/cron.py`. We append `<project_root>/src` to
 `sys.path` (NOT insert at index 0 — phase-4 lesson) and import from
-the `assistant.scheduler.cron` module. Full `_memlib`-style
-consolidation is deferred to phase 6 (detailed-plan §13 item 4).
+the `assistant.scheduler.cron` module. Full package-style
+consolidation closed in phase 7 for memory + skill_installer (see
+`tools/__init__.py`); this CLI continues to use the shim because it
+imports from `assistant.*` (under `src/`), not from a sibling tool.
 """
 
 from __future__ import annotations

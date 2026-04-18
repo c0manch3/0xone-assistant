@@ -2,7 +2,7 @@
 
 The Q1 snippet re-surfaces `bundle_sha` strings in the model's visible
 history. The concern (detailed-plan §Compatibility with phase-3
-skill-installer flow):
+skill_installer flow):
   * R-p3-1: preview → install flow is still cache-by-URL, not bundle-sha.
   * R-p3-2: if a snippet contains a hash, the installer CLI MUST NOT
     accept it as a flag (CLI never had `--bundle-sha`; argparse rejects
@@ -32,7 +32,7 @@ from tests._helpers.history_seed import (
 )
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
-_INSTALLER = _PROJECT_ROOT / "tools" / "skill-installer" / "main.py"
+_INSTALLER = _PROJECT_ROOT / "tools" / "skill_installer" / "main.py"
 
 
 async def test_bundle_sha_appears_in_history_not_in_cli_contract(tmp_path: Path) -> None:

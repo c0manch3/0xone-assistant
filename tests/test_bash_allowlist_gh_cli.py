@@ -1,6 +1,6 @@
 """Bash allowlist matrix for `gh` CLI (phase 3).
 
-Five allow cases cover the read-only endpoints the skill-installer actually
+Five allow cases cover the read-only endpoints the skill_installer actually
 needs; the deny matrix pins down every write-flag + every blocked
 subcommand so a future `gh` version that adds new aliases cannot silently
 broaden the attack surface.

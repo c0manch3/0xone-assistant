@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from _memlib import fts as fts_mod
+from tools.memory._lib import fts as fts_mod
 
 
 @pytest.fixture(autouse=True)

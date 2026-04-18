@@ -8,7 +8,7 @@ This module hosts the *canonical* implementation of three tiny helpers:
   private-range reject.
 
 The block between the `SSRF_MIRROR_START` / `SSRF_MIRROR_END` sentinels is
-mirrored **byte-for-byte** into `tools/skill-installer/_lib/_net_mirror.py`.
+mirrored **byte-for-byte** into `tools/skill_installer/_lib/_net_mirror.py`.
 The installer is a separate entrypoint (stdlib-only, see
 `plan/phase3/implementation.md §2.8`) that cannot import from the main
 package without coupling `sys.path` to it — duplicating the ~60 LOC block
@@ -28,7 +28,7 @@ import socket
 from urllib.parse import urlparse
 
 
-# --- SSRF_MIRROR_START (mirrored to tools/skill-installer/_lib/_net_mirror.py) ---
+# --- SSRF_MIRROR_START (mirrored to tools/skill_installer/_lib/_net_mirror.py) ---
 def is_private_address(
     addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
 ) -> bool:

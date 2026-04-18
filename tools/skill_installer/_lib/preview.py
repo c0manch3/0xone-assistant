@@ -1,4 +1,4 @@
-"""Human-readable preview renderer for skill-installer.
+"""Human-readable preview renderer for skill_installer.
 
 Output is plain text (no markdown rendering — sent straight to Telegram
 which in phase 3 has `parse_mode=None`). Caps the file list at 40 entries
@@ -16,7 +16,7 @@ FILE_LIST_LIMIT = 40
 def render_preview(url: str, bundle: Path, bundle_sha: str, report: dict[str, Any]) -> str:
     """Return a multi-line plain-text preview of `bundle`.
 
-    Shape (stable; skill-installer SKILL.md references the `To install run`
+    Shape (stable; skill_installer SKILL.md references the `To install run`
     line so the model knows exactly which command to surface to the user):
 
         Preview of <url>
@@ -27,7 +27,7 @@ def render_preview(url: str, bundle: Path, bundle_sha: str, report: dict[str, An
         files:
           - SKILL.md
           - ...
-        To install run: python tools/skill-installer/main.py install --confirm --url <URL>
+        To install run: python tools/skill_installer/main.py install --confirm --url <URL>
     """
     lines = [f"Preview of {url}"]
     lines.append(f"name:        {report['name']}")
@@ -66,6 +66,6 @@ def render_preview(url: str, bundle: Path, bundle_sha: str, report: dict[str, An
 
     lines.append("")
     lines.append(
-        f"To install run: python tools/skill-installer/main.py install --confirm --url {url}"
+        f"To install run: python tools/skill_installer/main.py install --confirm --url {url}"
     )
     return "\n".join(lines)

@@ -1,4 +1,4 @@
-"""Bundle validation + stable tree-hash for skill-installer.
+"""Bundle validation + stable tree-hash for skill_installer.
 
 Stdlib-only (B-4). The frontmatter parser is a minimal YAML-subset
 implementation that handles scalar strings and `[a, b]`-style lists — the

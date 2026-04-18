@@ -7,10 +7,10 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
-import main as installer_main
 import pytest
 
-import _lib.fetch as fetch_mod
+import tools.skill_installer._lib.fetch as fetch_mod
+import tools.skill_installer.main as installer_main
 
 
 def _materialise_bundle(content: str) -> Callable[[str, Path], None]:
