@@ -267,6 +267,118 @@ async def test_stop_hook_cancelled_status_stopped(tmp_path: Path) -> None:
     await store._conn.close()
 
 
+async def test_stop_hook_large_transcript_read_does_not_block_event_loop(
+    tmp_path: Path,
+) -> None:
+    """Fix-pack CRITICAL #4 (CR I-6 pitfall #12).
+
+    Hook pitfall #12: any blocking call >500 ms inside an async hook
+    stalls the SDK iterator. A subagent that streamed many assistant
+    messages can leave a multi-MB JSONL transcript; the pre-fix code
+    ran `path.read_text()` directly, which blocks the event loop.
+
+    This test builds a ~2 MB transcript with many assistant entries
+    and asserts that a concurrent ticker coroutine ticks at least
+    once every 200 ms while the hook is running. On the regression
+    path (direct sync read), the ticker would miss ticks because the
+    loop is blocked inside `read_text`. With `asyncio.to_thread` the
+    file I/O runs on a worker thread and the loop stays cooperative.
+    """
+    store = await _mkstore(tmp_path)
+    adapter = _FakeAdapter()
+    pending: set[asyncio.Task[object]] = set()
+    settings = _settings(tmp_path)
+    hooks = make_subagent_hooks(
+        store=store,
+        adapter=adapter,
+        settings=settings,
+        pending_updates=pending,
+    )
+    start_cb = hooks["SubagentStart"][0].hooks[0]
+    stop_cb = hooks["SubagentStop"][0].hooks[0]
+
+    await start_cb(
+        {"agent_id": "agent-big-1", "agent_type": "general", "session_id": "p"},
+        None,
+        None,
+    )
+
+    # Build a sizable JSONL transcript. Each assistant entry is ~2 KB
+    # of padded text; 1500 entries ≈ 3 MB — big enough that a
+    # synchronous read on disk takes measurable time on any machine.
+    transcript = tmp_path / "big.jsonl"
+    lines: list[str] = []
+    padding = "x" * 2000
+    for i in range(1500):
+        lines.append(
+            json.dumps(
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": f"entry-{i} {padding}"},
+                        ],
+                    }
+                }
+            )
+        )
+    transcript.write_text("\n".join(lines), encoding="utf-8")
+
+    # Concurrent ticker: records the timestamp of each tick. If the
+    # event loop is blocked inside the hook, ticks will cluster
+    # around the block-end rather than spacing evenly at ~50 ms.
+    ticks: list[float] = []
+    ticker_stop = asyncio.Event()
+
+    async def _ticker() -> None:
+        while not ticker_stop.is_set():
+            ticks.append(asyncio.get_event_loop().time())
+            try:
+                await asyncio.wait_for(ticker_stop.wait(), timeout=0.05)
+            except TimeoutError:
+                continue
+
+    ticker_task = asyncio.create_task(_ticker())
+    try:
+        await stop_cb(
+            {
+                "agent_id": "agent-big-1",
+                "agent_transcript_path": str(transcript),
+                "session_id": "s-child",
+                # Empty → forces the transcript fallback path (the
+                # code under test).
+                "last_assistant_message": "",
+            },
+            None,
+            None,
+        )
+    finally:
+        ticker_stop.set()
+        await ticker_task
+    await _drain(pending)
+
+    # Assertion: no gap between consecutive ticks exceeds 500 ms
+    # (pitfall #12 threshold). The 250 ms retry-sleep inside the hook
+    # yields to the loop, and `asyncio.to_thread` off-loads the read,
+    # so ticks should stay spaced around 50 ms + scheduler jitter.
+    gaps = [ticks[i + 1] - ticks[i] for i in range(len(ticks) - 1)]
+    assert gaps, "ticker never ran"
+    max_gap = max(gaps)
+    assert max_gap < 0.5, (
+        f"event loop blocked for {max_gap:.3f}s inside subagent_stop hook; "
+        "large transcript read must be off-loaded to asyncio.to_thread "
+        "(pitfall #12)."
+    )
+
+    # Secondary: the hook still produced the correct result.
+    job = await store.get_by_agent_id("agent-big-1")
+    assert job is not None
+    # The last entry's text (entry-1499) should be captured.
+    assert job.result_summary is not None
+    assert "entry-1499" in job.result_summary
+    await store._conn.close()
+
+
 async def test_stop_hook_fallback_jsonl_reads_last_assistant_text(tmp_path: Path) -> None:
     store = await _mkstore(tmp_path)
     adapter = _FakeAdapter()

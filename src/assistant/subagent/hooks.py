@@ -179,8 +179,16 @@ def make_subagent_hooks(
         last_msg = str(raw.get("last_assistant_message") or "")
         if not last_msg and transcript_path_str:
             # Fallback: retry once after 250 ms, then walk the JSONL.
+            # Fix-pack CRITICAL #4 (CR I-6 pitfall #12): transcripts
+            # for long subagents can be MB-scale; `path.read_text()`
+            # inside an async hook would block the SDK's event loop
+            # for the entire file read. Off-load the read to a worker
+            # thread so the loop stays responsive.
             await asyncio.sleep(_TRANSCRIPT_RETRY_S)
-            last_msg = _read_last_assistant_from_transcript(Path(transcript_path_str))
+            last_msg = await asyncio.to_thread(
+                _read_last_assistant_from_transcript,
+                Path(transcript_path_str),
+            )
 
         was_cancelled = await store.is_cancel_requested(agent_id)
         status = "stopped" if was_cancelled else "completed"
