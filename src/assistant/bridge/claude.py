@@ -6,8 +6,10 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from claude_agent_sdk import (
+    AgentDefinition,
     AssistantMessage,
     ClaudeAgentOptions,
+    HookMatcher,
     ResultMessage,
     SystemMessage,
     ToolResultBlock,
@@ -45,7 +47,11 @@ _GLOBAL_BASELINE: frozenset[str] = frozenset(
 _LAST_COLLAPSED_WARN: frozenset[str] | None = None
 
 
-def _effective_allowed_tools(manifest_entries: list[dict[str, Any]]) -> list[str]:
+def _effective_allowed_tools(
+    manifest_entries: list[dict[str, Any]],
+    *,
+    baseline_extras: frozenset[str] = frozenset(),
+) -> list[str]:
     """Compute the effective `allowed_tools` set for a turn (Q8).
 
     Semantics (detailed-plan Q8; spike-verified):
@@ -74,23 +80,30 @@ def _effective_allowed_tools(manifest_entries: list[dict[str, Any]]) -> list[str
     We still return the narrowed list because (a) strict-env hosts (CI,
     service account with empty permissions.allow) DO honour it and
     (b) it is the contract the SDK documents.
+
+    `baseline_extras` (phase 6 / B-W2-8): tool names unioned into the
+    baseline BEFORE intersecting with skills' manifests. The caller
+    passes `frozenset({"Task"})` iff the bridge has subagent agents
+    registered, so skills that don't know about the Task tool still
+    get everything else (narrower-is-safer default).
     """
+    effective_baseline = _GLOBAL_BASELINE | baseline_extras
     if not manifest_entries:
-        return sorted(_GLOBAL_BASELINE)
+        return sorted(effective_baseline)
 
     union: set[str] = set()
     collapsed_by: list[str] = []
     for entry in manifest_entries:
         tools = entry.get("allowed_tools")
         if tools is None:
-            union |= set(_GLOBAL_BASELINE)
+            union |= set(effective_baseline)
             name = entry.get("name") or "<unnamed>"
             collapsed_by.append(str(name))
         elif not tools:
             # []: honest lockdown on this skill; no contribution.
             continue
         elif isinstance(tools, list):
-            union |= {str(t) for t in tools if str(t) in _GLOBAL_BASELINE}
+            union |= {str(t) for t in tools if str(t) in effective_baseline}
 
     if collapsed_by:
         # Should-fix #7: emit the WARN only when the set of offending
@@ -163,9 +176,33 @@ class ClaudeBridge:
       `ClaudeBridgeError`.
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        extra_hooks: dict[str, list[HookMatcher]] | None = None,
+        agents: dict[str, AgentDefinition] | None = None,
+    ) -> None:
+        """Phase 6 adds `extra_hooks` + `agents`:
+
+        * `extra_hooks`: dict keyed by SDK hook-event name (e.g.
+          `"SubagentStart"`, `"SubagentStop"`, `"PreToolUse"`). Merged
+          into the options' `hooks` dict: PreToolUse is LIST-UNIONED
+          with the existing phase-3 guards, other events are appended
+          under their own key. This lets the Daemon hand the SAME
+          factory to the user-chat bridge and the picker bridge (Q6).
+
+        * `agents`: dict of AgentDefinition for subagent kinds. When
+          set, `_build_options` adds `"Task"` to the baseline via the
+          `baseline_extras` param of `_effective_allowed_tools`
+          (B-W2-8) so the main turn can delegate. Subagents themselves
+          do NOT carry `"Task"` in their tools list — the depth cap is
+          enforced by that omission (Q4 / pitfall #2).
+        """
         self._settings = settings
         self._sem = asyncio.Semaphore(settings.claude.max_concurrent)
+        self._extra_hooks = extra_hooks or {}
+        self._agents = agents
 
     # ------------------------------------------------------------------
 
@@ -182,7 +219,15 @@ class ClaudeBridge:
                 entry = parse_skill(skill_md)
                 if entry:
                     entries.append(entry)
-        allowed_tools = _effective_allowed_tools(entries)
+
+        # Phase 6 B-W2-8: extend baseline with `"Task"` when the bridge
+        # has subagent agents registered. The main turn needs Task;
+        # subagents inherit the baseline MINUS Task (their
+        # AgentDefinition.tools is the source of truth). Unit test
+        # `test_allowed_tools_includes_task_when_agents_registered`
+        # locks both branches.
+        baseline_extras = frozenset({"Task"}) if self._agents else frozenset()
+        allowed_tools = _effective_allowed_tools(entries, baseline_extras=baseline_extras)
         log.info(
             "allowed_tools_computed",
             allowed=allowed_tools,
@@ -190,22 +235,35 @@ class ClaudeBridge:
         )
 
         hooks: dict[Any, Any] = {
-            "PreToolUse": make_pretool_hooks(pr),
-            "PostToolUse": make_posttool_hooks(pr, dd),
+            "PreToolUse": list(make_pretool_hooks(pr)),
+            "PostToolUse": list(make_posttool_hooks(pr, dd)),
         }
+        # Merge extra_hooks (phase 6: subagent hooks).
+        # PreToolUse: LIST-UNION — cancel-flag gate stacks on top of the
+        # phase-3 sandbox (both must pass before the tool fires).
+        # Other events: create-or-extend under the event key.
+        for event, matchers in self._extra_hooks.items():
+            if event == "PreToolUse":
+                hooks["PreToolUse"].extend(matchers)
+            else:
+                hooks.setdefault(event, []).extend(matchers)
+
         thinking_kwargs: dict[str, Any] = {}
         if self._settings.claude.thinking_budget > 0:
             thinking_kwargs["max_thinking_tokens"] = self._settings.claude.thinking_budget
             thinking_kwargs["effort"] = self._settings.claude.effort
-        return ClaudeAgentOptions(
-            cwd=str(pr),
-            setting_sources=["project"],
-            max_turns=self._settings.claude.max_turns,
-            allowed_tools=allowed_tools,
-            hooks=hooks,
-            system_prompt=system_prompt,
+        opts_kwargs: dict[str, Any] = {
+            "cwd": str(pr),
+            "setting_sources": ["project"],
+            "max_turns": self._settings.claude.max_turns,
+            "allowed_tools": allowed_tools,
+            "hooks": hooks,
+            "system_prompt": system_prompt,
             **thinking_kwargs,
-        )
+        }
+        if self._agents:
+            opts_kwargs["agents"] = self._agents
+        return ClaudeAgentOptions(**opts_kwargs)
 
     def _check_skills_sentinel(self) -> None:
         """Drop + rebuild the manifest cache when the PostToolUse sentinel is set.
