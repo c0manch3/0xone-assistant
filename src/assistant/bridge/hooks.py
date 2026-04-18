@@ -121,6 +121,28 @@ _SCHEDULE_PROMPT_MAX_BYTES = 2048
 _SCHEDULE_TZ_MAX_CHARS = 64
 _UV_RUN_ALLOWED_PREFIXES: tuple[str, ...] = ("tools/", "skills/")
 
+# Phase 6: argv gate for `python tools/task/main.py <sub>`.
+# Mirrors the phase-5 schedule validator — enum subcommands, dup-flag
+# deny (wave-2 B-W2-5), per-sub flag whitelist, size/range caps.
+_TASK_SUBCMDS: frozenset[str] = frozenset({"spawn", "list", "status", "cancel", "wait"})
+_TASK_KINDS: frozenset[str] = frozenset({"general", "worker", "researcher"})
+_TASK_TASK_MAX_BYTES = 4096
+_TASK_TIMEOUT_MIN_S = 1
+_TASK_TIMEOUT_MAX_S = 600
+_TASK_LIMIT_MAX = 100
+_TASK_STATUS_VALUES: frozenset[str] = frozenset(
+    {
+        "requested",
+        "started",
+        "completed",
+        "failed",
+        "stopped",
+        "interrupted",
+        "error",
+        "dropped",
+    }
+)
+
 # Strictly safe `git` subcommands. We refuse arbitrary args (no `-c`,
 # `--upload-pack`, custom `--format=`, etc.) -- only known harmless flags.
 _GIT_ALLOWED_SUBCMDS: frozenset[str] = frozenset({"status", "log", "diff", "clone"})
@@ -273,6 +295,9 @@ def _validate_python_invocation(argv: list[str], project_root: Path) -> str | No
     # other `python tools/<foo>/main.py` call passes through unchanged.
     if script == "tools/schedule/main.py":
         return _validate_schedule_argv(argv[2:])
+    # Phase 6: argv gate for the task CLI.
+    if script == "tools/task/main.py":
+        return _validate_task_argv(argv[2:])
     return None
 
 
@@ -353,6 +378,125 @@ def _validate_schedule_argv(args: list[str]) -> str | None:
         return None
 
     return f"schedule subcommand {sub!r} missing validator"
+
+
+def _validate_task_argv(args: list[str]) -> str | None:
+    """Phase 6 bash-hook gate for `python tools/task/main.py ...`.
+
+    Runs on the arguments AFTER the script path (i.e. `[<subcmd>, *rest]`).
+    Mirrors `_validate_schedule_argv`:
+      * enum subcommands;
+      * dup-flag deny (wave-2 B-W2-5 lesson);
+      * per-sub flag whitelist;
+      * size / range caps on free-form values.
+
+    Returns a deny-reason string, or None to allow.
+    """
+    if not args:
+        return "task CLI requires a subcommand"
+    sub = args[0]
+    if sub not in _TASK_SUBCMDS:
+        return f"task subcommand {sub!r} not allowed"
+    remaining = args[1:]
+
+    if sub == "spawn":
+        allowed = {"--kind", "--task", "--callback-chat-id"}
+        required = {"--kind", "--task"}
+        seen: dict[str, str] = {}
+        i = 0
+        while i < len(remaining):
+            tok = remaining[i]
+            if tok not in allowed:
+                return f"task spawn: flag {tok!r} not allowed"
+            if tok in seen:
+                return f"task spawn: duplicate flag {tok!r}"
+            if i + 1 >= len(remaining):
+                return f"task spawn: flag {tok} requires a value"
+            val = remaining[i + 1]
+            seen[tok] = val
+            if tok == "--kind" and val not in _TASK_KINDS:
+                return f"task spawn: --kind must be one of {sorted(_TASK_KINDS)}"
+            if tok == "--task" and len(val.encode("utf-8")) > _TASK_TASK_MAX_BYTES:
+                return f"task spawn: --task exceeds {_TASK_TASK_MAX_BYTES} bytes"
+            if tok == "--callback-chat-id":
+                try:
+                    int(val)
+                except ValueError:
+                    return "task spawn: --callback-chat-id must be integer"
+            i += 2
+        missing = required - seen.keys()
+        if missing:
+            return f"task spawn: missing required flag(s) {sorted(missing)}"
+        return None
+
+    if sub == "list":
+        allowed = {"--status", "--kind", "--limit"}
+        seen_flags: set[str] = set()
+        i = 0
+        while i < len(remaining):
+            tok = remaining[i]
+            if tok not in allowed:
+                return f"task list: flag {tok!r} not allowed"
+            if tok in seen_flags:
+                return f"task list: duplicate flag {tok!r}"
+            seen_flags.add(tok)
+            if i + 1 >= len(remaining):
+                return f"task list: flag {tok} requires a value"
+            val = remaining[i + 1]
+            if tok == "--status" and val not in _TASK_STATUS_VALUES:
+                return f"task list: --status must be one of {sorted(_TASK_STATUS_VALUES)}"
+            if tok == "--kind" and val not in _TASK_KINDS:
+                return f"task list: --kind must be one of {sorted(_TASK_KINDS)}"
+            if tok == "--limit":
+                try:
+                    n = int(val)
+                except ValueError:
+                    return "task list: --limit must be integer"
+                if n < 1 or n > _TASK_LIMIT_MAX:
+                    return f"task list: --limit must be 1..{_TASK_LIMIT_MAX}"
+            i += 2
+        return None
+
+    if sub in ("status", "cancel"):
+        if len(remaining) != 1:
+            return f"task {sub}: exactly one positional job_id required"
+        try:
+            int(remaining[0])
+        except ValueError:
+            return f"task {sub}: job_id must be integer"
+        return None
+
+    if sub == "wait":
+        if not remaining:
+            return "task wait: positional job_id required"
+        try:
+            int(remaining[0])
+        except ValueError:
+            return "task wait: job_id must be integer"
+        rest = remaining[1:]
+        seen_flags = set()
+        i = 0
+        while i < len(rest):
+            tok = rest[i]
+            if tok != "--timeout-s":
+                return f"task wait: flag {tok!r} not allowed"
+            if tok in seen_flags:
+                return f"task wait: duplicate flag {tok!r}"
+            seen_flags.add(tok)
+            if i + 1 >= len(rest):
+                return f"task wait: flag {tok} requires a value"
+            try:
+                t = int(rest[i + 1])
+            except ValueError:
+                return "task wait: --timeout-s must be integer"
+            if t < _TASK_TIMEOUT_MIN_S or t > _TASK_TIMEOUT_MAX_S:
+                return (
+                    f"task wait: --timeout-s must be {_TASK_TIMEOUT_MIN_S}..{_TASK_TIMEOUT_MAX_S}"
+                )
+            i += 2
+        return None
+
+    return f"task subcommand {sub!r} missing validator"
 
 
 def _validate_uv_run(argv: list[str], project_root: Path) -> str | None:
