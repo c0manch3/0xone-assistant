@@ -47,6 +47,24 @@ class _FakeAdapter(MessengerAdapter):
         self.sent.append((chat_id, text))
         self._send_event.set()
 
+    # Phase 7 (commit 4) abstract-compliance stubs. These hook tests
+    # exercise `send_text` only; full media fakes arrive with the
+    # Wave B / Wave 7A test matrix that actually invokes dispatch_reply.
+    async def send_photo(
+        self, chat_id: int, path: Path, *, caption: str | None = None
+    ) -> None:
+        raise NotImplementedError
+
+    async def send_document(
+        self, chat_id: int, path: Path, *, caption: str | None = None
+    ) -> None:
+        raise NotImplementedError
+
+    async def send_audio(
+        self, chat_id: int, path: Path, *, caption: str | None = None
+    ) -> None:
+        raise NotImplementedError
+
 
 def _settings(tmp_path: Path) -> Settings:
     return Settings(

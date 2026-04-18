@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import os
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 from aiogram import Bot, Dispatcher, F
@@ -220,3 +221,36 @@ class TelegramAdapter(MessengerAdapter):
                         attempt=attempt + 1,
                     )
                     await asyncio.sleep(exc.retry_after + 1)
+
+    # Phase 7 (Wave 3, commit 4): abstract-compliance stubs.
+    # The full implementations -- aiogram `FSInputFile` upload, `
+    # TelegramRetryAfter` / `TelegramNetworkError` retry loops, per-kind
+    # size-pre-check + streaming download helper -- land in Wave 7A
+    # (commit 12, per `plan/phase7/implementation.md` §3.4 and
+    # `plan/phase7/wave-plan.md` Wave 7A). These stubs exist so that
+    # `MessengerAdapter` can be made abstract over `send_photo` /
+    # `send_document` / `send_audio` now (commit 4) without breaking
+    # the ~10 production + test construction sites of `TelegramAdapter`
+    # that exist today. Each site is NOT exercising the media path;
+    # calling these at runtime before Wave 7A lands is a programmer
+    # error, so `NotImplementedError` is the honest answer.
+    async def send_photo(
+        self, chat_id: int, path: Path, *, caption: str | None = None
+    ) -> None:
+        raise NotImplementedError(
+            "TelegramAdapter.send_photo lands in phase-7 Wave 7A (commit 12)"
+        )
+
+    async def send_document(
+        self, chat_id: int, path: Path, *, caption: str | None = None
+    ) -> None:
+        raise NotImplementedError(
+            "TelegramAdapter.send_document lands in phase-7 Wave 7A (commit 12)"
+        )
+
+    async def send_audio(
+        self, chat_id: int, path: Path, *, caption: str | None = None
+    ) -> None:
+        raise NotImplementedError(
+            "TelegramAdapter.send_audio lands in phase-7 Wave 7A (commit 12)"
+        )
