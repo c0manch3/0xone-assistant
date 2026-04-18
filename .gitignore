@@ -43,3 +43,4 @@ tools/*
 !tools/task/
 !tools/transcribe/
 !tools/genimage/
+!tools/extract_doc/
