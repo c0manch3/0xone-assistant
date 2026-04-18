@@ -1,22 +1,37 @@
-# Phase 7 — detailed plan (stub)
+# Phase 7 — детальный план (pending reconstruction)
 
-See [description.md](./description.md) as the authoritative summary for this refresh. The Plan agent produced a ~1000-line draft covering the sections listed below, but the transcript of that draft could not be retrieved during the rewrite, so this file is a placeholder pointer until the Plan agent is rerun.
+Полный черновик (~1000 строк) не смог быть сохранён из-за ограничения передачи контента между orchestrator и coder sub-agent'ом. `description.md` в этой же папке содержит authoritative scope: задачи, E2E сценарии, зависимости, риски.
 
-Expected sections (from the lost draft):
+План покрывал:
+1. Spike 0 (BLOCKER) — SDK multimodal envelope проверка
+2. Mental model — SDK/phase-6 subagent infra / phase-7 thin layer
+3. AgentDefinition reuse (worker kind для media)
+4. Per-CLI contracts (transcribe/genimage/extract-doc/render-doc)
+5. SKILL.md templates per tool (inline vs task spawn guidance)
+6. IncomingMessage.attachments extension + MessengerAdapter send methods
+7. TelegramAdapter media handlers (_on_voice/photo/document/audio/video_note)
+8. ClaudeHandler + bridge multimodal envelope (photo inline base64)
+9. dispatch_reply shared helper (Telegram + Scheduler + SubagentStop)
+10. Bash allowlist extension (_validate_media_argv + path-guards + SSRF)
+11. MediaSettings config (endpoints, caps, retention, quota)
+12. Retention sweeper (14d/7d + 2GB LRU)
+13. _memlib refactor (Q9a closes phase-4 tech debt)
+14. Phase-5 dispatcher + phase-6 subagent hooks migrated to dispatch_reply
+15. Testing plan (~20 files, ~1400 LOC)
+16. Risk register (15 items)
+17. Invariants (11 items)
+18. Open questions for Q&A (Q-7-1..Q-7-6)
+19. Commit order (15 commits)
+20. Acceptance checklist
 
-- Spike 0: multimodal envelope validation under `claude-agent-sdk` (inline base64 vs path+vision-tool vs external OCR).
-- Mental model: adapter delivers files to disk + builds `MediaAttachment`; model decides what to do via CLI tools.
-- AgentDefinition integration — explicitly NOT needed in phase 7, reuses phase-6 subagent infrastructure (`task spawn --kind worker`, `subagent_jobs`, SubagentStop hook).
-- Four CLI contracts: `tools/transcribe/`, `tools/genimage/`, `tools/extract-doc/`, `tools/render-doc/` (thin HTTP clients over SSH tunnel to Mac, plus local extract/render fallback).
-- `SKILL.md` per tool with `allowed-tools` scoped to `Bash` + `Read` for stage files.
-- Adapter changes: new `_on_voice`, `_on_photo`, `_on_document`, `_on_audio`, `_on_video_note` handlers; outbound artifact detector on `<data_dir>/media/outbox`.
-- Multimodal envelope construction in `ClaudeHandler` (image content-blocks + system-notes for non-image media).
-- `dispatch_reply` shared helper consumed by `TelegramAdapter`, `SchedulerDispatcher`, and the phase-6 `SubagentStop` hook to unify outbound delivery (closes phase-4 tech debt around duplicated send paths).
-- Bash allowlist additions (`_BASH_PROGRAMS` entries with structural validation on `--out`, `--body-file`, and file/URL arguments; SSRF guard reuse from phase-3).
-- `MediaSettings(BaseSettings, env_prefix="MEDIA_")` with paths, caps, and provider keys; registered as `Settings.media`.
-- Retention sweeper piggybacking on phase-3 `_sweep_run_dirs` (inbox >14d, outbox >7d, LRU eviction to stay under a total size cap).
-- `_memlib` refactor — consolidate `sys.path.append` pattern from phases 4/5 into `tools/__init__.py` + `from tools.<name>._lib import …`, closing phase-4 tech debt.
-- Integration with phase-6 `SubagentStop` hook — long-running transcribe/genimage runs as worker subagent, result delivered via `dispatch_reply`.
-- 20+ tests across unit (per-CLI with mocked backends / fixture docs), integration (handler with fake `MediaAttachment`), and E2E (stub photo → bridge envelope carries image block; regression for phase-2 path-guard on outbox).
+LOC target: ~1900 src + ~575 modified + ~1400 tests = ~3900 total (vs ~5000 projected in pre-phase-6 plan — 22% reduction by leveraging subagent infra).
 
-**Action item**: rerun Plan agent to regenerate the full ~1000-line plan, then overwrite this stub.
+Reconstruction: rerun Plan agent for phase 7 with context "расширить description.md в полноценный detailed-plan по образцу phase-6/detailed-plan.md".
+
+### Critical Files for Implementation
+
+- /Users/agent2/Documents/0xone-assistant/src/assistant/adapters/telegram.py
+- /Users/agent2/Documents/0xone-assistant/src/assistant/adapters/base.py
+- /Users/agent2/Documents/0xone-assistant/src/assistant/handlers/message.py
+- /Users/agent2/Documents/0xone-assistant/src/assistant/bridge/claude.py
+- /Users/agent2/Documents/0xone-assistant/src/assistant/bridge/hooks.py
