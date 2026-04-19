@@ -205,6 +205,70 @@ _GIT_FORBIDDEN_FLAGS: tuple[str, ...] = (
 _GH_ALLOWED_SUBCMDS: frozenset[str] = frozenset({"api", "auth"})
 _GH_AUTH_ALLOWED_SUBSUB: frozenset[str] = frozenset({"status"})
 
+# Phase 8 (C6): argv gate for `python tools/gh/main.py ...`. Covers the
+# five first-level subcommands we ship (auth-status / issue / pr / repo /
+# vault-commit-push). Every sub-subcommand outside the explicit allow-list
+# below is denied; ditto for any write-flag (`--force`, `-X POST`, ...).
+_GH_CLI_SUBCMDS: frozenset[str] = frozenset({
+    "auth-status",
+    "issue",
+    "pr",
+    "repo",
+    "vault-commit-push",
+})
+# Issue sub-subs that mutate remote state — blocked until phase-9
+# keyboard-confirm surface exists. SF-C6 extended the list with
+# `develop`/`pin`/`unpin`/`status` to match gh 2.89's verb set.
+_GH_CLI_ISSUE_FORBIDDEN: frozenset[str] = frozenset({
+    "close",
+    "comment",
+    "edit",
+    "delete",
+    "reopen",
+    "transfer",
+    "unlock",
+    "lock",
+    "develop",
+    "pin",
+    "unpin",
+    "status",
+})
+# PR sub-subs that mutate or leak diff content — same deferral.
+_GH_CLI_PR_FORBIDDEN: frozenset[str] = frozenset({
+    "create",
+    "merge",
+    "close",
+    "comment",
+    "edit",
+    "delete",
+    "review",
+    "ready",
+    "checkout",
+    "checks",
+    "develop",
+    "update-branch",
+    "lock",
+    "unlock",
+    "diff",
+})
+# SF-C6: `repo` sub-sub allow-list. `view` only; `clone`/`create`/`delete`/
+# `edit`/`archive`/`rename`/`sync`/... all touch local filesystem or mutate
+# remote state and are rejected even when they LOOK read-only.
+_GH_CLI_REPO_ALLOWED_SUBSUB: frozenset[str] = frozenset({"view"})
+# Flags that turn a read-only invocation into a write, leak state into
+# an attacker-controlled file, or bypass the numeric --limit cap.
+_GH_CLI_FORBIDDEN_FLAGS: frozenset[str] = frozenset({
+    "--force",
+    "--force-with-lease",
+    "--no-verify",
+    "--amend",
+    "-X",
+    "--method",
+    "--body-file",  # SF-C6: file-based body reads bypass --body size caps
+})
+_GH_CLI_LIMIT_MIN = 1
+_GH_CLI_LIMIT_MAX = 100
+
 # Endpoints the model is allowed to hit via `gh api`. Must stay read-only —
 # `/repos/<owner>/<repo>/contents[...]` and `/repos/<owner>/<repo>/tarball[...]`
 # are the only shapes the skill_installer actually needs for marketplace flow.
@@ -361,6 +425,10 @@ def _validate_python_invocation(
         if data_dir is None:
             return "render-doc requires data_dir-bound hooks"
         return _validate_render_doc_argv(argv[2:], data_dir=data_dir)
+    # Phase 8 (C6): argv gate for the gh CLI wrapper. SF-C6 locks `repo`
+    # to `view`, blocks write flags, and caps `--limit` to 1..100.
+    if script == "tools/gh/main.py":
+        return _validate_gh_argv(argv[2:])
     return None
 
 
@@ -1048,6 +1116,98 @@ def _validate_git_invocation(argv: list[str], project_root: Path) -> str | None:
                 return f"git flag '{arg}' is not allowed (option-injection risk)"
     if sub == "clone":
         return _validate_git_clone(argv, project_root)
+    return None
+
+
+def _validate_gh_argv(args: list[str]) -> str | None:
+    """Phase 8 (C6) argv gate for ``python tools/gh/main.py ...``.
+
+    Validates the arguments AFTER the script path, i.e. the output of
+    ``argv[2:]``. Returns a deny-reason string or ``None`` to allow.
+
+    Defence-in-depth: the CLI itself re-validates subcommands and flags,
+    but the Bash hook must reject malicious shapes BEFORE `gh` / `git` is
+    ever launched. Same layered strategy as phase-5 schedule and phase-6
+    task validators.
+
+    Rules (SF-C6):
+      * first token must be in `_GH_CLI_SUBCMDS`;
+      * any `-X`/`--method`/`--force`/`--force-with-lease`/`--no-verify`/
+        `--amend`/`--body-file` → deny;
+      * duplicate long-flag → deny (closes the
+        `--repo legit --repo evil` exfiltration shape);
+      * `--limit N` must be an integer in 1..100;
+      * `issue` sub-sub ∈ {close, comment, edit, delete, reopen,
+        transfer, unlock, lock, develop, pin, unpin, status} → deny
+        (reserved for phase 9 keyboard-confirm);
+      * `pr` sub-sub ∈ same style → deny;
+      * `repo` sub-sub MUST be exactly `view` (SF-C6);
+      * `issue create` additionally forbids `--body-file` (already in
+        the global forbidden-flag list, but the per-sub branch adds a
+        precise error message for operator clarity).
+    """
+    if not args:
+        return "gh CLI requires a subcommand"
+    sub = args[0]
+    if sub not in _GH_CLI_SUBCMDS:
+        return f"gh CLI subcommand {sub!r} not allowed"
+
+    # Duplicate long-flag guard (`--repo a/b --repo c/d`). `--flag=value`
+    # and `--flag value` forms are normalised to their key component.
+    seen: set[str] = set()
+    for arg in args[1:]:
+        if arg.startswith("--"):
+            key = arg.split("=", 1)[0]
+            if key in seen:
+                return f"gh CLI duplicate flag {key}"
+            seen.add(key)
+
+    # Forbidden-flag matrix — both bare (`--force`) and keyed
+    # (`--method=POST`) forms.
+    for bad in _GH_CLI_FORBIDDEN_FLAGS:
+        if bad in args or any(a.startswith(bad + "=") for a in args):
+            return f"gh CLI flag {bad} not allowed"
+
+    # --limit numeric cap (SF-C6 rate-limit defence).
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        limit_val: str | None = None
+        if arg == "--limit":
+            if i + 1 >= len(args):
+                return "gh CLI --limit requires a value"
+            limit_val = args[i + 1]
+            i += 2
+        elif arg.startswith("--limit="):
+            limit_val = arg.split("=", 1)[1]
+            i += 1
+        else:
+            i += 1
+            continue
+        try:
+            n = int(limit_val)
+        except ValueError:
+            return "gh CLI --limit requires integer"
+        if n < _GH_CLI_LIMIT_MIN or n > _GH_CLI_LIMIT_MAX:
+            return f"gh CLI --limit must be {_GH_CLI_LIMIT_MIN}..{_GH_CLI_LIMIT_MAX}"
+
+    # Per-subcommand sub-sub matrix.
+    if sub == "issue" and len(args) >= 2:
+        subsub = args[1]
+        if subsub in _GH_CLI_ISSUE_FORBIDDEN:
+            return f"gh issue subsub {subsub!r} not allowed (phase 9)"
+    if sub == "pr" and len(args) >= 2:
+        subsub = args[1]
+        if subsub in _GH_CLI_PR_FORBIDDEN:
+            return f"gh pr subsub {subsub!r} not allowed (phase 9)"
+    # SF-C6: `repo` MUST be `repo view` exactly; any other sub-sub denied.
+    if sub == "repo":
+        if len(args) < 2:
+            return "gh repo requires a sub-subcommand"
+        subsub = args[1]
+        if subsub not in _GH_CLI_REPO_ALLOWED_SUBSUB:
+            return f"gh repo subsub {subsub!r} not allowed (only 'view' is permitted)"
+
     return None
 
 

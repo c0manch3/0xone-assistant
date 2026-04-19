@@ -43,6 +43,25 @@ _EXPECTED_SDK_VERSION = "0.1.59"
 AUTH_PREFLIGHT_FAIL_EXIT = 3
 DATA_DIR_SYNC_GUARD_FAIL_EXIT = 4
 
+# Phase 8 (C6): env keys scrubbed from the gh preflight probe. If the
+# operator has `GH_TOKEN` exported globally, the probe would succeed
+# even though `gh auth status` under the daemon's systemd/launchd
+# service would fail (service env is different). Reproducing the CLI
+# wrapper's `build_gh_env` scrub locally — duplicated here to keep the
+# `assistant` package independent of `tools/`.
+_GH_PREFLIGHT_ENV_SCRUB_KEYS: Final[tuple[str, ...]] = (
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "GH_HOST",
+    "GH_CONFIG_DIR",
+    "GIT_SSH_COMMAND",
+    "SSH_ASKPASS",
+)
+_GH_PREFLIGHT_TIMEOUT_S = 10.0
+_GH_VERSION_PREFLIGHT_TIMEOUT_S = 10.0
+
 # Phase-3 TTLs (Q7).
 _TMP_TTL_S = 3600  # 1 hour — aborted fetches
 _INSTALLER_CACHE_TTL_S = 7 * 86400  # 7 days — preview -> install window
@@ -224,6 +243,192 @@ def _check_data_dir_not_in_cloud_sync(
         ),
     )
     sys.exit(DATA_DIR_SYNC_GUARD_FAIL_EXIT)
+
+
+async def _verify_gh_config_accessible_for_daemon(
+    log: structlog.stdlib.BoundLogger,
+    timeout_s: float = _GH_PREFLIGHT_TIMEOUT_S,
+) -> bool:
+    """Phase 8 (B7) — probe ``gh auth status`` under the daemon's env.
+
+    SF-E1: now async — uses ``asyncio.create_subprocess_exec`` +
+    ``asyncio.wait_for`` so the probe is cancellable via task
+    cancellation. The previous synchronous ``subprocess.run(timeout=...)``
+    could not be interrupted if ``Daemon.start()`` received SIGTERM
+    mid-probe.
+
+    Non-fatal: any failure (gh missing, not authed, timeout, OSError)
+    returns ``False`` after a structured warning. Downstream
+    ``python tools/gh/main.py issue ...`` calls would surface the same
+    state at exit 4 (``GH_NOT_AUTHED``). The daemon does NOT refuse to
+    start on a broken gh config — vault auto-commit and other flows must
+    keep working even if the owner is mid-rotation on their gh token.
+
+    Env scrub: the probe drops ``GH_TOKEN`` / ``GITHUB_TOKEN`` / etc.
+    before invoking ``gh auth status`` so an operator-scoped token
+    doesn't falsely mask a systemd/launchd-scoped auth failure.
+    """
+    if shutil.which("gh") is None:
+        log.warning(
+            "gh_not_on_path",
+            hint="`gh` CLI missing; issue/pr/repo subcommands will fail.",
+        )
+        return False
+
+    env = dict(os.environ)
+    for key in _GH_PREFLIGHT_ENV_SCRUB_KEYS:
+        env.pop(key, None)
+    env["HOME"] = str(Path.home())
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "gh",
+            "auth",
+            "status",
+            "--hostname",
+            "github.com",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+    except OSError as exc:
+        log.warning("gh_auth_status_probe_spawn_failed", error=repr(exc))
+        return False
+
+    try:
+        _stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout_s
+        )
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+        log.warning("gh_auth_status_probe_timed_out", timeout_s=timeout_s)
+        return False
+
+    rc = proc.returncode or 0
+    stderr_text = (stderr_bytes or b"").decode("utf-8", "replace")
+    if rc == 0:
+        log.info("gh_auth_preflight_ok")
+        return True
+
+    stderr_first = stderr_text.splitlines()[0] if stderr_text else ""
+    lowered = stderr_text.lower()
+    reason = "not_authenticated" if (
+        "not logged into" in lowered or "not authenticated" in lowered
+    ) else f"rc={rc}"
+    log.warning(
+        "gh_config_not_accessible",
+        rc=rc,
+        reason=reason,
+        stderr=stderr_first[:200],
+        hint=(
+            "Run `gh auth login --hostname github.com` as the daemon user, "
+            "or ensure the systemd/launchd service sets HOME correctly."
+        ),
+    )
+    return False
+
+
+async def _probe_gh_version_for_daemon(
+    log: structlog.stdlib.BoundLogger,
+    timeout_s: float = _GH_VERSION_PREFLIGHT_TIMEOUT_S,
+) -> bool:
+    """Phase 8 (C6) — best-effort ``gh --version`` probe.
+
+    Analogous to :func:`_preflight_claude_cli` but NON-FATAL: a missing
+    or hanging `gh` binary must not block the daemon from starting
+    because the vault auto-commit flow uses `git` directly (via
+    `tools/gh/_lib/git_ops.py`) and does not strictly require `gh` to
+    be on PATH. Only the `gh issue/pr/repo` subcommands depend on it.
+
+    Returns True iff ``gh --version`` exits 0.
+    """
+    if shutil.which("gh") is None:
+        log.warning("gh_cli_not_found_issue_pr_disabled")
+        return False
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "gh",
+            "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        log.warning("gh_version_probe_spawn_failed", error=repr(exc))
+        return False
+    try:
+        stdout_bytes, _stderr_bytes = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout_s
+        )
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+        log.warning("gh_version_probe_timed_out", timeout_s=timeout_s)
+        return False
+
+    rc = proc.returncode or 0
+    if rc != 0:
+        log.warning("gh_version_probe_failed", rc=rc)
+        return False
+    version_line = (stdout_bytes or b"").decode("utf-8", "replace").splitlines()
+    first = version_line[0] if version_line else ""
+    log.info("gh_version_preflight_ok", gh_version=first[:120])
+    return True
+
+
+def _check_path_not_in_cloud_sync(
+    path: Path,
+    *,
+    label: str,
+    log: structlog.stdlib.BoundLogger,
+) -> None:
+    """Phase 8 (B8) — warn if ``path`` is under a known cloud-sync root.
+
+    Extends the D3 guard used for ``data_dir``. Unlike that guard, this
+    one is WARN-ONLY (no ``sys.exit``) because:
+
+    * ssh keys under iCloud Drive are a known owner pattern on macOS
+      and mostly work — iCloud caches the small file immediately and
+      the key is read-only at runtime.
+    * A "race" would only bite during key rotation, not during normal
+      auto-commit; the blast radius is a single failed push, not
+      data loss.
+
+    The check resolves ``path`` to its real filesystem path (symlinks
+    followed) and walks the well-known sync-root list. First match
+    wins; any resolve failure is silently ignored (the key is probably
+    missing on disk anyway, which the seed-path validator will catch
+    later).
+    """
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError):
+        return
+    for raw_root, cloud_label in _CLOUD_SYNC_ROOTS:
+        candidate = Path(raw_root).expanduser()
+        try:
+            root_resolved = candidate.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if not root_resolved.exists():
+            continue
+        try:
+            inside = resolved.is_relative_to(root_resolved)
+        except ValueError:
+            inside = False
+        if inside:
+            log.warning(
+                f"{label}_under_sync_folder",
+                path=str(resolved),
+                cloud=cloud_label,
+                sync_root=str(root_resolved),
+                hint=(
+                    f"ssh key under {cloud_label} — sync delays or "
+                    "de-duplication can intermittently impact auto-commit. "
+                    "Consider moving the key to ~/.ssh/ on local disk."
+                ),
+            )
+            return
 
 
 class Daemon:
@@ -796,11 +1001,57 @@ class Daemon:
         if reverted:
             self._log.info("scheduler_clean_slate_revert", count=reverted)
 
-        if shutil.which("gh") is None:
-            self._log.warning(
-                "gh_cli_not_found",
-                hint=("marketplace features disabled. Install https://cli.github.com/ to enable."),
+        # Phase 8 (C6): gh CLI preflight + vault auto-commit seed.
+        # ----------------------------------------------------------------
+        # B7 — async ``gh auth status`` probe with env-scrub. Non-fatal:
+        # daemon keeps starting even if gh is missing / unauthed so the
+        # scheduler, bridge, and Telegram adapter stay up. The seed row
+        # is still written below; cron invocations will surface the real
+        # failure reason (exit 4 / GH_NOT_AUTHED) per tick.
+        await _verify_gh_config_accessible_for_daemon(self._log)
+
+        # ``gh --version`` — best-effort binary check (analogous to the
+        # mandatory ``claude --version`` preflight, but non-fatal).
+        await _probe_gh_version_for_daemon(self._log)
+
+        gh_settings = self._settings.github
+
+        # B8 — extend the D3 cloud-sync guard to the ssh key parent.
+        # WARN-only (ssh keys are cached and read-only at runtime).
+        if gh_settings.auto_commit_enabled and gh_settings.vault_remote_url:
+            _check_path_not_in_cloud_sync(
+                gh_settings.vault_ssh_key_path.parent,
+                label="vault_ssh_key_path",
+                log=self._log,
             )
+
+        # B10 — allowed_repos empty + auto_commit_enabled → warn.
+        # Every vault-commit-push would exit 6 (``REPO_NOT_ALLOWED``);
+        # surface the config mistake at startup rather than per-tick.
+        if (
+            gh_settings.auto_commit_enabled
+            and gh_settings.vault_remote_url
+            and not gh_settings.allowed_repos
+        ):
+            self._log.warning(
+                "vault_auto_commit_allowed_repos_empty_will_reject",
+                hint=(
+                    "GH_ALLOWED_REPOS is empty; every vault-commit-push will "
+                    "exit 6. Set GH_ALLOWED_REPOS to a comma-separated list "
+                    "of 'owner/repo' slugs."
+                ),
+            )
+
+        # Q10 — default-seed the vault_auto_commit schedule row. The helper
+        # is tombstone-aware, idempotent, and no-ops when auto-commit is
+        # disabled or mis-configured. Must run AFTER ``apply_schema`` (for
+        # migration 0005/0006) and while the pidfile flock is held (the
+        # lock was acquired at the top of ``start``).
+        from assistant.scheduler.seed import ensure_vault_auto_commit_seed
+
+        seed_id = await ensure_vault_auto_commit_seed(sched_store, gh_settings)
+        if seed_id is not None:
+            self._log.info("vault_auto_commit_seed_ready", schedule_id=seed_id)
 
         # Phase 6 wiring -------------------------------------------------
         # B-W2-2: loud log-only warning on SDK version drift. We do NOT
