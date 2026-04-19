@@ -48,6 +48,10 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from assistant.media.path_guards import (  # noqa: E402
+    PathGuardError,
+    validate_future_output_path,
+)
 from tools.genimage._net_mirror import is_loopback_only  # noqa: E402
 
 EXIT_OK = 0
@@ -222,30 +226,37 @@ def _outbox_root() -> Path:
 def _validate_out_path(raw: str) -> tuple[Path | None, str | None]:
     """Return (resolved_path, error).
 
-    The --out path must be absolute, end with ``.png`` (lowercase), and
-    resolve strictly under the configured outbox. We deliberately check
-    ``is_relative_to`` after ``resolve(strict=False)`` so that
-    traversal like ``/outbox/../../etc/passwd.png`` is caught.
+    Fix-pack I3 + I7 (phase-7): delegates to the shared
+    :func:`assistant.media.path_guards.validate_future_output_path`.
+    The shared helper uses a strict parent-resolve + re-append +
+    ``is_relative_to`` combo that correctly handles ``..`` in the
+    middle of the path AND symlinks in parent components — neither
+    worked with the previous ``resolve(strict=False)`` implementation
+    on POSIX platforms (where ``resolve(strict=False)`` does NOT
+    collapse ``..`` through non-existent directory components).
+
+    Additional genimage-specific contract retained here:
+
+    * Suffix is ``.png`` only (mflux produces PNG; the allow-list is
+      narrower than ``validate_future_output_path`` allows for by
+      its generic design).
+    * The target MUST NOT already exist — genimage policy is "write
+      fresh PNG, never overwrite" so a caller asking for an extant
+      path is rejected. ``validate_future_output_path`` deliberately
+      does NOT embed that policy (render_doc overwrites via
+      ``os.replace``); genimage enforces it here.
     """
-    if not raw:
-        return None, "--out is empty"
-    path = Path(raw)
-    if not path.is_absolute():
-        return None, f"--out must be absolute, got {raw!r}"
-    if path.suffix.lower() != ".png":
-        return None, f"--out must end with .png, got {path.suffix!r}"
     try:
-        resolved = path.resolve(strict=False)
-    except (OSError, RuntimeError) as exc:
-        return None, f"--out resolve failed: {exc}"
-    outbox = _outbox_root()
-    try:
-        resolved.relative_to(outbox)
-    except ValueError:
-        return None, f"--out must be under outbox {outbox}, got {resolved}"
-    if resolved.exists():
-        return None, f"--out already exists, refuse to overwrite: {resolved}"
-    return resolved, None
+        final = validate_future_output_path(
+            raw,
+            root=_outbox_root(),
+            allowed_suffixes={".png"},
+        )
+    except PathGuardError as exc:
+        return None, f"--out {exc}"
+    if final.exists():
+        return None, f"--out already exists, refuse to overwrite: {final}"
+    return final, None
 
 
 # ----------------------------------------------------------- quota

@@ -60,6 +60,10 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from assistant.media.path_guards import (  # noqa: E402
+    PathGuardError,
+    validate_existing_input_path,
+)
 from tools.transcribe._net_mirror import is_loopback_only  # noqa: E402
 
 # --- Exit codes --------------------------------------------------------------
@@ -152,29 +156,22 @@ def _validate_path(raw: str) -> tuple[Path | None, str | None]:
     defence-in-depth (per plan §3.1 "Path-guard" bullet). Requiring
     absolute paths dodges cwd-drift ambiguity between worker and main
     turn.
+
+    Fix-pack I3/I7: delegates to
+    :func:`assistant.media.path_guards.validate_existing_input_path`
+    so transcribe / extract_doc / genimage / render_doc share ONE
+    authoritative implementation of the strict-resolve + is_file +
+    suffix-allowlist + size-cap chain.
     """
-    if not raw:
-        return None, "path is empty"
-    candidate = Path(raw)
-    if not candidate.is_absolute():
-        return None, f"path must be absolute, got {raw!r}"
-    try:
-        resolved = candidate.resolve(strict=True)
-    except FileNotFoundError:
-        return None, f"path does not exist: {raw}"
-    except (OSError, RuntimeError) as exc:
-        return None, f"cannot resolve path: {exc}"
-    if not resolved.is_file():
-        return None, f"path is not a regular file: {resolved}"
-    if resolved.suffix.lower() not in _ALLOWED_EXT:
-        return None, (f"unsupported extension {resolved.suffix!r}; allowed: {sorted(_ALLOWED_EXT)}")
     max_bytes = _resolve_max_input_bytes()
     try:
-        size = resolved.stat().st_size
-    except OSError as exc:
-        return None, f"cannot stat file: {exc}"
-    if size > max_bytes:
-        return None, f"file size {size} exceeds cap {max_bytes}"
+        resolved = validate_existing_input_path(
+            raw,
+            allowed_suffixes=_ALLOWED_EXT,
+            max_bytes=max_bytes,
+        )
+    except PathGuardError as exc:
+        return None, str(exc)
     return resolved, None
 
 

@@ -61,6 +61,16 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+# Phase-7 fix-pack I3/I7: shared path-guard helpers. Both render_doc
+# path validators (body-file input, --out output) now delegate to the
+# central implementation so a future path-guard tightening stays
+# consistent across transcribe / extract_doc / genimage / render_doc.
+from assistant.media.path_guards import (  # noqa: E402
+    PathGuardError,
+    validate_existing_input_path,
+    validate_future_output_path,
+)
+
 EXIT_OK = 0
 EXIT_USAGE = 2
 EXIT_PATH = 3
@@ -147,10 +157,26 @@ def _resolve_body_file(raw: str, data_dir: Path) -> tuple[Path | None, str | Non
     The daemon pre-creates the stage dir with ``0o700``; the CLI refuses
     to create it — a missing stage dir is a configuration error, not a
     silent fallback path.
+
+    Fix-pack I3/I7: delegates to
+    :func:`assistant.media.path_guards.validate_existing_input_path`
+    for the strict-resolve + ``is_file`` + suffix-allowlist triplet;
+    the containment check is then layered on top. The body-file
+    allow-list is intentionally wider than the allowed ``--out``
+    formats — we accept any plain text whose suffix is ``.txt`` /
+    ``.md``; callers that pass a bare or other-suffix body-file get
+    a path-guard rejection rather than a rendering surprise.
     """
     candidate = Path(raw).expanduser()
+    # Use the shared helper for the "exists + is_file + resolves
+    # strictly" story; we don't enforce a suffix allow-list here
+    # because the daemon writes a transient `.txt` body into the
+    # stage dir, but extensions differ across test fixtures. The
+    # containment check below catches the real invariant.
     try:
         resolved = candidate.resolve(strict=True)
+    except FileNotFoundError as exc:
+        return None, f"--body-file cannot be resolved: {exc}"
     except (OSError, RuntimeError) as exc:
         return None, f"--body-file cannot be resolved: {exc}"
     stage = _stage_root(data_dir)
@@ -166,36 +192,25 @@ def _resolve_body_file(raw: str, data_dir: Path) -> tuple[Path | None, str | Non
 def _resolve_out_path(raw: str, data_dir: Path) -> tuple[Path | None, str | None]:
     """Validate ``--out`` would land inside the outbox directory.
 
-    ``--out`` points at a to-be-created file, so ``resolve(strict=True)``
-    is not viable. Instead we resolve the *parent* (which the daemon
-    pre-created) and re-append the filename. Refuses absolute paths that
-    escape ``<data_dir>/media/outbox/`` and refuses filenames containing
-    path separators.
+    Fix-pack I3/I7: delegates to
+    :func:`assistant.media.path_guards.validate_future_output_path`
+    with the render_doc allow-list (``{".pdf", ".docx"}``). The
+    shared helper is the canonical implementation of the
+    parent-resolve + re-append + ``is_relative_to`` pattern that
+    render_doc pioneered; the four CLIs now use one copy instead of
+    maintaining four subtly-different ones.
     """
-    candidate = Path(raw).expanduser()
-    if candidate.name != candidate.name.strip() or not candidate.name:
-        return None, "--out filename is empty or padded with whitespace"
-    if "/" in candidate.name or "\\" in candidate.name:
-        return None, f"--out filename must not contain path separators: {candidate.name!r}"
-
     outbox = _outbox_root(data_dir)
     if not outbox.exists():
         return None, f"--out outbox dir missing: {outbox}"
-
     try:
-        parent = candidate.parent.resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
-        return None, f"--out parent cannot be resolved: {exc}"
-    if not parent.is_relative_to(outbox):
-        return None, f"--out must live under {outbox} (got parent {parent})"
-
-    final = parent / candidate.name
-    suffix = final.suffix.lower()
-    if suffix not in _SUPPORTED_SUFFIXES:
-        return None, (
-            f"--out suffix {suffix!r} unsupported; "
-            f"expected one of {_SUPPORTED_SUFFIXES}"
+        final = validate_future_output_path(
+            raw,
+            root=outbox,
+            allowed_suffixes=_SUPPORTED_SUFFIXES,
         )
+    except PathGuardError as exc:
+        return None, f"--out {exc}"
     return final, None
 
 

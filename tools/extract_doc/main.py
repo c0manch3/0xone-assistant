@@ -42,6 +42,18 @@ import zipfile
 from pathlib import Path
 from typing import Any, Final
 
+# Phase-7 (Q9a tech-debt close): CLI runs via `python tools/extract_doc/main.py`.
+# `assistant` is an installed distribution inside the project venv so the
+# shared path-guard helpers are importable without sys.path games.
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from assistant.media.path_guards import (  # noqa: E402
+    PathGuardError,
+    validate_existing_input_path,
+)
+
 # Install defusedxml patches into xml.* stdlib modules BEFORE python-docx /
 # openpyxl import — both libraries cache the patched parser factories at
 # import time. We also import defusedxml modules ourselves for the one
@@ -190,43 +202,106 @@ def _parse_page_range(spec: str) -> tuple[int, int]:
 # --- validation -------------------------------------------------------------
 
 
-def _validate_path(raw: str) -> tuple[Path, str]:
-    """Resolve + verify an input path. Returns (resolved_path, suffix_lower)."""
+def _resolve_max_input_bytes() -> int:
+    """Return the effective max input byte cap (env override honoured).
+
+    The env override may be set to 0 to disable the cap; we preserve
+    that semantic by returning ``_DEFAULT_MAX_INPUT_BYTES`` for a
+    non-positive override and letting the caller pass ``None`` to
+    skip the check entirely.
+    """
+    cap_raw = os.environ.get(_ENV_MAX_INPUT_BYTES)
+    if cap_raw is None:
+        return _DEFAULT_MAX_INPUT_BYTES
     try:
-        path = Path(raw).resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
-        raise _RejectError(EXIT_VALIDATION, f"path resolve failed: {exc}") from exc
-    if not path.is_file():
-        raise _RejectError(EXIT_VALIDATION, f"not a regular file: {path}")
-    suffix = path.suffix.lower()
-    if suffix not in _SUPPORTED_SUFFIXES:
-        raise _RejectError(
-            EXIT_VALIDATION,
-            f"unsupported suffix {suffix!r}; expected one of "
-            + ", ".join(sorted(_SUPPORTED_SUFFIXES)),
+        parsed = int(cap_raw)
+    except ValueError:
+        return _DEFAULT_MAX_INPUT_BYTES
+    # A non-positive override means "disable the cap" — return 0 as
+    # a sentinel; callers treat 0 as "skip size check".
+    return parsed if parsed > 0 else 0
+
+
+def _validate_path(raw: str) -> tuple[Path, str]:
+    """Resolve + verify an input path. Returns (resolved_path, suffix_lower).
+
+    Fix-pack I3/I7: delegates to
+    :func:`assistant.media.path_guards.validate_existing_input_path`
+    for the strict-resolve + is_file + suffix-allowlist + size-cap
+    triplet. The shared helper raises :class:`PathGuardError`; we
+    convert to :class:`_RejectError` with the appropriate exit code
+    AND preserve the legacy extract_doc error-message prefixes so
+    existing caller-side regexes (tests, structured logs, operator
+    runbooks) keep matching.
+    """
+    cap = _resolve_max_input_bytes()
+    max_bytes = cap if cap > 0 else None
+    try:
+        resolved = validate_existing_input_path(
+            raw,
+            allowed_suffixes=_SUPPORTED_SUFFIXES,
+            max_bytes=max_bytes,
         )
-    return path, suffix
+    except PathGuardError as exc:
+        msg = str(exc)
+        # Map the shared helper's phrasing to extract_doc's legacy
+        # message prefixes so test fixtures + operator muscle memory
+        # stay stable across the consolidation. This is a thin
+        # translation layer, not a behaviour change — the rejection
+        # conditions are identical.
+        if "does not exist" in msg or "cannot resolve" in msg:
+            raise _RejectError(
+                EXIT_VALIDATION, f"path resolve failed: {msg}"
+            ) from exc
+        if "not a regular file" in msg:
+            raise _RejectError(EXIT_VALIDATION, msg) from exc
+        if "unsupported extension" in msg:
+            # Translate the shared helper's "unsupported extension"
+            # → legacy "unsupported suffix" phrasing; the `allowed: [...]`
+            # enumeration is preserved verbatim from the message.
+            raise _RejectError(
+                EXIT_VALIDATION,
+                msg.replace("unsupported extension", "unsupported suffix"),
+            ) from exc
+        if "file size" in msg and "exceeds cap" in msg:
+            # Reformat "file size N exceeds cap M" → "input size N
+            # exceeds cap M" and attach size/cap as structured extras.
+            parts = msg.split()
+            # parts: ["file", "size", N, "exceeds", "cap", M]
+            try:
+                size_val = int(parts[2])
+                cap_val = int(parts[5])
+                raise _RejectError(
+                    EXIT_VALIDATION,
+                    f"input size {size_val} exceeds cap {cap_val}",
+                    size=size_val,
+                    cap=cap_val,
+                ) from exc
+            except (IndexError, ValueError):
+                raise _RejectError(EXIT_VALIDATION, msg) from exc
+        if "cannot stat" in msg:
+            raise _RejectError(EXIT_IO, msg) from exc
+        # Anything unclassified (e.g. empty path / not absolute)
+        # maps to EXIT_VALIDATION with the helper's message.
+        raise _RejectError(EXIT_VALIDATION, msg) from exc
+    return resolved, resolved.suffix.lower()
 
 
 def _validate_size(path: Path) -> int:
-    """Enforce the input-size cap. Returns the file size in bytes."""
+    """Return the size of an already-validated input file.
+
+    The size cap has already been enforced inside ``_validate_path``
+    via the shared helper; this function exists for the JSON
+    envelope which echoes ``size_bytes`` back to the caller. We
+    re-stat (rather than smuggle size through the return tuple) so
+    the output uses the current on-disk size; a concurrent modify
+    between resolve and here is astronomically unlikely but the
+    re-stat keeps the observable data truthful.
+    """
     try:
-        size = path.stat().st_size
+        return path.stat().st_size
     except OSError as exc:
         raise _RejectError(EXIT_IO, f"stat failed: {exc}") from exc
-    cap_raw = os.environ.get(_ENV_MAX_INPUT_BYTES)
-    try:
-        cap = int(cap_raw) if cap_raw is not None else _DEFAULT_MAX_INPUT_BYTES
-    except ValueError:
-        cap = _DEFAULT_MAX_INPUT_BYTES
-    if cap > 0 and size > cap:
-        raise _RejectError(
-            EXIT_VALIDATION,
-            f"input size {size} exceeds cap {cap}",
-            size=size,
-            cap=cap,
-        )
-    return size
 
 
 class _RejectError(Exception):
