@@ -170,10 +170,35 @@ def history_to_user_envelopes(
         for row in by_turn[turn_id]:
             if row["role"] == "user":
                 for block in row["content"]:
-                    if isinstance(block, dict) and block.get("type") == "text":
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype == "text":
                         text = block.get("text")
                         if isinstance(text, str) and text:
                             user_texts.append(text)
+                    elif btype == "image":
+                        # Phase 7 (H-10): raw image bytes are NOT replayed
+                        # across turns (phase-2 ConversationStore.append
+                        # only stores the original user text — the image
+                        # blocks the bridge injected live ephemerally on
+                        # the wire). If a future phase DOES persist the
+                        # image row, this placeholder keeps replay safe
+                        # by emitting a synthetic note anchored to
+                        # `turn_id`; without the turn_id anchor a model
+                        # replaying >1 image turn could not distinguish
+                        # which image belonged to which turn.
+                        src = block.get("source") or {}
+                        media_type = (
+                            src.get("media_type")
+                            if isinstance(src, dict)
+                            else None
+                        ) or "image/?"
+                        user_texts.append(
+                            f"[system-note: in turn {turn_id} user sent "
+                            f"image ({media_type}) — raw bytes omitted "
+                            f"from replay]"
+                        )
             elif row.get("block_type") == "tool_use":
                 for block in row["content"]:
                     if not isinstance(block, dict):

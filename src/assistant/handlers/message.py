@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import re
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -203,13 +204,97 @@ class ClaudeHandler:
                 urls=urls,
             )
 
+        # Phase 7 (§3.1 + C-4): attachments → image_blocks + notes. Safe
+        # multi-attachment envelope per S-7: any single attachment that
+        # fails to read (FNF, EPERM, etc.) is skipped with a failure-note
+        # so the model knows the photo existed; remaining attachments and
+        # the turn itself survive. I-7.6 invariant: the adapter has
+        # already de-duped by `local_path` before emitting, so the
+        # handler does NOT maintain a local `seen_paths` set.
+        image_blocks: list[dict[str, Any]] = []
+        photo_mode = self._settings.media.photo_mode
+        for att in msg.attachments or ():
+            if att.kind == "photo" and photo_mode == "inline_base64":
+                cap = self._settings.media.photo_max_inline_bytes
+                if att.file_size is not None and att.file_size > cap:
+                    notes.append(
+                        f"user attached photo at {att.local_path} but size "
+                        f"{att.file_size} exceeds inline cap {cap}; skipped."
+                    )
+                    continue
+                try:
+                    raw = att.local_path.read_bytes()
+                except (FileNotFoundError, PermissionError, OSError) as exc:
+                    notes.append(
+                        f"user attempted to attach photo at {att.local_path} "
+                        f"but read failed: {type(exc).__name__}."
+                    )
+                    log.warning(
+                        "media_photo_read_failed",
+                        path=str(att.local_path),
+                        chat_id=msg.chat_id,
+                        turn_id=turn_id,
+                        exc_info=True,
+                    )
+                    continue
+                mime = att.mime_type or "image/jpeg"
+                b64 = base64.b64encode(raw).decode("ascii")
+                image_blocks.append(
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": mime,
+                            "data": b64,
+                        },
+                    }
+                )
+                notes.append(
+                    f"user attached photo at {att.local_path} "
+                    f"({att.width}x{att.height})"
+                )
+            elif att.kind == "photo" and photo_mode == "path_tool":
+                # (v2 fix-pack, C-4) Explicit fallback branch — env flag
+                # MEDIA_PHOTO_MODE=path_tool disables inline base64. Model
+                # still gets a note so the photo isn't silently lost.
+                notes.append(
+                    f"user attached photo at {att.local_path} "
+                    f"({att.width}x{att.height}). Photo-inline mode "
+                    f"disabled (path_tool fallback); describe via vision "
+                    f"tool if available, or acknowledge receipt."
+                )
+            elif att.kind in ("voice", "audio"):
+                notes.append(
+                    f"user attached {att.kind} (duration={att.duration_s}s) "
+                    f"at {att.local_path}. use tools/transcribe/; if >30s "
+                    f"spawn worker."
+                )
+            elif att.kind == "document":
+                notes.append(
+                    f"user attached document '{att.filename_original}' at "
+                    f"{att.local_path}. use tools/extract_doc/."
+                )
+            elif att.kind == "video_note":
+                notes.append(
+                    f"user attached video_note (duration={att.duration_s}s) "
+                    f"at {att.local_path}. video out of scope phase 7."
+                )
+            else:
+                notes.append(
+                    f"unknown attachment kind={att.kind!r} at {att.local_path}"
+                )
+
         system_notes: list[str] | None = notes or None
 
         completed = False
         meta: dict[str, Any] = {}
         try:
             async for item in self._bridge.ask(
-                msg.chat_id, msg.text, history, system_notes=system_notes
+                msg.chat_id,
+                msg.text,
+                history,
+                system_notes=system_notes,
+                image_blocks=image_blocks or None,
             ):
                 if isinstance(item, InitMeta):
                     if item.model is not None:
