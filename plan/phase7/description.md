@@ -92,3 +92,13 @@
 | 🟢 | History replay для photo turn'а | Image-rows хранятся как `[image: <path>]`; history_to_user_envelopes конвертирует в synthetic text note |
 | 🟢 | Scheduler-turn получает media artefact | dispatch_reply shared helper закрывает this — единая логика на all delivery paths |
 | 🟢 | Subagent worker spawned для media — не видит атачментов | task spawn --task TEXT передаёт path как часть task строки; subagent читает CLI argv, не envelope |
+
+> **Pillow footprint note (S-3 spike correction).** Pillow **is a required
+> transitive dependency** through `fpdf2` (`Requires-Dist: Pillow>=8.3.2`),
+> not an optional one — earlier plan drafts incorrectly implied fpdf2 could
+> render without Pillow. Importing `fpdf` loads ~22 PIL submodules
+> unconditionally. Root `pyproject.toml` pins `Pillow>=10.4,<13` (CVE floor
+> + API-churn upper bound; pitfall #1 / H-8). Dep footprint (S-4):
+> Pillow ≈ 12.5 MB, lxml ≈ 18.8 MB (via `python-docx`), fontTools ≈ 11.8 MB
+> (via `fpdf2`) — top 3 contributors to the +48.75 MB venv delta. Operator
+> owns Pillow CVE monitoring between phase upgrades.

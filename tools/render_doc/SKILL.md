@@ -58,16 +58,23 @@ pattern:
 Правило действует для всех четырёх phase-7 скиллов (`transcribe`,
 `genimage`, `extract_doc`, `render_doc`).
 
-## Dedup guidance
+## Dedup guidance (§4.5)
 
 Основной turn и `on_subagent_stop` hook оба умеют извлекать outbox-пути
-из финального текста, поэтому `_DedupLedger` дедуплицирует доставку в
-пределах 300-секундного окна. НО — если ты спавнишь worker через
-`task spawn --kind worker`, **не** цитируй outbox-путь в финальном
-ответе main turn'а: worker сам упомянет путь в своём stop-hook, и
-двойной текст с путём всё равно будет скип'нут ledger'ом, но лишний
-round-trip — это лишний deliver'ov'ский log. Достаточно сказать
-«готово, отправил документ».
+из финального текста, поэтому `dispatch_reply` держит in-memory
+`_DedupLedger` с ключом `(chat_id, resolved_outbox_path)` и TTL=300 s.
+Если один и тот же путь упомянут дважды в пределах 300-секундного окна
+(main turn + follow-up scheduler-trigger, или main turn + worker stop
+hook), ledger пропустит только первую `send_document`; повторные
+совпадения отброшены. Ledger — **in-memory, не переживает рестарт
+Daemon'а**.
+
+НО — если ты спавнишь worker через `task spawn --kind worker`, **не**
+цитируй outbox-путь в финальном ответе main turn'а: worker сам упомянет
+путь в своём stop-hook, и двойной текст с путём всё равно будет
+скип'нут ledger'ом, но лишний round-trip — это лишний deliver-log.
+Достаточно сказать «готово, отправил документ». Prompt-level rule —
+первая линия обороны; ledger — вторая.
 
 ## Примеры
 

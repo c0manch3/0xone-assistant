@@ -117,9 +117,13 @@ hook'а. Безопасная фразировка:
 
 > "готово, PDF скоро придёт отдельным сообщением."
 
-Если нарушишь — dedup ledger (300s sliding window, ключ
-`(resolved_path, chat_id)`) выкинет дубликат на ingress, но
-prompt-level mitigation — первая линия обороны.
+Если нарушишь — `_DedupLedger` в `dispatch_reply` дедуплицирует
+доставку по ключу `(chat_id, resolved_outbox_path)` в пределах
+300-секундного TTL: повторное упоминание того же пути (например,
+main turn + follow-up scheduler-trigger) вызовет ровно один
+`send_document` — первый. Остальные отброшены. Ledger in-memory,
+**не переживает рестарт Daemon'а**. Prompt-level mitigation —
+первая линия обороны; ledger — вторая.
 
 ## Примеры
 
