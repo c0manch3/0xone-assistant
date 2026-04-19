@@ -27,7 +27,9 @@ import argparse
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 # sys.path pragma for cwd + module invocation parity (phase-7 Q9a pattern —
 # see `tools/__init__.py`). The project root hosts both `src/` and `tools/`;
@@ -40,6 +42,19 @@ if str(_PROJECT_ROOT) not in sys.path:
 from tools.gh._lib import exit_codes as ec  # noqa: E402 — sys.path pragma above
 from tools.gh._lib import repo_allowlist  # noqa: E402
 from tools.gh._lib.gh_ops import gh_auth_status, run_gh_json  # noqa: E402
+from tools.gh._lib.git_ops import (  # noqa: E402
+    commit as _git_commit,
+    diff_cached_empty,
+    files_changed_count,
+    is_inside_work_tree,
+    porcelain_status,
+    push as _git_push,
+    reset_soft_head_one,
+    stage_all,
+    unpushed_commit_count,
+)
+from tools.gh._lib.lock import LockBusyError, flock_exclusive_nb  # noqa: E402
+from tools.gh._lib.vault_git_init import bootstrap as _vault_bootstrap  # noqa: E402
 
 # B-A2: instantiate ``GitHubSettings`` directly (the sub-model has no
 # required fields), so the CLI works without ``TELEGRAM_BOT_TOKEN`` /
@@ -395,8 +410,369 @@ def _cmd_repo(args: argparse.Namespace) -> int:
     return ec.OK
 
 
-def _cmd_vault_commit_push(_args: argparse.Namespace) -> int:
-    return _cmd_stub("vault-commit-push")
+# ---------------------------------------------------------------------------
+# C4: vault-commit-push handler + helpers.
+#
+# Execution flow per implementation.md §C4 (v2 with B-A2 / B-A3 / B-B2 /
+# SF-B3 / SF-D7 fixes):
+#
+#   1.  Instantiate ``GitHubSettings()`` directly (B-A2).
+#   2.  ``vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)`` (B-A3).
+#   3.  allow-list check (I-8.5).
+#   4.  ssh key readability + permission probe (exit 10).
+#   5.  prepare lock path + known-hosts path; ``--dry-run`` bypasses flock (SF-B3).
+#   6.  acquire flock exclusively (I-8.2).
+#   7.  bootstrap the vault if not yet a git repo (Q9 / R-8).
+#   8.  B-B2 unpushed-commit detection → push-only retry path if > 0.
+#   9.  ``git status --porcelain`` change detection (B2 / R-9).
+#   10. render commit message in ``auto_commit_tz`` (B4 / R-10).
+#   11. ``_do_push_cycle(stage=True)`` — stage, commit, push, classify outcome.
+#
+# Divergence in step 11 triggers ``reset --soft HEAD~1`` inside
+# ``_do_push_cycle`` (B-B2) so the working tree stays dirty for the next
+# run to retry cleanly.
+
+
+def _render_message(template: str, tz_name: str) -> str:
+    """Render ``{date}`` placeholder in the commit-message template.
+
+    Uses ``ZoneInfo(tz_name)`` so the date reflects the owner's timezone
+    (B4). ``strftime("%Y-%m-%d")`` is ASCII-safe and matches the default
+    template ``"vault sync {date}"`` → ``"vault sync 2026-04-19"``.
+    """
+    date_str = datetime.now(ZoneInfo(tz_name)).strftime("%Y-%m-%d")
+    return template.format(date=date_str)
+
+
+def _ssh_key_readable(path: Path) -> tuple[bool, str]:
+    """Probe the ssh key file.
+
+    Returns ``(ok, note)``:
+
+    - ``(False, "not a file: <path>")`` — doesn't exist or is a dir.
+    - ``(False, "not readable: <path>")`` — exists but not r-- for our uid.
+    - ``(False, "stat failed: ...")`` — syscall error (rare).
+    - ``(True,  "")`` — fine, proceed.
+    - ``(True,  "permissive_mode:0oNNN")`` — usable but group/other bits
+      are set; caller logs a warning but proceeds. This matches the
+      openssh client behaviour (accepts the key, just complains on
+      stderr for non-0o600 files on operating systems that care).
+
+    Only fatal (ok=False) cases return exit 10. The "permissive_mode"
+    warning path returns ok=True so an owner who intentionally uses a
+    group-readable key on a trusted host isn't blocked from backups.
+    """
+    if not path.is_file():
+        return False, f"not a file: {path}"
+    if not os.access(path, os.R_OK):
+        return False, f"not readable: {path}"
+    try:
+        mode = path.stat().st_mode & 0o777
+        if mode & 0o077:
+            return True, f"permissive_mode:{oct(mode)}"
+    except OSError as exc:
+        return False, f"stat failed: {exc}"
+    return True, ""
+
+
+def _do_push_cycle(
+    *,
+    vault_dir: Path,
+    gh: object,  # GitHubSettings, but pydantic isn't on this module's type-sight
+    known_hosts: Path,
+    stage: bool,
+    message: str | None,
+) -> tuple[int, dict[str, object]]:
+    """Execute a single commit-then-push cycle. Returns ``(exit_code, payload)``.
+
+    Two entry modes controlled by ``stage``:
+
+    - ``stage=True`` (normal): runs :func:`stage_all`, a race-window
+      recheck via :func:`diff_cached_empty`, :func:`_git_commit`, then
+      :func:`_git_push`.
+    - ``stage=False`` (B-B2 retry): HEAD already points at the commit we
+      want to ship (a previous run made it). We skip staging+commit and
+      push directly. If push fails with "diverged" we DO NOT
+      ``reset --soft`` — the commit may be salvageable manually; the
+      owner inspects and decides.
+
+    Payload shape on success: ``{"ok": true, "commit_sha": ..., "files_changed":
+    N, "retried_unpushed": <bool>}``. On failure, ``ok=False`` with an
+    ``error`` string. ``stderr`` is truncated to 300 chars to keep the JSON
+    a reasonable size for logging.
+    """
+    # Type shim: we accept ``gh`` as ``object`` so this module doesn't
+    # force every mypy run to import pydantic. The attribute access below
+    # relies on the instantiation contract in :func:`_cmd_vault_commit_push`.
+    vault_remote_name: str = gh.vault_remote_name  # type: ignore[attr-defined]
+    vault_branch: str = gh.vault_branch  # type: ignore[attr-defined]
+    vault_ssh_key_path: Path = gh.vault_ssh_key_path  # type: ignore[attr-defined]
+    commit_author_email: str = gh.commit_author_email  # type: ignore[attr-defined]
+
+    if stage:
+        stage_all(vault_dir)
+        # Race-window recheck: porcelain said "dirty" but between then and
+        # `git add` something may have reverted the tree. If `git diff
+        # --cached --quiet` returns 0 now, there's nothing to commit.
+        if diff_cached_empty(vault_dir):
+            return ec.NO_CHANGES, {
+                "ok": True,
+                "no_changes": True,
+                "race": True,
+            }
+        sha = _git_commit(
+            vault_dir,
+            message=message or "",
+            author_email=commit_author_email,
+        )
+    else:
+        # Push-only retry path: HEAD is already the commit we want to
+        # ship. Import `_run_git` here (not at module top) to keep the
+        # hot-import surface of `main.py` minimal for `auth-status` /
+        # `issue` / `pr` callers that don't touch git at all.
+        from tools.gh._lib.git_ops import _run_git
+
+        head = _run_git(["rev-parse", "HEAD"], vault_dir, check=True)
+        sha = head.stdout.strip()
+
+    files_n = files_changed_count(vault_dir)
+
+    push_result, verdict = _git_push(
+        vault_dir,
+        remote=vault_remote_name,
+        branch=vault_branch,
+        ssh_key_path=vault_ssh_key_path,
+        known_hosts_path=known_hosts,
+    )
+    if verdict == "ok":
+        return ec.OK, {
+            "ok": True,
+            "commit_sha": sha,
+            "files_changed": files_n,
+            "retried_unpushed": not stage,
+        }
+    if verdict == "diverged":
+        # B-B2: protect next run from silent data loss. If we staged a
+        # new commit in THIS cycle, roll it back via `reset --soft
+        # HEAD~1` so the working tree stays dirty — the next invocation
+        # will re-stage + re-commit (presumably against an up-to-date
+        # remote by then). Push-only retries DO NOT reset; the commit
+        # pre-exists and may deserve manual inspection.
+        reset_ok = True
+        reset_error: str | None = None
+        if stage:
+            try:
+                reset_soft_head_one(vault_dir)
+            except Exception as exc:  # pragma: no cover — last-resort
+                reset_ok = False
+                reset_error = repr(exc)
+        payload: dict[str, object] = {
+            "ok": False,
+            "error": "remote_has_diverged",
+            "commit_sha": sha,
+            "reset": stage and reset_ok,
+            "stderr": push_result.stderr[:300],
+        }
+        if reset_error is not None:
+            payload["reset_error"] = reset_error
+        return ec.DIVERGED, payload
+    return ec.PUSH_FAILED, {
+        "ok": False,
+        "error": "push_failed",
+        "commit_sha": sha,
+        "stderr": push_result.stderr[:300],
+    }
+
+
+def _cmd_vault_commit_push(args: argparse.Namespace) -> int:
+    """``vault-commit-push`` — commit and push the vault to the backup remote.
+
+    See the module-top comment for the numbered execution flow. Exit
+    codes (matching :mod:`tools.gh._lib.exit_codes`):
+
+    - 0  ``OK`` (commit+push succeeded, or `--dry-run` noop).
+    - 3  ``VALIDATION`` (unset URL, bad URL, mkdir failed).
+    - 5  ``NO_CHANGES`` (porcelain empty, or race-window recheck empty).
+    - 6  ``REPO_NOT_ALLOWED`` (url parses but slug is not in allow-list).
+    - 7  ``DIVERGED`` (remote has diverged; local commit reset).
+    - 8  ``PUSH_FAILED`` (other push failure).
+    - 9  ``LOCK_BUSY`` (another vault-commit-push is active).
+    - 10 ``SSH_KEY_ERROR`` (key file missing / unreadable).
+    """
+    # Step 1: direct sub-model instantiation (B-A2). The import is local
+    # so `auth-status` / `issue` / `pr` callers don't pay the
+    # pydantic-settings load cost.
+    from assistant.config import GitHubSettings
+
+    gh = GitHubSettings()
+    data_dir = _data_dir()
+    vault_dir = _vault_dir()
+
+    # Step 2 (B-A3): create vault_dir unconditionally. `mode=0o700` mirrors
+    # the memory tool's assumptions about vault privacy. This survives
+    # both fresh installs (nothing created yet) and the
+    # user-deletes-vault-then-runs-CLI race.
+    try:
+        vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "vault_mkdir_failed",
+                    "path": str(vault_dir),
+                    "detail": repr(exc),
+                }
+            )
+        )
+        return ec.VALIDATION
+
+    # Step 3 (I-8.5): allow-list check BEFORE any subprocess / ssh.
+    if not gh.vault_remote_url:
+        print(json.dumps({"ok": False, "error": "vault_remote_url_unset"}))
+        return ec.VALIDATION
+    try:
+        slug = repo_allowlist.extract_owner_repo_from_ssh_url(
+            gh.vault_remote_url
+        )
+    except ValueError:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "bad_remote_url",
+                    "url": gh.vault_remote_url,
+                }
+            )
+        )
+        return ec.VALIDATION
+    if not repo_allowlist.is_repo_allowed(slug, gh.allowed_repos):
+        return _fail_repo_not_allowed(slug, gh.allowed_repos)
+
+    # Step 4: ssh key sanity. We only check when the remote is an
+    # ssh-style URL — a `file://` URL (used in tests) bypasses ssh
+    # entirely so the key file is irrelevant. In production,
+    # `GitHubSettings._validate_remote_url` ensures the URL starts with
+    # `git@github.com:`, so this branch is always taken.
+    if gh.vault_remote_url.startswith("git@"):
+        key_ok, key_note = _ssh_key_readable(gh.vault_ssh_key_path)
+        if not key_ok:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": "ssh_key_error",
+                        "path": str(gh.vault_ssh_key_path),
+                        "detail": key_note,
+                    }
+                )
+            )
+            return ec.SSH_KEY_ERROR
+        if key_note.startswith("permissive_mode:"):
+            # Not fatal — see `_ssh_key_readable` docstring. Emit the
+            # warning on stderr so log aggregators pick it up; the
+            # success JSON on stdout stays clean.
+            sys.stderr.write(f"warning: ssh key {key_note}\n")
+
+    # Step 5: path plumbing for the lock + the isolated known-hosts file.
+    # SF-B3: `--dry-run` is a read-only operation — it does NOT touch the
+    # flock, so a stuck lock-holder can't make `vault-commit-push
+    # --dry-run` fail for the owner who's just trying to inspect state.
+    data_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = data_dir / "run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = run_dir / "gh-vault-commit.lock"
+    known_hosts = run_dir / "gh-vault-known-hosts"
+
+    if args.dry_run:
+        if not is_inside_work_tree(vault_dir):
+            # Fresh vault: nothing to diff; next non-dry-run will
+            # bootstrap. Report that intent so the owner knows.
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "dry_run": True,
+                        "would_bootstrap": True,
+                        "vault_dir": str(vault_dir),
+                    }
+                )
+            )
+            return ec.OK
+        porcelain = porcelain_status(vault_dir)
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "dry_run": True,
+                    "porcelain": porcelain,
+                    "unpushed_commits": unpushed_commit_count(vault_dir),
+                    "planned_message": _render_message(
+                        gh.commit_message_template, gh.auto_commit_tz
+                    ),
+                }
+            )
+        )
+        return ec.OK
+
+    # Step 6: acquire the cross-process lock (write path only).
+    try:
+        with flock_exclusive_nb(lock_path):
+            # Step 7: bootstrap if needed (Q9 / R-8). A fresh vault_dir
+            # (just mkdir'd in step 2, or a pre-existing empty dir) has
+            # no `.git/` — we initialise + add remote + seed
+            # `.gitignore` + make an empty bootstrap commit here.
+            if not is_inside_work_tree(vault_dir):
+                _vault_bootstrap(
+                    vault_dir,
+                    remote_name=gh.vault_remote_name,
+                    remote_url=gh.vault_remote_url,
+                    branch=gh.vault_branch,
+                    author_email=gh.commit_author_email,
+                )
+
+            # Step 8 (B-B2): detect unpushed commits FIRST. A non-zero
+            # count means a prior run committed locally but the push
+            # failed; retry ONLY the push (no re-stage, no new commit).
+            unpushed = unpushed_commit_count(vault_dir)
+            if unpushed > 0:
+                rc, payload = _do_push_cycle(
+                    vault_dir=vault_dir,
+                    gh=gh,
+                    known_hosts=known_hosts,
+                    stage=False,
+                    message=None,
+                )
+                payload["retried_unpushed_count"] = unpushed
+                print(json.dumps(payload))
+                return rc
+
+            # Step 9: change detection via porcelain (R-9 / B2 — `git
+            # diff --quiet` misses untracked files).
+            porcelain = porcelain_status(vault_dir)
+            if not porcelain.strip():
+                print(json.dumps({"ok": True, "no_changes": True}))
+                return ec.NO_CHANGES
+
+            # Step 10: render the commit message in the owner's tz.
+            message = args.message or _render_message(
+                gh.commit_message_template, gh.auto_commit_tz
+            )
+
+            # Step 11: stage + commit + push. Divergence-reset logic
+            # lives inside `_do_push_cycle` (B-B2).
+            rc, payload = _do_push_cycle(
+                vault_dir=vault_dir,
+                gh=gh,
+                known_hosts=known_hosts,
+                stage=True,
+                message=message,
+            )
+            print(json.dumps(payload))
+            return rc
+    except LockBusyError:
+        print(json.dumps({"ok": False, "error": "lock_busy"}))
+        return ec.LOCK_BUSY
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,83 @@
+vault сохранён, 3 файла, sha=abc1234
+vault сохранён, 3 файла, commit_sha=abc1234def567
+готово: commit abc1234def on main
+3 files changed, 10 insertions(+), 2 deletions(-)
+ M data/vault/note.md
+?? data/vault/new.md
+A  data/vault/added.md
+data/vault/note.md | 3 +++
+ 1 file changed, 3 insertions(+)
+* main abc1234def commit message
+{"ok":true,"commit_sha":"abc1234","files_changed":3}
+{"ok":false,"error":"remote has diverged"}
+{"url":"https://github.com/owner/repo/issues/42","number":42}
+{"url":"https://github.com/owner/repo/pull/15","state":"open"}
+{"title":"bug report","body":"see attached","labels":[]}
+[{"number":1,"title":"open"},{"number":2,"title":"done"}]
+{"ok":false,"error":"ssh_key_error","path":"~/.ssh/id_vault"}
+{"error":"repo_not_allowed"}
+{"commit_sha":"deadbeef12345","files_changed":0}
+{"timestamp":"2026-04-19T03:00:00Z","status":"sent"}
+ежедневный бэкап vault завершён
+сохранил vault, получил SHA abc1234
+запушил изменения в vault-backup
+vault без изменений, ничего не коммичу
+remote расходится, нужен ручной разбор
+deploy key не найден: ~/.ssh/id_vault
+issue создан: https://github.com/c0manch3/0xone-assistant/issues/42
+PR #15 открыт: проверь merge-status
+ветка main на remote, два коммита впереди
+сделал git add data/vault, коммит, git push
+gh: couldn't authenticate; run `gh auth login`
+error: failed to push some refs to 'git@github.com:owner/vault.git'
+hint: Updates were rejected because the tip of your current branch is behind
+To git@github.com:owner/vault-backup.git
+ ! [rejected]        main -> main (non-fast-forward)
+fatal: not a git repository (or any of the parent directories): .git
+Everything up-to-date
+Enumerating objects: 5, done.
+Counting objects: 100% (5/5), done.
+Writing objects: 100% (3/3), 520 bytes | 520.00 KiB/s, done.
+Total 3 (delta 1), reused 0 (delta 0), pack-reused 0
+To github.com:owner/repo.git
+   abc123..def456  main -> main
+https://github.com/owner/repo/blob/main/README.md
+https://github.com/owner/repo/actions/runs/12345.png
+см. docs/ops/github-setup.md
+откройте ~/.ssh/id_vault.pub
+put a file at data/vault/images/chart.png if you want, but this one is no-op
+/Users/me/Projects/x.md is only referenced inside a .git internal
+Q: что-то.txt тоже пойдёт в commit?
+сгенерю диаграмму позже (chart.png)
+logs from http://example.com/stuff.pdf — не наш artefact
+relative path ./data/vault/note.md
+S2: готово: issue #42 создан, url=https://github.com/owner/repo/issues/42
+S2: ✅ vault синхронизирован, 5 файлов, sha=abc1234def
+S2: 🎉 commit пушнут в vault-backup
+S2: готов результат — никаких путей
+```json
+{"kind": "vault_backup", "files": ["note.md", "images.png"], "ok": true}
+```
+S2: см. https://avatars.githubusercontent.com/u/123/avatar.png
+S2: скачай из https://user-images.githubusercontent.com/123/screenshot.png
+S2: артефакты обычно в data/vault/report.pdf (без leading slash)
+S2: заметка в /home/user/Documents/plan/phase8/implementation.md
+S2: лог ошибки в кеше (путь не шлём)
+S2: commits: [abc1234] main, [def4567] dev
+S2: рядом c ~/.ssh/id_vault.pub — публичная часть
+S2: `gh issue view 42 --json body` возвращает markdown с картинками
+S2: ![chart](data/vault/images/chart.png) — markdown без leading slash
+S2: relative path data/vault/note.md (без префикса)
+S2: code-block `/home/user/project/vault/note.md` в backticks
+S2: quoted "/abs/path/vault/note.md" между кавычками
+S2: emoji в пути 📊chart.png (не матчится — нет абсолютного /)
+S2: multiline response\nс переносами строк и .png в конце
+S2: `git status --porcelain` output: `?? data/vault/drafts/idea.md`
+S2: JSON content field has "body": "see /vault/note.md для деталей"
+S2: [rejected] main -> main (fetch first) — стандартный divergence marker
+S2: hint: Updates were rejected because the remote contains work...
+S2: success ✓ pushed 3 refs to origin
+S2: gh: not logged into github.com; run gh auth login
+S2: encrypted archive /var/backups/vault-2026-04-19.tar.gz (not our path)
+S2: owner issue #123 = «баг в scheduler.py около строки 42»
+S2: model reply ends with just "ok\n" no artefact
