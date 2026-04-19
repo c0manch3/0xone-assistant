@@ -27,6 +27,7 @@ from typing import Any
 
 import pytest
 
+from assistant.adapters.dispatch_reply import _DedupLedger
 from assistant.config import ClaudeSettings, SchedulerSettings, Settings
 from assistant.scheduler.dispatcher import ScheduledTrigger, SchedulerDispatcher
 from assistant.scheduler.store import SchedulerStore
@@ -81,6 +82,7 @@ async def test_pending_updates_tracked_and_drained(tmp_path: Path) -> None:
         adapter=_FakeAdapter(),  # type: ignore[arg-type]
         owner_chat_id=settings.owner_chat_id,
         settings=settings,
+        dedup_ledger=_DedupLedger(),
     )
     await queue.put(
         ScheduledTrigger(

@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from assistant.adapters.dispatch_reply import _DedupLedger
 from assistant.config import ClaudeSettings, SchedulerSettings, Settings
 from assistant.scheduler.dispatcher import ScheduledTrigger, SchedulerDispatcher
 from assistant.scheduler.store import SchedulerStore
@@ -79,6 +80,7 @@ async def test_fatal_triggers_notify_once(tmp_path: Path) -> None:
         owner_chat_id=settings.owner_chat_id,
         settings=settings,
         notify_fn=notify,
+        dedup_ledger=_DedupLedger(),
     )
 
     # Patch the queue.get path so the FIRST wait_for raises a fatal exception
@@ -159,6 +161,7 @@ async def test_cancelled_error_does_not_notify(tmp_path: Path) -> None:
         owner_chat_id=settings.owner_chat_id,
         settings=settings,
         notify_fn=notify,
+        dedup_ledger=_DedupLedger(),
     )
 
     task = asyncio.create_task(disp.run(), name="d")

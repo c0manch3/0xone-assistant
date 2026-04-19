@@ -36,7 +36,9 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from assistant.adapters.base import IncomingMessage
+from assistant.adapters.dispatch_reply import _DedupLedger, dispatch_reply
 from assistant.logger import get_logger
+from assistant.media.paths import outbox_dir
 
 if TYPE_CHECKING:  # pragma: no cover — avoid circular imports at runtime
     from assistant.adapters.base import MessengerAdapter
@@ -88,6 +90,7 @@ class SchedulerDispatcher:
         owner_chat_id: int,
         settings: Settings,
         notify_fn: Callable[[str], Awaitable[None]] | None = None,
+        dedup_ledger: _DedupLedger,
     ) -> None:
         self._queue = queue
         self._store = store
@@ -96,6 +99,15 @@ class SchedulerDispatcher:
         self._owner = owner_chat_id
         self._settings = settings
         self._notify = notify_fn
+        # Phase-7 commit 14: scheduler deliveries go through
+        # `dispatch_reply` so artefact paths emitted by the model (e.g.
+        # `/abs/outbox/photo.png`) are routed via `send_photo/document/
+        # audio` instead of being dumped verbatim via `send_text`. The
+        # `_DedupLedger` is shared with the main-turn + subagent-hook
+        # call-sites (one per `Daemon`) — invariant I-7.5 guarantees
+        # at-most-once delivery in the 300 s race window between the
+        # main turn's final text and a worker's `SubagentStop` hook.
+        self._dedup_ledger = dedup_ledger
         self._stop = asyncio.Event()
         self._inflight: set[int] = set()
         self._recent_acked: deque[int] = deque(maxlen=_LRU_SIZE)
@@ -213,7 +225,17 @@ class SchedulerDispatcher:
             try:
                 joined = await self._deliver_with_handler(t)
                 if joined:
-                    await self._adapter.send_text(self._owner, joined)
+                    await dispatch_reply(
+                        self._adapter,
+                        self._owner,
+                        joined,
+                        outbox_root=outbox_dir(self._settings.data_dir),
+                        dedup=self._dedup_ledger,
+                        log_ctx={
+                            "trigger_id": t.trigger_id,
+                            "schedule_id": t.schedule_id,
+                        },
+                    )
                 if await self._store.mark_acked(t.trigger_id):
                     self._recent_acked.append(t.trigger_id)
             except asyncio.CancelledError:

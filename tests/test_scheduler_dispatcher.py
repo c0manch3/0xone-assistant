@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 
+from assistant.adapters.dispatch_reply import _DedupLedger
 from assistant.config import ClaudeSettings, SchedulerSettings, Settings
 from assistant.scheduler.dispatcher import ScheduledTrigger, SchedulerDispatcher
 from assistant.scheduler.store import SchedulerStore
@@ -93,6 +94,7 @@ async def _setup(
         adapter=adapter,  # type: ignore[arg-type]
         owner_chat_id=settings.owner_chat_id,
         settings=settings,
+        dedup_ledger=_DedupLedger(),
     )
     return store, queue, disp, adapter, handler, settings
 
