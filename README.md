@@ -1,6 +1,6 @@
 # 0xone-assistant
 
-Персональный Telegram-бот (single-user) на Claude Code SDK. Phase 1 — text echo.
+Персональный Telegram-бот (single-user) на Claude Code SDK.
 
 ## Запуск
 
@@ -9,3 +9,9 @@
     just run
 
 Архитектура и фазы — `plan/README.md`.
+
+## Phases shipped
+
+- **Phase 8** — GitHub CLI wrapper (`tools/gh/`) + daily vault auto-commit to
+  a separate GitHub account via SSH deploy key. See
+  [`docs/ops/github-setup.md`](docs/ops/github-setup.md) for the setup playbook.
