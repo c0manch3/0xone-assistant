@@ -362,19 +362,6 @@ class TestR5CorruptionRecovery:
         assert a3 is False and s3["count"] == 2
         assert _read_persisted(qf) == {"date": "2026-04-18", "count": 2}
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "Known gap surfaced by this regression gate: the locked write "
-            "path in `_check_and_increment_quota` calls `state.get(...)` "
-            "without checking that the JSON parsed to a dict. A list- or "
-            "scalar-shaped quota file (rare but observed when the disk "
-            "fills mid-write or an operator hand-edits the file) crashes "
-            "with AttributeError. The diagnostic `_read_quota_best_effort` "
-            "reader DOES handle this — the asymmetry is the bug. Fix "
-            "scope: separate commit; remove this xfail when patched."
-        ),
-    )
     def test_wrong_shape_list_payload_recovers(self, tmp_path: Path) -> None:
         """A list/scalar quota file must be replaced, not crash the helper."""
         qf = tmp_path / "q.json"
@@ -391,26 +378,14 @@ class TestR5CorruptionRecovery:
         Currently exercises the code paths that the helper explicitly
         handles: missing file, empty file, malformed JSON, and JSON of
         the wrong shape. Binary-garbage inputs are covered by
-        ``test_best_effort_reader_binary_input_xfail`` below.
+        ``test_best_effort_reader_binary_input_recovers`` below.
         """
         qf = tmp_path / "q.json"
         for raw in (b"{not json", b"", json.dumps([1]).encode()):
             qf.write_bytes(raw)
             assert _read_quota_best_effort(qf) == {}
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "Known gap: `_read_quota_best_effort` catches OSError and "
-            "JSONDecodeError but NOT UnicodeDecodeError, so a quota file "
-            "containing arbitrary binary bytes (e.g. partial fsync after "
-            "a crash) leaks an exception to the caller. The locked write "
-            "path correctly handles UnicodeDecodeError; the diagnostic "
-            "reader should match. Fix scope: separate commit; remove "
-            "this xfail when patched."
-        ),
-    )
-    def test_best_effort_reader_binary_input_xfail(self, tmp_path: Path) -> None:
+    def test_best_effort_reader_binary_input_recovers(self, tmp_path: Path) -> None:
         qf = tmp_path / "q.json"
         qf.write_bytes(b"\xff\xff")
         assert _read_quota_best_effort(qf) == {}

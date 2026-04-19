@@ -338,6 +338,12 @@ def _check_and_increment_quota(
             # on corruption is preferable to refusing all requests
             # forever.
             state = {}
+        # X-1 guard: a disk-fill mid-write or hand-edit can produce a
+        # well-formed JSON list/scalar that parses cleanly but breaks
+        # the subsequent `state.get(...)` calls. Treat any non-dict
+        # payload as absent, symmetric with `_read_quota_best_effort`.
+        if not isinstance(state, dict):
+            state = {}
 
         if state.get("date") != today_str:
             state = {"date": today_str, "count": 0}
@@ -363,7 +369,11 @@ def _check_and_increment_quota(
 def _read_quota_best_effort(path: Path) -> dict[str, Any]:
     """Return the quota state without locking; used only for diagnostics."""
     try:
-        raw = path.read_text(encoding="utf-8")
+        # X-2: read_bytes + decode(errors="replace") mirrors the locked
+        # write-path's tolerance for non-UTF-8 bytes. A partial fsync
+        # after a crash can leave arbitrary bytes on disk; we must never
+        # let that raise UnicodeDecodeError out of a diagnostic helper.
+        raw = path.read_bytes().decode("utf-8", errors="replace")
     except OSError:
         return {}
     try:
