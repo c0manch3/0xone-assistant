@@ -10,7 +10,7 @@ import sys
 import time
 from collections.abc import Coroutine
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 import aiosqlite
 import structlog
@@ -41,6 +41,7 @@ from assistant.subagent.store import SubagentStore
 _EXPECTED_SDK_VERSION = "0.1.59"
 
 AUTH_PREFLIGHT_FAIL_EXIT = 3
+DATA_DIR_SYNC_GUARD_FAIL_EXIT = 4
 
 # Phase-3 TTLs (Q7).
 _TMP_TTL_S = 3600  # 1 hour — aborted fetches
@@ -48,6 +49,32 @@ _INSTALLER_CACHE_TTL_S = 7 * 86400  # 7 days — preview -> install window
 _BOOTSTRAP_TIMEOUT_S = 120.0
 _BOOTSTRAP_NOTIFY_COOLDOWN_S = 7 * 86400  # re-notify if marker older than 7 d
 _STOP_DRAIN_TIMEOUT_S = 5.0  # review fix #10
+
+# Phase-7 fix-pack D3 — known cloud-sync folder roots on macOS (and the
+# Linux equivalents most users run). The daemon sweeper `unlink`s
+# media files; if `data_dir` is under one of these, the unlink races
+# with the cloud-sync agent and the delete replicates to ALL devices
+# including fresh installs from backup, causing user-visible data
+# loss.
+#
+# The list is NOT exhaustive and cannot be — we can never guess every
+# niche sync provider. A `.nosync` sentinel inside `data_dir` opts out
+# of the check entirely so users on a sync root that the daemon does
+# not recognise can still opt in manually after confirming the risk.
+# The sentinel is also the escape hatch for CI / integration tests
+# that deliberately run under a temp path that happens to look cloud-
+# like (e.g. some pytest fixtures use `~/Library/Caches/...` which is
+# a sync sibling).
+_CLOUD_SYNC_ROOTS: Final[tuple[tuple[str, str], ...]] = (
+    ("~/Library/Mobile Documents", "iCloud Drive"),
+    ("~/Library/CloudStorage", "macOS CloudStorage (iCloud/GDrive/OneDrive)"),
+    ("~/Yandex.Disk.localized", "Yandex.Disk"),
+    ("~/Yandex.Disk", "Yandex.Disk"),
+    ("~/Dropbox", "Dropbox"),
+    ("~/Google Drive", "Google Drive"),
+    ("~/OneDrive", "OneDrive"),
+)
+_NOSYNC_SENTINEL = ".nosync"
 
 
 async def _preflight_claude_cli(log: structlog.stdlib.BoundLogger) -> None:
@@ -94,6 +121,109 @@ async def _preflight_claude_cli(log: structlog.stdlib.BoundLogger) -> None:
 
     version = (stdout_bytes or b"").decode("utf-8", "replace").strip()
     log.info("auth_preflight_ok", claude_version=version[:120])
+
+
+def _check_data_dir_not_in_cloud_sync(
+    data_dir: Path, log: structlog.stdlib.BoundLogger
+) -> None:
+    """Phase 7 fix-pack D3 — reject a `data_dir` under a cloud-sync root.
+
+    The media sweeper `unlink`s expired files under
+    ``<data_dir>/media/inbox``/``outbox``. If ``data_dir`` happens to
+    sit under iCloud Drive / Yandex.Disk / Dropbox / etc., every
+    sweep immediately replicates the delete to all of the owner's
+    devices — a silent data-loss scenario nobody signed up for.
+
+    Check semantics:
+
+    * Resolve ``data_dir`` to its real filesystem path (symlinks
+      followed) so a ``~/data`` symlink pointing into iCloud still
+      trips the guard.
+    * Walk the well-known cloud-sync root list. If the resolved
+      ``data_dir`` ``is_relative_to`` any entry, log the match and
+      ``sys.exit(DATA_DIR_SYNC_GUARD_FAIL_EXIT)``.
+    * Allow the opt-out escape hatch: if ``<data_dir>/.nosync``
+      exists, we log at info level and proceed. This covers CI
+      environments and power users who genuinely want their
+      assistant data syncing across devices at their own risk.
+
+    The check runs before ``ensure_media_dirs`` so a mis-configured
+    startup never manifests as a destructive sweep tick — we bail
+    with a clear, actionable error message instead.
+    """
+    try:
+        resolved = data_dir.resolve()
+    except (OSError, RuntimeError) as exc:
+        # A broken symlink or missing parent is a configuration issue
+        # on its own, but it's orthogonal to the sync-root check. Let
+        # the downstream `mkdir` path surface a clearer failure.
+        log.debug(
+            "data_dir_resolve_skip",
+            data_dir=str(data_dir),
+            error=repr(exc),
+        )
+        return
+
+    matched_root: str | None = None
+    matched_label: str | None = None
+    for raw_root, label in _CLOUD_SYNC_ROOTS:
+        candidate = Path(raw_root).expanduser()
+        try:
+            root_resolved = candidate.resolve()
+        except (OSError, RuntimeError):
+            # The sync root simply doesn't exist on this machine.
+            continue
+        if not root_resolved.exists():
+            continue
+        try:
+            inside = resolved.is_relative_to(root_resolved)
+        except ValueError:
+            # Pre-3.12 semantics — defensive.
+            inside = False
+        if inside:
+            matched_root = str(root_resolved)
+            matched_label = label
+            break
+
+    if matched_root is None:
+        return
+
+    # Opt-out sentinel: a `.nosync` file inside `data_dir` means the
+    # operator has read the warning, acknowledged the risk, and
+    # deliberately chose a sync root. We still log at WARNING so the
+    # decision is visible in the daemon log, just don't fail startup.
+    sentinel = data_dir / _NOSYNC_SENTINEL
+    if sentinel.exists():
+        log.warning(
+            "data_dir_under_sync_folder_bypass",
+            data_dir=str(resolved),
+            cloud=matched_label,
+            sync_root=matched_root,
+            sentinel=str(sentinel),
+            hint=(
+                "Cloud sync of daemon data_dir is opt-in via the "
+                f"{_NOSYNC_SENTINEL} sentinel. You are on your own "
+                "for unlink-race data loss."
+            ),
+        )
+        return
+
+    log.error(
+        "data_dir_under_sync_folder",
+        data_dir=str(resolved),
+        cloud=matched_label,
+        sync_root=matched_root,
+        hint=(
+            f"data_dir {resolved} sits under {matched_label} ({matched_root}). "
+            f"The media sweeper's `unlink` races cloud-sync replication → "
+            f"expired media can be deleted from every device (incl. backup "
+            f"restores). Move ASSISTANT_DATA_DIR to a non-sync location "
+            f"(e.g. ~/.local/share/0xone-assistant) OR acknowledge the risk "
+            f"by creating `{data_dir / _NOSYNC_SENTINEL}` to opt out of this "
+            f"check."
+        ),
+    )
+    sys.exit(DATA_DIR_SYNC_GUARD_FAIL_EXIT)
 
 
 class Daemon:
@@ -615,6 +745,23 @@ class Daemon:
         self._settings.db_path.parent.mkdir(parents=True, exist_ok=True)
         (self._settings.data_dir / "run").mkdir(parents=True, exist_ok=True)
         self._ensure_vault()
+
+        # Phase 7 fix-pack D3: refuse to start if `data_dir` resolves
+        # under a known cloud-sync root (iCloud, Dropbox, Yandex,
+        # OneDrive, GDrive, macOS CloudStorage umbrella). The media
+        # sweeper `unlink` would otherwise race the sync agent and
+        # replicate deletes across every device. An opt-out `.nosync`
+        # sentinel inside `data_dir` lets advanced users acknowledge
+        # the risk; CI and integration tests can create the sentinel
+        # as part of their fixture setup.
+        #
+        # Runs BEFORE `ensure_media_dirs` so a mis-configured startup
+        # exits with a clear error before creating any directories
+        # inside the sync root. Exit code is
+        # ``DATA_DIR_SYNC_GUARD_FAIL_EXIT`` (4) so ops tooling can
+        # distinguish sync-root mis-configuration from auth preflight
+        # (3) and generic startup failures.
+        _check_data_dir_not_in_cloud_sync(self._settings.data_dir, self._log)
 
         # Phase 7 (commit 16) pitfall #14: create the media layout
         # BEFORE ANY background task is spawned. `media_sweeper_loop`
