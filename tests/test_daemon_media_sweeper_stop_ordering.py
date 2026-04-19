@@ -72,8 +72,12 @@ from assistant.media.sweeper import media_sweeper_loop, sweep_media_once
 class _DummyAdapter:
     """Minimal `TelegramAdapter` substitute for daemon start/stop tests."""
 
-    def __init__(self, settings: Any) -> None:
-        del settings
+    def __init__(self, settings: Any, *, dedup_ledger: Any = None) -> None:
+        # Phase 7 fix-pack C1: `Daemon.start` threads the shared
+        # `_DedupLedger` through the adapter constructor. The dummy
+        # accepts + discards the kwarg so tests that monkeypatch
+        # `TelegramAdapter` onto this class continue to work.
+        del settings, dedup_ledger
         self._handler: Any = None
 
     def set_handler(self, handler: Any) -> None:

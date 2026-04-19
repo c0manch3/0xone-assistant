@@ -66,8 +66,9 @@ class _DummyAdapter:
     """Stand-in for TelegramAdapter — start()/stop() are instant, and
     `send_text` records calls so we can verify bootstrap-notify behaviour."""
 
-    def __init__(self, settings: Any) -> None:
-        del settings
+    def __init__(self, settings: Any, *, dedup_ledger: Any = None) -> None:
+        # Phase 7 fix-pack C1: daemon threads the shared ledger.
+        del settings, dedup_ledger
         self.sent: list[tuple[int, str]] = []
         self._handler: Any = None
 
