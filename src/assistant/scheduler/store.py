@@ -43,12 +43,28 @@ class SchedulerStore:
 
     # ------------------------------------------------------------------ schedules
 
-    async def insert_schedule(self, *, cron: str, prompt: str, tz: str = "UTC") -> int:
-        """Insert a new enabled schedule. Returns the new row id."""
+    async def insert_schedule(
+        self,
+        *,
+        cron: str,
+        prompt: str,
+        tz: str = "UTC",
+        seed_key: str | None = None,
+    ) -> int:
+        """Insert a new enabled schedule. Returns the new row id.
+
+        Phase 8: optional ``seed_key`` tags the row as a Daemon-managed
+        default seed (e.g. ``"vault_auto_commit"``). The partial UNIQUE
+        INDEX ``idx_schedules_seed_key`` (migration 0005) keeps at most
+        one non-NULL-keyed row per key so Daemon restarts cannot create
+        duplicates. User-created rows (``tools/schedule/main.py add``)
+        pass ``seed_key=None`` and are not constrained by the index.
+        """
         async with self._lock:
             cur = await self._conn.execute(
-                "INSERT INTO schedules(cron, prompt, tz, enabled) VALUES (?, ?, ?, 1)",
-                (cron, prompt, tz),
+                "INSERT INTO schedules(cron, prompt, tz, enabled, seed_key) "
+                "VALUES (?, ?, ?, 1, ?)",
+                (cron, prompt, tz, seed_key),
             )
             await self._conn.commit()
         # aiosqlite types `lastrowid` as `int | None`; INSERT always sets it.
@@ -119,6 +135,123 @@ class SchedulerStore:
             "created_at": row[5],
             "last_fire_at": row[6],
         }
+
+    # ------------------------------------------------------------------ seed_key (phase 8)
+
+    async def find_by_seed_key(self, seed_key: str) -> dict[str, Any] | None:
+        """Return the row carrying ``seed_key`` or ``None`` if absent.
+
+        The partial UNIQUE INDEX ``idx_schedules_seed_key`` means at
+        most one row can match; a soft-deleted row (``enabled=0``) still
+        shows up here — callers rely on this to avoid resurrecting a row
+        that the owner disabled.
+        """
+        async with self._conn.execute(
+            "SELECT id, cron, prompt, tz, enabled, seed_key "
+            "FROM schedules WHERE seed_key=?",
+            (seed_key,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return {
+            "id": int(row[0]),
+            "cron": row[1],
+            "prompt": row[2],
+            "tz": row[3],
+            "enabled": bool(row[4]),
+            "seed_key": row[5],
+        }
+
+    async def tombstone_exists(self, seed_key: str) -> bool:
+        """Return True iff the owner has explicitly tombstoned this seed.
+
+        Q10 (plan I-8.9): ``tools/schedule/main.py rm`` inserts into
+        ``seed_tombstones`` so the next Daemon boot does NOT re-seed.
+        """
+        async with self._conn.execute(
+            "SELECT 1 FROM seed_tombstones WHERE seed_key=?", (seed_key,)
+        ) as cur:
+            row = await cur.fetchone()
+        return row is not None
+
+    async def insert_tombstone(self, seed_key: str) -> None:
+        """Async insert kept for symmetry / future callers.
+
+        v2 B-D1 note: the ``rm`` CLI does **not** call this — it inserts
+        via sync sqlite3 inside ``cmd_rm``'s own ``BEGIN IMMEDIATE``
+        transaction so the soft-delete and the tombstone land together.
+        Tests may call this method directly to set up scenarios.
+        """
+        async with self._lock:
+            await self._conn.execute(
+                "INSERT OR REPLACE INTO seed_tombstones(seed_key) VALUES (?)",
+                (seed_key,),
+            )
+            await self._conn.commit()
+
+    async def delete_tombstone(self, seed_key: str) -> bool:
+        """Return True iff a tombstone row was removed.
+
+        v2 B-D1 note: the ``revive-seed`` CLI does **not** call this —
+        it deletes via sync sqlite3. Tests may call this directly.
+        """
+        async with self._lock:
+            cur = await self._conn.execute(
+                "DELETE FROM seed_tombstones WHERE seed_key=?", (seed_key,)
+            )
+            await self._conn.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def ensure_seed_row(
+        self,
+        *,
+        seed_key: str,
+        cron: str,
+        prompt: str,
+        tz: str,
+    ) -> tuple[int, str]:
+        """Atomic ``tombstone_exists`` + ``find_by_seed_key`` + ``INSERT``.
+
+        Returns ``(schedule_id, action)`` where ``action`` is one of
+        ``{"exists", "tombstoned", "inserted"}``. ``schedule_id`` is
+        ``0`` for ``"tombstoned"`` (no row is owned/created).
+
+        v2 B-B1 / SF-B1: all three SQL operations run inside a single
+        ``BEGIN IMMEDIATE`` transaction so a concurrent writer cannot
+        slip a row in between the check and the insert. Defence-in-depth
+        against the pidfile flock we already hold at the Daemon layer.
+        """
+        async with self._lock:
+            await self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                async with self._conn.execute(
+                    "SELECT 1 FROM seed_tombstones WHERE seed_key=?",
+                    (seed_key,),
+                ) as cur:
+                    tombstone_row = await cur.fetchone()
+                if tombstone_row is not None:
+                    await self._conn.rollback()
+                    return (0, "tombstoned")
+                async with self._conn.execute(
+                    "SELECT id FROM schedules WHERE seed_key=?",
+                    (seed_key,),
+                ) as cur:
+                    existing = await cur.fetchone()
+                if existing is not None:
+                    await self._conn.rollback()
+                    return (int(existing[0]), "exists")
+                ins = await self._conn.execute(
+                    "INSERT INTO schedules(cron, prompt, tz, enabled, seed_key) "
+                    "VALUES (?, ?, ?, 1, ?)",
+                    (cron, prompt, tz, seed_key),
+                )
+                await self._conn.commit()
+                assert ins.lastrowid is not None
+                return (int(ins.lastrowid), "inserted")
+            except Exception:
+                await self._conn.rollback()
+                raise
 
     # ------------------------------------------------------------------ producer
 
