@@ -18,7 +18,7 @@ from pathlib import Path
 import aiosqlite
 import pytest
 
-from assistant.state.db import apply_schema, connect
+from assistant.state.db import SCHEMA_VERSION, apply_schema, connect
 
 
 async def _column_names(conn: aiosqlite.Connection, table: str) -> list[str]:
@@ -40,7 +40,7 @@ async def test_v4_bumps_user_version(tmp_path: Path) -> None:
         async with conn.execute("PRAGMA user_version") as cur:
             row = await cur.fetchone()
         assert row is not None
-        assert row[0] == 4
+        assert row[0] == SCHEMA_VERSION
     finally:
         await conn.close()
 
@@ -140,6 +140,6 @@ async def test_v4_apply_is_idempotent(tmp_path: Path) -> None:
         async with conn.execute("PRAGMA user_version") as cur:
             row = await cur.fetchone()
         assert row is not None
-        assert row[0] == 4
+        assert row[0] == SCHEMA_VERSION
     finally:
         await conn.close()
