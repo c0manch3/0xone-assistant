@@ -31,8 +31,9 @@ class _FakeBridge:
         history: list[dict[str, Any]],
         *,
         system_notes: list[str] | None = None,
+        image_blocks: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[Any]:
-        del chat_id, user_text, history, system_notes
+        del chat_id, user_text, history, system_notes, image_blocks
         for item in self._items:
             yield item
 

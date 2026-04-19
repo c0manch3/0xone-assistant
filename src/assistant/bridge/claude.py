@@ -326,6 +326,7 @@ class ClaudeBridge:
         history: list[dict[str, Any]],
         *,
         system_notes: list[str] | None = None,
+        image_blocks: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[Any]:
         """Yield InitMeta, then Blocks, then one final ResultMessage.
 
@@ -342,6 +343,17 @@ class ClaudeBridge:
         writes the raw `user_text` unchanged, so history stays honest.
         Phase 3 uses this for the URL-detector nudge (S-4).
 
+        `image_blocks` (phase 7, §3.2) is an optional list of SDK image
+        content blocks (`{"type":"image","source":{...}}`) built by the
+        handler from `IncomingMessage.attachments`. They are inserted
+        into the SAME user envelope as `user_text`, between the text
+        block and any system-notes. Order matters — S-0 Q0-5b verified
+        that `text → image → system-notes` is the envelope shape the
+        SDK accepts for multimodal turns. Raw image bytes are NOT
+        persisted to `ConversationStore`; the handler still writes the
+        original plain-text row, and history replay re-synthesises the
+        image turn as a placeholder note (phase 7 §3.3, H-10).
+
         Order is preserved: entries are appended in the supplied sequence
         (spike S-7 verification). Phase-5 convention for scheduler-initiated
         turns is `[scheduler_note, url_note]` — the scheduler context comes
@@ -355,6 +367,7 @@ class ClaudeBridge:
             prompt_len=len(user_text),
             history_rows=len(history),
             system_notes=len(system_notes or []),
+            image_blocks=len(image_blocks or []),
         )
 
         truncate = self._settings.memory.history_tool_result_truncate_chars
@@ -364,14 +377,20 @@ class ClaudeBridge:
                 history, chat_id, tool_result_truncate=truncate
             ):
                 yield envelope
-            if system_notes:
-                # Mixed-block content: original text + one text-block per note.
-                content_blocks: list[dict[str, str]] = [
+            if system_notes or image_blocks:
+                # Mixed-block content: text → images → system-notes
+                # (S-0 Q0-5b order). Raw image bytes NEVER persisted by
+                # the handler; they live only in this ephemeral envelope.
+                content_blocks: list[dict[str, Any]] = [
                     {"type": "text", "text": user_text},
                 ]
-                for note in system_notes:
-                    content_blocks.append({"type": "text", "text": f"[system-note: {note}]"})
-                user_content: str | list[dict[str, str]] = content_blocks
+                for blk in image_blocks or ():
+                    content_blocks.append(blk)
+                for note in system_notes or ():
+                    content_blocks.append(
+                        {"type": "text", "text": f"[system-note: {note}]"}
+                    )
+                user_content: str | list[dict[str, Any]] = content_blocks
             else:
                 user_content = user_text
             yield {

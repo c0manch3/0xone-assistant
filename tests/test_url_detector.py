@@ -75,8 +75,9 @@ class _FakeBridge:
         history: list[dict[str, Any]],
         *,
         system_notes: list[str] | None = None,
+        image_blocks: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[Any]:
-        del chat_id, history
+        del chat_id, history, image_blocks
         self.last_system_notes = list(system_notes) if system_notes is not None else None
         self.last_user_text = user_text
         for item in self._items:
