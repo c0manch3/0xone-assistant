@@ -35,7 +35,6 @@ import sys
 import zipfile
 from pathlib import Path
 
-import pytest
 from docx import Document
 from openpyxl import Workbook
 
@@ -218,24 +217,15 @@ def test_xxe_docx_does_not_leak_secret(tmp_path: Path) -> None:
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Production gap: python-docx parses document.xml with lxml's "
-        "XMLParser(resolve_entities=False), not via stdlib xml, so "
-        "defuse_stdlib() in tools/extract_doc/main.py does not intercept. "
-        "Entities are silently unresolved (no leak, no expansion) but the "
-        "CLI returns exit 0 with empty text — there is no explicit DOCTYPE/"
-        "entity rejection. Flagged for phase-7 fix; do not fix in this test "
-        "commit. See module docstring."
-    ),
-)
 def test_xxe_docx_rejected_by_defusedxml(tmp_path: Path) -> None:
-    """An XXE DOCX SHOULD be refused by the XML parser with a non-zero
-    exit so callers can distinguish hostile input from legitimate
-    empty documents. Currently xfail — production silently emits
-    empty text (secret is NOT leaked; see the paired hard-guarantee
-    test). Remove the xfail once explicit rejection lands.
+    """Phase-7 fix-pack D2: an XXE DOCX MUST be refused with a
+    non-zero exit so callers can distinguish hostile input from
+    legitimate empty documents.
+
+    The fix scans every XML part in the DOCX zip for ``<!DOCTYPE`` /
+    ``<!ENTITY`` markers BEFORE handing the file to python-docx. A
+    hit produces ``EXIT_VALIDATION`` (3) with the offending part
+    name in the structured error payload.
     """
     legit = tmp_path / "ok.docx"
     _make_legit_docx(legit)
@@ -248,9 +238,16 @@ def test_xxe_docx_rejected_by_defusedxml(tmp_path: Path) -> None:
 
     result = _run(str(evil))
 
-    assert result.returncode != 0, (
-        f"expected non-zero exit on XXE, got 0\nstdout={result.stdout!r}\nstderr={result.stderr!r}"
+    assert result.returncode == 3, (
+        f"expected EXIT_VALIDATION (3) on XXE, got {result.returncode}\n"
+        f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
     )
+    payload = json.loads(result.stderr)
+    assert payload["ok"] is False
+    # The error message mentions DOCTYPE or ENTITY so operators can
+    # tell XML-entity rejection apart from other validation failures.
+    assert "DOCTYPE" in payload["error"] or "ENTITY" in payload["error"], payload
+    assert payload.get("part") == "word/document.xml"
 
 
 def test_billion_laughs_docx_does_not_expand(tmp_path: Path) -> None:
@@ -286,20 +283,13 @@ def test_billion_laughs_docx_does_not_expand(tmp_path: Path) -> None:
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Production gap: same root cause as test_xxe_docx_rejected_by_defusedxml. "
-        "python-docx's lxml parser uses resolve_entities=False so billion-laughs "
-        "entities stay unresolved (no memory blow-up) but the CLI returns exit 0 "
-        "with empty text — no explicit DOCTYPE/entity rejection. Flagged for "
-        "phase-7 fix."
-    ),
-)
 def test_billion_laughs_docx_rejected_by_defusedxml(tmp_path: Path) -> None:
-    """A billion-laughs DOCX SHOULD be refused by the XML parser with a
-    non-zero exit. Currently xfail — see the paired hard-guarantee
-    test for the non-negotiable safety invariant that DOES hold.
+    """Phase-7 fix-pack D2: a billion-laughs DOCX MUST be refused by
+    the pre-parse XML-entity scan with a non-zero exit.
+
+    The fix's bytes-level ``<!ENTITY`` scan catches this attack
+    shape regardless of whether the expansion itself is benign —
+    the declaration ALONE is sufficient grounds for rejection.
     """
     legit = tmp_path / "ok.docx"
     _make_legit_docx(legit)
@@ -309,10 +299,14 @@ def test_billion_laughs_docx_rejected_by_defusedxml(tmp_path: Path) -> None:
 
     result = _run(str(evil))
 
-    assert result.returncode != 0, (
-        f"expected non-zero exit on billion-laughs, got 0\n"
+    assert result.returncode == 3, (
+        f"expected EXIT_VALIDATION (3) on billion-laughs, got {result.returncode}\n"
         f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
     )
+    payload = json.loads(result.stderr)
+    assert payload["ok"] is False
+    assert "DOCTYPE" in payload["error"] or "ENTITY" in payload["error"], payload
+    assert payload.get("part") == "word/document.xml"
 
 
 # --- control case -----------------------------------------------------------

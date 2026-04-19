@@ -82,6 +82,50 @@ _DEFAULT_MAX_CHARS: Final = 200_000  # plenty for a model turn; caller can reque
 
 _SUPPORTED_SUFFIXES: Final = frozenset({".pdf", ".docx", ".xlsx", ".rtf", ".txt"})
 
+# --- XML-entity attack scan (phase-7 fix-pack D2) ---------------------------
+#
+# python-docx (OPC package) + openpyxl parse XML parts via lxml's
+# ``XMLParser(resolve_entities=False)`` — NOT via stdlib ``xml.*``.
+# ``defusedxml.defuse_stdlib()`` cannot see those code paths, so a
+# hostile DOCX/XLSX with a ``<!DOCTYPE>`` / ``<!ENTITY>`` declaration
+# reached the parser unnoticed. lxml's ``resolve_entities=False`` keeps
+# the attack non-leaky (entities stay unresolved, no external fetch),
+# but the CLI returned exit 0 with empty text — identical to a legit
+# empty document — which is a silent-acceptance gap.
+#
+# Fix: before handing a ZIP-backed Office file to python-docx /
+# openpyxl, scan every XML entry in the zip for a DOCTYPE or ENTITY
+# declaration. If present, reject with ``EXIT_VALIDATION`` and an
+# explicit structured-log event. Keeps defense-in-depth (the
+# ``_guard_zip_bomb`` check still fires first for archive-level
+# amplification), adds explicit XXE / billion-laughs rejection that
+# surfaces in the CLI's exit code.
+#
+# Bytes-level scan rather than parse: (a) parsing the hostile XML
+# with ``defusedxml.lxml`` would require an extra dependency and
+# defeat the point of scanning before any parser touches the
+# payload; (b) a simple bytes-level substring scan is O(file_size),
+# bounded by ``_ZIP_UNCOMPRESSED_CAP`` via the zip-bomb guard; (c)
+# case-insensitive match covers XML spec variants ``<!DOCTYPE`` and
+# ``<!doctype`` alike, while the marker characters themselves
+# cannot legitimately appear in any XML part content (they're only
+# valid at the prolog level).
+_XML_ENTITY_MARKERS: Final[tuple[bytes, ...]] = (b"<!DOCTYPE", b"<!ENTITY")
+
+# Cap the declared-size of a single XML part we're willing to scan —
+# an individual XML part >32 MB is unheard of in legitimate Office
+# files and a hostile crafted part could otherwise push RAM. 32 MB is
+# half of ``_ZIP_UNCOMPRESSED_CAP`` so the sum across all XML parts
+# is still under the zip-bomb ceiling.
+_XML_PART_SCAN_CAP: Final = 32 * 1024 * 1024
+
+# XML part suffixes found inside DOCX / XLSX packages. We scan parts
+# matching these — the payload surface an attacker could manipulate.
+# Other entries in an OPC zip (e.g. ``word/media/image1.png``,
+# ``[Content_Types].xml``) are either non-XML (images) or already
+# covered by the .xml/.rels scan.
+_XML_PART_SUFFIXES: Final[tuple[str, ...]] = (".xml", ".rels")
+
 
 # --- output helpers ---------------------------------------------------------
 
@@ -215,6 +259,14 @@ def _guard_zip_bomb(path: Path) -> None:
     defusedxml guards against XML-entity expansion once the parser
     reaches individual XML parts; zip-bomb is a separate attack
     surface defusedxml cannot see, hence this explicit check.
+
+    Fix-pack D2: we also scan every XML part inside the zip for
+    ``<!DOCTYPE`` / ``<!ENTITY`` markers and reject the whole file if
+    any part declares one. python-docx + openpyxl route their XML
+    parsing through lxml (not stdlib), which ``defuse_stdlib()``
+    cannot intercept; scanning bytes-level BEFORE any parser opens
+    the file closes the silent-acceptance gap and yields a real exit
+    code for observability.
     """
     try:
         with zipfile.ZipFile(path) as zf:
@@ -232,10 +284,111 @@ def _guard_zip_bomb(path: Path) -> None:
                         declared=total,
                         cap=_ZIP_UNCOMPRESSED_CAP,
                     )
+            # D2: entity-declaration scan across every XML-like part.
+            # Run AFTER the size tally so the cheap check (aggregate
+            # size) rejects zip-bombs before we start reading
+            # individual parts — which themselves could be huge.
+            _reject_xml_entity_declarations(zf, path)
     except zipfile.BadZipFile as exc:
         raise _RejectError(EXIT_IO, f"not a valid zip archive: {exc}") from exc
     except OSError as exc:
         raise _RejectError(EXIT_IO, f"zip open failed: {exc}") from exc
+
+
+def _reject_xml_entity_declarations(zf: zipfile.ZipFile, path: Path) -> None:
+    """Raise ``_RejectError`` if any XML part declares ``<!DOCTYPE`` / ``<!ENTITY``.
+
+    Scans each ``.xml`` / ``.rels`` entry in the archive up to
+    ``_XML_PART_SCAN_CAP`` bytes (bounded above by the zip-bomb cap
+    total already enforced). A single matching byte sequence is
+    sufficient to reject the whole file — legitimate Office XML parts
+    never declare a DOCTYPE or ENTITY (the OPC spec puts schema
+    declarations in dedicated parts the parser reaches separately).
+
+    Using a bytes-level substring scan rather than an XML parse is
+    intentional:
+
+    * No parser receives the hostile input; the scan happens BEFORE
+      python-docx / openpyxl touch the file.
+    * The markers ``<!DOCTYPE`` / ``<!ENTITY`` are uppercase by XML
+      spec (case-sensitivity varies by parser, but the legitimate
+      declarations are always uppercase); lowercase variants would
+      be rejected by a strict XML parser anyway. We still fold the
+      scan to case-insensitive (``.upper()``) to catch the `lol`
+      corner-case where the attacker lowercases the marker to evade
+      a naive substring check, then relies on lax-mode parsing.
+
+    Raises:
+      ``_RejectError`` with exit code ``EXIT_VALIDATION`` and the
+      offending part name in the extra payload so operators can tell
+      which entry tripped the guard.
+    """
+    for info in zf.infolist():
+        name = info.filename
+        lower_name = name.lower()
+        # Scan `.xml`, `.rels`, and `.xml.rels`. `endswith` on tuple
+        # is stdlib-idiomatic and covers both suffix families.
+        if not lower_name.endswith(_XML_PART_SUFFIXES):
+            continue
+        declared = max(info.file_size, 0)
+        if declared > _XML_PART_SCAN_CAP:
+            # An XML part exceeding 32 MB is itself deeply suspicious
+            # — a legitimate Office part virtually never reaches this
+            # size. Treat as a rejection rather than silently skipping
+            # the scan.
+            raise _RejectError(
+                EXIT_VALIDATION,
+                f"xml part {name!r} declared size {declared} exceeds scan cap "
+                f"{_XML_PART_SCAN_CAP}",
+                part=name,
+                declared=declared,
+                cap=_XML_PART_SCAN_CAP,
+            )
+        try:
+            # `open().read()` within the ZipFile context honours the
+            # underlying `ZipExtFile` streaming — for a 32 MB cap the
+            # worst-case RAM cost is 32 MB, which is well within the
+            # ambient process budget. We read at most the declared
+            # size (guarded above) so an attacker cannot push us past
+            # the cap by lying about the compressed size.
+            with zf.open(info, "r") as member:
+                data = member.read(_XML_PART_SCAN_CAP + 1)
+        except (OSError, zipfile.BadZipFile) as exc:
+            raise _RejectError(
+                EXIT_IO,
+                f"xml part {name!r} read failed: {exc}",
+                part=name,
+            ) from exc
+        if len(data) > _XML_PART_SCAN_CAP:
+            # The archive lied about the declared size and expanded
+            # past our scan cap. Treat identically to a declared-size
+            # overflow — reject rather than trying to reason about
+            # the rest of the part.
+            raise _RejectError(
+                EXIT_VALIDATION,
+                f"xml part {name!r} actual size exceeds scan cap "
+                f"{_XML_PART_SCAN_CAP}",
+                part=name,
+                cap=_XML_PART_SCAN_CAP,
+            )
+        # Case-insensitive bytes scan. ``upper()`` on bytes is
+        # ASCII-only which is exactly what we want — XML declaration
+        # tokens are ASCII.
+        upper = data.upper()
+        for marker in _XML_ENTITY_MARKERS:
+            if marker in upper:
+                raise _RejectError(
+                    EXIT_VALIDATION,
+                    (
+                        f"xml part {name!r} declares {marker.decode()!r}; "
+                        "DOCTYPE / ENTITY declarations are rejected to "
+                        "block XXE + billion-laughs attacks (extract_doc "
+                        "processes content-only XML)"
+                    ),
+                    part=name,
+                    marker=marker.decode(),
+                    source=str(path),
+                )
 
 
 # --- extractors -------------------------------------------------------------
