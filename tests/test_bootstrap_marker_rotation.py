@@ -83,6 +83,18 @@ async def _noop_preflight(log: Any) -> None:
     del log
 
 
+async def _ok_gh_preflight(log: Any, timeout_s: float = 10.0) -> bool:
+    """Phase 8 Wave 5 fix-up: bypass C6 preflight subprocess probes.
+
+    The tests below monkeypatch ``asyncio.create_subprocess_exec`` to a
+    controlled mock that only knows about the bootstrap subprocess; the
+    C6 preflight probes (``gh auth status`` / ``gh --version``) would
+    otherwise consume those mocks with the wrong protocol and fail.
+    """
+    del log, timeout_s
+    return True
+
+
 def _settings(tmp_path: Path) -> Settings:
     (tmp_path / "skills").mkdir(exist_ok=True)
     return Settings(
@@ -104,6 +116,16 @@ def _wired(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(main_mod, "_preflight_claude_cli", _noop_preflight)
     monkeypatch.setattr(main_mod, "ensure_skills_symlink", lambda root: None)
     monkeypatch.setattr(main_mod, "TelegramAdapter", _DummyAdapter)
+    # Phase 8 Wave 5 (C6) fix-up: stub gh preflight probes so they do not
+    # consume the test's mocked ``asyncio.create_subprocess_exec``. The
+    # bootstrap subprocess is the only one the controlled mocks below
+    # expect to be invoked.
+    monkeypatch.setattr(
+        main_mod, "_verify_gh_config_accessible_for_daemon", _ok_gh_preflight
+    )
+    monkeypatch.setattr(
+        main_mod, "_probe_gh_version_for_daemon", _ok_gh_preflight
+    )
     monkeypatch.setattr(shutil, "which", lambda name: "/fake/gh")
 
 
