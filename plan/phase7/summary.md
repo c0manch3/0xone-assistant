@@ -9,6 +9,13 @@ scheduler,subagent}/` + `tools/{transcribe,genimage,extract_doc,render_doc}/`,
 / 4 skipped / 7 xfailed / 1 xpassed** на HEAD `22bb3a6`. Lint + mypy
 strict зелёные на новых модулях.
 
+**Post-phase fix-pack (6 commits поверх `465af0e`):** адресованы
+CR/devil-advocate issues C1 (main-turn dispatch_reply wiring), D2
+(DOCTYPE/ENTITY pre-parse reject), I4 (per-chat throttle lock TOCTOU),
+I3+I7 (shared CLI path-guards), D3 (cloud-sync folder guard), I2+I5+
+I6+D5 (micro-fixes cluster). Xfail count после fix-pack: **7 → 5**
+(X-3 и X-4 ниже — closed). Тесты 1200+ passed.
+
 ## 1. TL;DR
 
 Phase 7 расширяет приёмный/выходной контур бота с чисто-текстового до
@@ -135,8 +142,8 @@ correction + SKILL.md §4.5 dedup polish + summary.md.
 |---|------|----------|-----|--------|
 | X-1 | `test_wrong_shape_list_payload_recovers` | `tests/test_genimage_quota_midnight_rollover.py:378` | `_check_and_increment_quota` вызывает `state.get("date")` без проверки, что JSON распарсился в dict. List/scalar-shaped quota-file (rare: disk fill mid-write / operator hand-edit) крашит с `AttributeError`. Диагностический `_read_quota_best_effort` ЭТО обрабатывает — asymmetry = bug. | `tools/genimage/main.py:331` | xfail(strict=True) — **phase-8 fix-pack** |
 | X-2 | `test_best_effort_reader_binary_input_xfail` | `tests/test_genimage_quota_midnight_rollover.py:413` | `_read_quota_best_effort` catches `OSError` + `JSONDecodeError` но **НЕ `UnicodeDecodeError`**. Quota file с arbitrary binary bytes (partial fsync after crash) leak'ит exception к caller'у. Locked write path корректно обрабатывает; диагностический reader должен совпасть. | `tools/genimage/main.py:355` | xfail(strict=True) — **phase-8 fix-pack** |
-| X-3 | `test_xxe_docx_rejected_by_defusedxml` | `tests/test_extract_doc_defusedxml_zip_bomb.py:233` | `python-docx` парсит `document.xml` через `lxml.XMLParser(resolve_entities=False)`, не через stdlib `xml`. `defuse_stdlib()` в `tools/extract_doc/main.py` НЕ перехватывает. Entities silently unresolved (**нет leak, нет expansion**) но CLI возвращает exit 0 с пустым text — нет explicit DOCTYPE/entity rejection. | `tools/extract_doc/main.py` (parsing layer) | xfail(strict=True) — **phase-8 fix-pack** |
-| X-4 | `test_billion_laughs_docx_rejected_by_defusedxml` | `tests/test_extract_doc_defusedxml_zip_bomb.py:297` | Same root cause as X-3 — `lxml` с `resolve_entities=False` bypasses `defusedxml.defuse_stdlib()`. Billion-laughs entities stay unresolved (no memory blow-up), но explicit rejection отсутствует. XXE/billion-laughs **безопасны** (paired hard-guarantee `test_billion_laughs_docx_does_not_expand` PASS), но не отклоняются явно. | `tools/extract_doc/main.py` (openpyxl/python-docx lxml usage) | xfail(strict=True) — **phase-8 fix-pack** |
+| ~~X-3~~ | ~~`test_xxe_docx_rejected_by_defusedxml`~~ | ~~`tests/test_extract_doc_defusedxml_zip_bomb.py:233`~~ | **CLOSED** fix-pack D2 (commit `ff924e7`). `_reject_xml_entity_declarations` сканит каждую XML-часть в DOCX/XLSX zip на `<!DOCTYPE` / `<!ENTITY` markers BEFORE парсера — rejection через `EXIT_VALIDATION` (3). | ~~`tools/extract_doc/main.py`~~ | passed |
+| ~~X-4~~ | ~~`test_billion_laughs_docx_rejected_by_defusedxml`~~ | ~~`tests/test_extract_doc_defusedxml_zip_bomb.py:297`~~ | **CLOSED** fix-pack D2 (same commit). Same bytes-level `<!ENTITY>` scan catches billion-laughs declarations. | ~~`tools/extract_doc/main.py`~~ | passed |
 
 Плюс унаследованные xfails from earlier phases (1 xpassed на HEAD —
 один из ранее ожидаемо-fail'ящихся теперь проходит, следует проверить
@@ -256,3 +263,25 @@ summary; scheduler/worker → send_photo/document/audio через
 dispatch_reply с двухслойной дедупликацией (prompt-rule +
 `_DedupLedger`). Retention sweeper держит disk под 2 GB LRU + 14/7 d
 age. Phase 8 (GitHub skill) разблокирован.
+
+## 8. Fix-pack (post-merge, 6 commits поверх `465af0e`)
+
+| Commit | Issue | Краткое описание | Тесты добавлены |
+|--------|-------|-------------------|------------------|
+| `0c94781` | **C1** (I-7.5 main-turn) | `TelegramAdapter._on_text` wiring → `dispatch_reply`. Main-turn outbox artefact'ы теперь доставляются как photo/document/audio + cleaned text. Общий `_DedupLedger` между three call-sites. | `tests/test_telegram_main_turn_dispatch_reply.py` (4 теста) |
+| `ff924e7` | **D2** (XXE pre-parse) | extract_doc `_reject_xml_entity_declarations` — bytes-level `<!DOCTYPE`/`<!ENTITY>` scan по каждой XML-части zip'а ДО python-docx / openpyxl. Закрывает X-3 + X-4. | 2 ранее-xfail'ящихся теста теперь passed |
+| `d5d3bee` | **I4** (throttle TOCTOU) | Per-chat `asyncio.Lock` в `subagent/hooks.py::_throttle`. Два concurrent Stop hook'а для одного chat'а больше не видят stale `last_notify_at`. | `tests/test_subagent_throttle_concurrent.py` (3 теста) |
+| `d497d2a` | **I3 + I7** (path-guard drift) | `src/assistant/media/path_guards.py` — canonical `validate_existing_input_path` + `validate_future_output_path`. 4 CLI (transcribe/extract_doc/genimage/render_doc) делегируют. Исправлена genimage `resolve(strict=False)` regression (symlink parent escape). | `tests/test_path_guards_shared.py` (20 тестов) |
+| `71ebdde` | **D3** (cloud-sync guard) | `_check_data_dir_not_in_cloud_sync` в `Daemon.start` — reject startup если `data_dir` резолвится под iCloud/Dropbox/Yandex/OneDrive/GDrive/CloudStorage. Opt-out через `<data_dir>/.nosync` sentinel. Exit code 4 (`DATA_DIR_SYNC_GUARD_FAIL_EXIT`). | `tests/test_daemon_data_dir_sync_guard.py` (6 тестов) |
+| `a1570c0` | **I2 + I5 + I6 + D5** (micro-cluster) | I2: drop redundant inner TTL re-check в `_DedupLedger.mark_and_check` (dead after `_evict_expired`). I5: move `send_text`/`dispatch_reply` INSIDE `ChatActionSender.typing(...)` context (done in C1 commit). I6: `except (OSError, Exception)` → `except Exception` в `media/download.py`. D5: add `\u200B-\u200D` (ZWSP/ZWNJ/ZWJ) в `ARTEFACT_RE` body-forbid + stop-set. | 5 новых param-cases в `test_dispatch_reply_regex.py` |
+
+**Xfail count:** `7 → 5` после fix-pack (X-3, X-4 closed; X-1, X-2
+остаются как phase-8 candidates; плюс 3 regex S-2 adjacency residuals).
+
+**Файлы добавлены:** `src/assistant/media/path_guards.py`, 4 новых
+test-модуля (`test_telegram_main_turn_dispatch_reply.py`,
+`test_subagent_throttle_concurrent.py`, `test_path_guards_shared.py`,
+`test_daemon_data_dir_sync_guard.py`).
+
+**Фикс-пак итого:** 34 новых теста, ~600 LOC нового кода,
+6 bisectable commits. Mypy strict зелёный на HEAD.
