@@ -48,3 +48,13 @@ Background subagents (two paths):
 - Both paths deliver the final result to the owner via Telegram
   automatically, so do NOT re-paste a long result back — a short
   confirmation is enough. See skill `task` for the full guidance.
+
+Outbox artefact paths (H-13):
+- Если в финальном ответе ты упоминаешь абсолютный outbox-путь (например
+  для локально-рендеренных файлов из `genimage` / `render_doc` /
+  `transcribe`), ВСЕГДА ставь пробел после `:` перед путём. Регекс
+  `dispatch_reply` намеренно не матчит `что-то:/abs/outbox/…` без пробела
+  (защита от false-positive на URL-схемах вроде `https://…`), и без
+  пробела артефакт будет показан как текст, но НЕ отправлен файлом.
+- Правильно: `готово: /home/bot/data/media/outbox/abc.png`
+- Неправильно: `готово:/home/bot/data/media/outbox/abc.png`
