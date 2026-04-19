@@ -18,6 +18,12 @@ Scenario:
 
 Critical property: no new commit is created during step 6/7 — the push
 ships the SAME sha we created in step 2, so no data loss / duplication.
+
+T6.1 note: this test no longer manually sets ``branch --set-upstream-to``.
+The refspec-based :func:`unpushed_commit_count` uses the
+``refs/remotes/<remote>/<branch>`` ref which ``git push`` auto-updates on
+every successful push. The first push in the scenario is what populates
+that ref; no extra config mutation is needed.
 """
 
 from __future__ import annotations
@@ -53,31 +59,29 @@ def test_unpushed_retry_preserves_commit_sha(
     env.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     (env.vault_dir / "note.md").write_text("content\n")
 
-    # Stage 0: establish upstream tracking via a successful initial push.
-    # Without this, `git rev-list @{u}..HEAD` fails (no `@{u}` configured)
-    # and unpushed_commit_count conservatively returns 0 — the retry path
-    # wouldn't fire. Once we have ONE push complete, git remembers the
-    # upstream and future pushes leave `@{u}` resolvable.
+    # Stage 0: initial successful push. `git push` on success
+    # auto-updates `refs/remotes/<remote>/<branch>` — that's the ref the
+    # refspec-based `unpushed_commit_count` compares against from the
+    # second run onward. T6.1 removed the manual `--set-upstream-to`
+    # setup that the @{u}-based implementation used to need.
     rc0 = gh_main.main(["vault-commit-push"])
     assert rc0 == 0, f"initial push expected OK (0), got {rc0}"
     capsys.readouterr()
 
-    # Manually set upstream tracking (our `push` command doesn't pass
-    # -u, which is deliberate — the scheduler never wants auto-tracking
-    # config mutations). Local git needs `branch.main.remote` +
-    # `branch.main.merge` to resolve `@{u}`.
-    subprocess.run(  # noqa: S603
-        ["git", "-C", str(env.vault_dir), "branch",
-         f"--set-upstream-to={env.settings.vault_remote_name}/{env.settings.vault_branch}",
-         env.settings.vault_branch],
-        check=True, capture_output=True,
+    # Sanity: the remote-tracking ref MUST exist after the first push,
+    # otherwise the refspec comparison in stage 2 would silently see 0
+    # unpushed commits and the retry wouldn't fire.
+    remote_ref = (
+        env.vault_dir
+        / ".git"
+        / "refs"
+        / "remotes"
+        / env.settings.vault_remote_name
+        / env.settings.vault_branch
     )
-    # Fetch so the remote ref exists locally (required for `@{u}` to
-    # resolve to a meaningful sha).
-    subprocess.run(  # noqa: S603
-        ["git", "-C", str(env.vault_dir), "fetch", "-q",
-         env.settings.vault_remote_name],
-        check=True, capture_output=True,
+    assert remote_ref.is_file(), (
+        f"git push must auto-populate {remote_ref} on success; "
+        "refspec-based unpushed count depends on it"
     )
 
     # Stage 1: edit content + break the bare repo so push fails.

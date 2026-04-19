@@ -100,3 +100,41 @@ def test_auth_status_gh_missing_on_path(monkeypatch, capsys) -> None:  # type: i
     assert rc == 4
     stdout = capsys.readouterr().out.strip()
     assert json.loads(stdout) == {"ok": False, "error": "gh_not_found"}
+
+
+def test_build_gh_env_pins_home_to_real_user_home(
+    monkeypatch,  # type: ignore[no-untyped-def]
+) -> None:
+    """T5.1: ``build_gh_env`` pins ``HOME`` to ``Path.home()`` even when
+    the caller's env has ``HOME`` unset or pointing somewhere else.
+
+    Under systemd / launchd, ``HOME`` may be missing or redirected to
+    ``/var/empty``; ``gh`` reads ``~/.config/gh/hosts.yml`` via ``HOME``,
+    so a wrong value silently breaks auth. The pin uses
+    :meth:`pathlib.Path.home` which consults the real uid → pwd mapping
+    rather than trusting the inherited env.
+    """
+    from pathlib import Path
+
+    # Force HOME to a bogus value; build_gh_env must overwrite.
+    monkeypatch.setenv("HOME", "/var/empty-should-be-overwritten")
+    env = gh_ops.build_gh_env()
+    assert env["HOME"] == str(Path.home()), (
+        f"T5.1: HOME must be pinned to Path.home(); got {env['HOME']!r}"
+    )
+
+
+def test_build_gh_env_extra_can_still_override_home(
+    monkeypatch,  # type: ignore[no-untyped-def]
+) -> None:
+    """T5.1: the ``extra`` dict still wins (caller escape hatch).
+
+    If an operator truly wants a specific HOME (e.g. running under a
+    service account with a non-standard home), passing it through
+    ``extra`` must take precedence over the Path.home() pin. Otherwise
+    we'd have a backwards-incompatible contract change.
+    """
+    env = gh_ops.build_gh_env(extra={"HOME": "/tmp/explicit-override"})
+    assert env["HOME"] == "/tmp/explicit-override", (
+        "caller-provided HOME must override the Path.home() pin"
+    )

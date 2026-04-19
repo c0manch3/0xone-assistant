@@ -64,10 +64,18 @@ def test_bootstrap_empty_vault(
     # Inside a work tree per git's own opinion.
     assert _git(env.vault_dir, "rev-parse", "--is-inside-work-tree") == "true"
 
-    # .gitignore contains `.tmp/` (SF-D7 — memory indexer scratch excluded).
+    # .gitignore contains `/.tmp/` (SF-D7 — memory indexer scratch excluded).
+    # T4.3: the template now uses `/.tmp/` (anchored) to match only the
+    # top-level .tmp directory. It also carries credential patterns
+    # mirrored from bridge/hooks.py.
     gitignore = (env.vault_dir / ".gitignore").read_text()
-    assert ".tmp/" in gitignore, f"SF-D7 violated: {gitignore!r}"
+    assert "/.tmp/" in gitignore, f"SF-D7 violated: {gitignore!r}"
     assert "*.tmp" in gitignore
+    # T4.3 extended patterns — the template also covers credential files.
+    for pattern in (".env", "*.pem", "*.key", "id_rsa*", "credentials*"):
+        assert pattern in gitignore, (
+            f"T4.3: expected {pattern!r} in .gitignore template; got {gitignore!r}"
+        )
 
     # Remote registered and points at the configured URL.
     remotes = _git(env.vault_dir, "remote", "-v")
@@ -92,16 +100,19 @@ def test_bootstrap_empty_vault(
     assert "note.md" in files_in_head.splitlines()
 
 
-def test_bootstrap_respects_preexisting_gitignore(
+def test_bootstrap_merges_preexisting_gitignore(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """If the owner pre-populated ``.gitignore``, bootstrap doesn't overwrite it.
+    """T4.3: if the owner pre-populated ``.gitignore``, bootstrap preserves
+    the curated content but appends the mandatory SF-D7 lines.
 
-    The production code checks ``gitignore.exists()`` and skips the
-    template write if true. This preserves manually tuned ignores
-    across a reinstall / user-deletes-`.git` scenario.
+    Earlier behaviour skipped the template entirely when a file was
+    present, which left migrated vaults without the ``/.tmp/`` guard
+    — a potential data leak. T4.3 merge semantics append only the
+    missing mandatory lines so owner customisation is preserved while
+    SF-D7 is guaranteed.
     """
     env = install_file_remote(monkeypatch, tmp_path)
     env.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -114,6 +125,52 @@ def test_bootstrap_respects_preexisting_gitignore(
     capsys.readouterr()
 
     gitignore = (env.vault_dir / ".gitignore").read_text()
+    # Owner's original content is preserved verbatim at the top.
+    assert gitignore.startswith(custom_ignore), (
+        f"pre-existing .gitignore must be preserved verbatim; got {gitignore!r}"
+    )
+    # SF-D7 mandatory lines are appended.
+    lines_stripped = {line.strip() for line in gitignore.splitlines()}
+    assert "/.tmp/" in lines_stripped, (
+        f"T4.3: SF-D7 '/.tmp/' must be appended to existing .gitignore; "
+        f"got {gitignore!r}"
+    )
+    assert "*.tmp" in lines_stripped, (
+        f"T4.3: SF-D7 '*.tmp' must be appended to existing .gitignore; "
+        f"got {gitignore!r}"
+    )
+    # Custom line is still present.
+    assert "*.bak" in lines_stripped
+
+
+def test_bootstrap_preserves_gitignore_when_sfd7_already_present(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """T4.3: no append when SF-D7 lines are already in the owner's file.
+
+    Idempotent behaviour — a ``.gitignore`` that already contains the
+    mandatory lines is left untouched so repeat invocations don't
+    grow the file with duplicate marker blocks.
+    """
+    env = install_file_remote(monkeypatch, tmp_path)
+    env.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    custom_ignore = (
+        "# Owner's custom ignore\n"
+        "/.tmp/\n"
+        "*.tmp\n"
+        "*.bak\n"
+    )
+    (env.vault_dir / ".gitignore").write_text(custom_ignore)
+    (env.vault_dir / "note.md").write_text("x\n")
+
+    rc = gh_main.main(["vault-commit-push"])
+    assert rc == 0
+    capsys.readouterr()
+
+    gitignore = (env.vault_dir / ".gitignore").read_text()
     assert gitignore == custom_ignore, (
-        f"pre-existing .gitignore was overwritten: {gitignore!r}"
+        "SF-D7 lines already present; bootstrap must not append a "
+        f"second marker block. Got: {gitignore!r}"
     )

@@ -706,7 +706,11 @@ def _cmd_vault_commit_push(args: argparse.Namespace) -> int:
                     "ok": True,
                     "dry_run": True,
                     "porcelain": porcelain,
-                    "unpushed_commits": unpushed_commit_count(vault_dir),
+                    "unpushed_commits": unpushed_commit_count(
+                        vault_dir,
+                        remote=gh.vault_remote_name,
+                        branch=gh.vault_branch,
+                    ),
                     "planned_message": _render_message(
                         gh.commit_message_template, gh.auto_commit_tz
                     ),
@@ -734,7 +738,14 @@ def _cmd_vault_commit_push(args: argparse.Namespace) -> int:
             # Step 8 (B-B2): detect unpushed commits FIRST. A non-zero
             # count means a prior run committed locally but the push
             # failed; retry ONLY the push (no re-stage, no new commit).
-            unpushed = unpushed_commit_count(vault_dir)
+            # T6.1: explicit remote+branch args — the refspec-based
+            # check (``<remote>/<branch>..HEAD``) works without any
+            # upstream-tracking config, which our ``push()`` never sets.
+            unpushed = unpushed_commit_count(
+                vault_dir,
+                remote=gh.vault_remote_name,
+                branch=gh.vault_branch,
+            )
             if unpushed > 0:
                 rc, payload = _do_push_cycle(
                     vault_dir=vault_dir,

@@ -15,9 +15,15 @@ Public surface used by ``tools/gh/main.py::_cmd_vault_commit_push``:
 - :func:`is_inside_work_tree` / :func:`porcelain_status` / :func:`stage_all` /
   :func:`commit` — the usual staged-change flow.
 - :func:`unpushed_commit_count` — B-B2 helper. Returns how many local commits
-  are ahead of the configured upstream ``@{u}``. Used BEFORE the porcelain
-  check to detect "prior run committed but push failed" situations, so we
-  can retry a push-only cycle without duplicating commits.
+  are ahead of the remote-tracking ref ``<remote>/<branch>``. Used BEFORE
+  the porcelain check to detect "prior run committed but push failed"
+  situations, so we can retry a push-only cycle without duplicating
+  commits. We use the refspec form rather than ``@{u}`` on purpose: our
+  :func:`push` deliberately does NOT set ``-u`` (the scheduler path must
+  not mutate git config), so ``@{u}`` would fail with "no upstream
+  configured". ``git push`` DOES auto-update the remote-tracking ref at
+  ``refs/remotes/<remote>/<branch>`` on success (verified via spike), so
+  from the second run onward the refspec comparison is well-defined.
 - :func:`reset_soft_head_one` — B-B2 helper. Called when ``push()`` returns
   ``"diverged"``; undoes the local commit while keeping the index + working
   tree intact so the next run can re-try cleanly.
@@ -136,14 +142,30 @@ def _run_git(
     deliberately do NOT raise :class:`subprocess.CalledProcessError` —
     that class's ``__str__`` includes the argv which may contain
     sensitive tokens; our ``RuntimeError`` message is curated.
+
+    Timeout handling (S-3): ``subprocess.TimeoutExpired`` is converted into
+    a sentinel :class:`GitResult` with ``rc=-1`` and stderr prefixed by
+    ``"timeout after ..."``. Callers that pass ``check=True`` still get a
+    :class:`RuntimeError` (the rc!=0 branch fires); :func:`push` classifies
+    the sentinel as a generic push failure → exit 8.
     """
-    proc = subprocess.run(  # noqa: S603 — `git` is a trusted binary, argv is validated
-        ["git", "-C", str(cwd), *args],
-        env=env if env is not None else _base_env(),
-        capture_output=True,
-        text=True,
-        timeout=timeout_s,
-    )
+    try:
+        proc = subprocess.run(  # noqa: S603 — `git` is a trusted binary, argv is validated
+            ["git", "-C", str(cwd), *args],
+            env=env if env is not None else _base_env(),
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        # S-3: normalise to GitResult so the whole callsite matrix (including
+        # push()/classify_verdict) can treat it uniformly. We keep the stderr
+        # format stable (``timeout after <N>s``) so tests can assert on it.
+        if check:
+            raise RuntimeError(
+                f"git {args!r} timed out after {timeout_s}s"
+            ) from None
+        return GitResult(-1, "", f"timeout after {timeout_s}s")
     if check and proc.returncode != 0:
         raise RuntimeError(
             f"git {args!r} failed rc={proc.returncode} stderr={proc.stderr[:200]!r}"
@@ -220,13 +242,28 @@ def commit(
     return head.stdout.strip()
 
 
-def unpushed_commit_count(vault_dir: Path) -> int:
-    """B-B2: number of commits on HEAD not reachable from upstream ``@{u}``.
+def unpushed_commit_count(vault_dir: Path, remote: str, branch: str) -> int:
+    """B-B2: number of commits on HEAD not reachable from ``<remote>/<branch>``.
 
-    Returns 0 if the branch has no configured upstream yet (``@{u}``
-    resolution fails with rc != 0) or if ``rev-list`` output is
-    unparseable — both of those cases are treated as "nothing to retry"
-    so a first-ever push goes through the normal stage-and-commit path.
+    T6.1 rewrite — the previous implementation used ``@{u}..HEAD`` which
+    required ``branch.<name>.remote`` + ``branch.<name>.merge`` config.
+    Our :func:`push` deliberately does NOT pass ``-u`` /
+    ``--set-upstream-to`` (the scheduler must not mutate config), so
+    ``@{u}`` never resolved in production → the B-B2 retry guard was
+    dead code. Using the refspec ``<remote>/<branch>..HEAD`` instead
+    works from the second successful push onward because ``git push``
+    auto-updates ``refs/remotes/<remote>/<branch>`` on success
+    (verified via spike R-refspec).
+
+    Returns 0 when:
+
+    - No remote-tracking ref exists yet (first-ever push — rev-list
+      exits non-zero with ``unknown revision``).
+    - ``rev-list --count`` output is unparseable (defensive; the
+      command emits a bare integer in every git version we've tested).
+
+    Both of these map to "nothing to retry" so the caller proceeds to
+    the normal stage-and-commit path, and the push itself is the check.
 
     Used BEFORE the porcelain change-detection step in
     ``_cmd_vault_commit_push``: if a previous run managed to commit
@@ -235,11 +272,14 @@ def unpushed_commit_count(vault_dir: Path) -> int:
     WITHOUT creating a new commit so there's no duplicate / dangling
     parent chain.
     """
-    r = _run_git(["rev-list", "@{u}..HEAD", "--count"], vault_dir)
+    r = _run_git(
+        ["rev-list", f"{remote}/{branch}..HEAD", "--count"], vault_dir
+    )
     if r.rc != 0:
-        # Upstream unknown (first push) or rev-list error. Both map to
-        # "nothing unpushed" — the caller will proceed to the normal
-        # stage-and-commit path, and the push itself is the check.
+        # Remote-tracking ref unknown (first push) or rev-list error.
+        # Both map to "nothing unpushed" — the caller will proceed to
+        # the normal stage-and-commit path, and the push itself is the
+        # check.
         return 0
     try:
         return int(r.stdout.strip() or "0")
@@ -328,10 +368,25 @@ def push(
     ``SSH_AUTH_SOCK``-provided identities. This is the reason
     :data:`_GIT_ENV_SCRUB_KEYS` can safely leave ``SSH_AUTH_SOCK`` in
     place.
+
+    ``-F /dev/null`` (T1.4) tells openssh to skip ALL ssh config files
+    (``/etc/ssh/ssh_config``, ``~/.ssh/config``). Without it, a hostile
+    or stale ``~/.ssh/config`` entry for ``github.com`` with a
+    ``ProxyCommand`` or ``RemoteCommand`` directive would execute even
+    though we pass an explicit ``-i`` key. This is the ssh-side twin of
+    the env-scrub philosophy — we want the push to be deterministic
+    regardless of the owner's shell-level ssh customisation.
+
+    S-3: a :class:`subprocess.TimeoutExpired` inside ``_run_git`` is
+    surfaced here as ``rc == -1`` with stderr starting ``"timeout
+    after"``. We classify that as ``"failed"`` (exit 8) rather than
+    "diverged" (exit 7) because a timeout tells us nothing about the
+    remote's ref state.
     """
     ssh_cmd = " ".join(
         [
             "ssh",
+            "-F", "/dev/null",
             "-i", shlex.quote(str(ssh_key_path)),
             "-o", "IdentitiesOnly=yes",
             "-o", "StrictHostKeyChecking=accept-new",
@@ -344,6 +399,12 @@ def push(
     )
     if r.rc == 0:
         return r, "ok"
+    if r.rc == -1 and r.stderr.startswith("timeout after"):
+        # S-3: a timeout is a network / remote-side issue; never a
+        # diverged ref. Map to generic push failure (exit 8) so the
+        # caller retries on the next tick instead of resetting HEAD
+        # (which would discard data).
+        return r, "failed"
     if DIVERGED_RE.search(r.stderr):
         return r, "diverged"
     return r, "failed"

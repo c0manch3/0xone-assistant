@@ -53,7 +53,7 @@ python tools/gh/main.py issue view 42 --repo OWNER/REPO
 python tools/gh/main.py issue create --repo OWNER/REPO --title "bug: X" --body "..."
 python tools/gh/main.py pr list --repo OWNER/REPO
 python tools/gh/main.py pr view 15 --repo OWNER/REPO
-python tools/gh/main.py repo view OWNER/REPO
+python tools/gh/main.py repo view --repo OWNER/REPO
 ```
 
 Все `--repo` проверяются через `GH_ALLOWED_REPOS` allowlist; неподходящий

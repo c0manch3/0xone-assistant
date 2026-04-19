@@ -219,6 +219,16 @@ _GH_SSH_URL_RE = re.compile(
 # Shell metacharacters B6 rejects in ssh key path.
 _SSH_KEY_BAD_CHARS = frozenset(" \t\n$;&|<>'\"\\`")
 
+# T2.4 — remote-name / branch-name character classes. Kept deliberately
+# narrow so argv-injection attempts like `--receive-pack=/bin/sh` or
+# `-o ProxyCommand=evil` are rejected at config load time, before the
+# value can ever reach `git push <remote> <branch>`. We use ``\A`` /
+# ``\Z`` anchors rather than ``^`` / ``$`` so a trailing newline does
+# NOT count as an end-of-string match (Python re ``$`` permits a
+# final ``\n`` which would be a silent bypass).
+_GH_REMOTE_NAME_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
+_GH_BRANCH_RE = re.compile(r"\A[A-Za-z0-9_./-]{1,200}\Z")
+
 
 class GitHubSettings(BaseSettings):
     """Phase-8 GitHub operations + vault auto-commit knobs.
@@ -288,6 +298,63 @@ class GitHubSettings(BaseSettings):
                 )
         return v
 
+    @field_validator("vault_remote_name")
+    @classmethod
+    def _validate_remote_name(cls, v: str) -> str:
+        """T2.4: reject remote names that could smuggle argv flags.
+
+        ``git push <remote> <branch>`` parses ``<remote>`` as a positional
+        argument, but a value like ``--receive-pack=/bin/sh`` would be
+        interpreted as an option. Restricting to alphanumerics + `_-`
+        plus an explicit ban on a leading ``-`` removes the attack
+        surface entirely.
+        """
+        if not _GH_REMOTE_NAME_RE.match(v):
+            raise ValueError(
+                f"vault_remote_name {v!r} must be 1-64 chars of "
+                "[A-Za-z0-9_-] (git remote-name charset)"
+            )
+        if v.startswith("-"):
+            raise ValueError(
+                f"vault_remote_name {v!r} starts with '-' "
+                "(argv-injection risk)"
+            )
+        return v
+
+    @field_validator("vault_branch")
+    @classmethod
+    def _validate_branch(cls, v: str) -> str:
+        """T2.4: enforce a subset of git ref-name rules that excludes argv
+        injection (``-foo``), path traversal (``..``), and git reserved
+        suffixes (``.lock``).
+
+        Not every git ref rule is enforced — we intentionally allow ``/``
+        and ``-`` (mid-name) because legitimate branches use them, and
+        the regex plus the prefix/suffix checks together are sufficient
+        to prevent the shapes that matter for our threat model.
+        """
+        if not _GH_BRANCH_RE.match(v):
+            raise ValueError(
+                f"vault_branch {v!r} must be 1-200 chars of "
+                "[A-Za-z0-9_./-]"
+            )
+        if ".." in v:
+            raise ValueError(f"vault_branch {v!r} contains '..'")
+        if v.startswith("-"):
+            raise ValueError(
+                f"vault_branch {v!r} starts with '-' (argv-injection risk)"
+            )
+        if v.startswith("/") or v.endswith("/"):
+            raise ValueError(
+                f"vault_branch {v!r} must not start or end with '/'"
+            )
+        if v.endswith(".lock"):
+            raise ValueError(
+                f"vault_branch {v!r} ends with '.lock' "
+                "(reserved by git ref machinery)"
+            )
+        return v
+
     @field_validator("vault_ssh_key_path", mode="before")
     @classmethod
     def _expand_ssh_key_path(cls, v: object) -> object:
@@ -318,6 +385,56 @@ class GitHubSettings(BaseSettings):
         if " -o " in s:
             raise ValueError(
                 f"vault_ssh_key_path contains ' -o ' substring; got: {s!r}"
+            )
+        return v
+
+    @field_validator("commit_message_template")
+    @classmethod
+    def _validate_commit_message_template(cls, v: str) -> str:
+        """S-6: reject templates with unknown format placeholders or bad types.
+
+        The only supported placeholder is ``{date}``. An operator typo
+        like ``"{user}"`` would otherwise fail inside ``str.format`` at
+        commit time — which is a worse place to fail because the CLI
+        has already acquired the flock and staged the commit. Failing
+        at config load time keeps the daemon's error path predictable.
+        """
+        try:
+            v.format(date="2025-01-01")
+        except KeyError as exc:
+            placeholder = exc.args[0] if exc.args else "<unknown>"
+            raise ValueError(
+                f"commit_message_template has unknown placeholder "
+                f"{placeholder!r}; only {{date}} is supported"
+            ) from exc
+        except Exception as exc:
+            # `str.format` can raise ValueError / IndexError / TypeError
+            # depending on the template shape; normalise to ValueError so
+            # pydantic wraps into a ValidationError consistent with the
+            # other validators in this class.
+            raise ValueError(
+                f"commit_message_template {v!r} invalid: {exc}"
+            ) from exc
+        return v
+
+    @field_validator("commit_author_email")
+    @classmethod
+    def _validate_commit_author_email(cls, v: str) -> str:
+        """S-6: reject control characters / newlines in the commit author email.
+
+        ``git commit -c user.email=<v>`` does not sanitise the value
+        beyond what the commit-object parser enforces. A newline inside
+        ``v`` would let an attacker inject additional header fields
+        into the commit object. Stripping the attack surface here —
+        BEFORE the value ever reaches argv — is cheap and safe.
+        """
+        if "\n" in v or "\r" in v:
+            raise ValueError(
+                "commit_author_email must not contain newline characters"
+            )
+        if any(ord(c) < 0x20 for c in v):
+            raise ValueError(
+                "commit_author_email must not contain control characters"
             )
         return v
 

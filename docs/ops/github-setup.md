@@ -207,10 +207,32 @@ launchctl kickstart -k gui/$(id -u)/com.agent2.0xone-assistant
 ```
 
 To override the schedule without disabling it (e.g. run at 04:15
-instead of 03:00): edit `GH_AUTO_COMMIT_CRON` in `.env` and restart
-the daemon. The seed helper is idempotent — it updates the existing
-row's cron/tz if they diverge from settings (partial UNIQUE INDEX on
-`seed_key`, invariant I-8.6).
+instead of 03:00):
+
+```bash
+# 1. Edit GH_AUTO_COMMIT_CRON (or GH_AUTO_COMMIT_TZ) in .env:
+#    GH_AUTO_COMMIT_CRON=15 4 * * *
+
+# 2. Remove the existing seed row. `rm` writes a tombstone so the
+#    daemon does not consider the deletion accidental (I-8.9):
+python tools/schedule/main.py ls
+python tools/schedule/main.py rm <id>
+
+# 3. Clear the tombstone so the next daemon start re-seeds:
+python tools/schedule/main.py revive-seed vault_auto_commit
+
+# 4. Restart the daemon — on startup the seed helper sees no
+#    tombstone and creates a fresh row using the updated cron/tz
+#    from GitHubSettings:
+launchctl kickstart -k gui/$(id -u)/com.agent2.0xone-assistant
+```
+
+The seed helper is **not** self-updating: it only seeds when the row
+is absent AND the tombstone is cleared. Editing `.env` alone has no
+effect on an already-seeded row — you must go through the rm +
+revive-seed + restart cycle above (this is deliberate: tombstone
+semantics protect the owner's manual `rm` from being undone by a
+config-file edit that happens to match the seed key).
 
 ## 9. Encryption warning (Q12)
 

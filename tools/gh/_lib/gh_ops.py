@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import subprocess
+from pathlib import Path
 from typing import Any
 
 # SF-C2 / SF-C3: every variant of GH-scoped token / host / config-dir /
@@ -40,13 +41,25 @@ def build_gh_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     """Return an env dict with all GH / SSH override variables removed.
 
     Copies `os.environ` (never mutates it), drops the scrub keys
-    enumerated in ``_GH_ENV_SCRUB_KEYS``, then applies ``extra`` overrides
-    on top. Callers that need to set `GIT_SSH_COMMAND` (vault-commit-push)
-    pass it via ``extra`` so they pick the exact invariants they want.
+    enumerated in ``_GH_ENV_SCRUB_KEYS``, pins ``HOME`` to the real
+    user-home (T5.1), then applies ``extra`` overrides on top.
+    Callers that need to set `GIT_SSH_COMMAND` (vault-commit-push) pass
+    it via ``extra`` so they pick the exact invariants they want.
+
+    T5.1 rationale: ``gh`` resolves ``~`` via ``HOME`` to find its OAuth
+    session at ``~/.config/gh/hosts.yml``. Under systemd / launchd, a
+    misconfigured service unit may set ``HOME=/var/empty`` or leave it
+    unset, at which point ``gh`` reports "not authenticated" even
+    though the owner's interactive shell session is valid. Pinning
+    ``HOME`` to :meth:`Path.home` (which consults ``pwd`` — the real
+    uid → home mapping from the system, NOT the env var) removes this
+    accidental foot-gun. If the operator genuinely wants a different
+    ``HOME``, they can still override via ``extra``.
     """
     env = dict(os.environ)
     for key in _GH_ENV_SCRUB_KEYS:
         env.pop(key, None)
+    env["HOME"] = str(Path.home())
     if extra:
         env.update(extra)
     return env

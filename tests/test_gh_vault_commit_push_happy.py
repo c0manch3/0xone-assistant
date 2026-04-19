@@ -140,3 +140,62 @@ def test_happy_retried_unpushed_false_for_fresh_commit(
     assert payload["retried_unpushed"] is False, (
         "fresh commit must not be labelled as a retry"
     )
+
+
+def test_happy_push_constructs_ssh_cmd_with_config_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """T1.4: the ``GIT_SSH_COMMAND`` sent to ``git push`` must include
+    ``-F /dev/null`` so ``~/.ssh/config`` ProxyCommand entries cannot
+    inject unintended execution.
+
+    We capture the env handed to ``subprocess.run`` for the ``git push``
+    call and inspect ``GIT_SSH_COMMAND``. Passthrough for every other
+    invocation so the full bootstrap + commit pipeline still runs
+    against real git binaries.
+    """
+    env = install_file_remote(monkeypatch, tmp_path)
+    env.vault_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    (env.vault_dir / "note.md").write_text("content\n")
+
+    captured_ssh_cmd: list[str] = []
+
+    from tools.gh._lib import git_ops
+
+    real_run = git_ops.subprocess.run
+
+    def _capture(*args, **kwargs):  # type: ignore[no-untyped-def]
+        cmd = args[0] if args else kwargs.get("args")
+        if (
+            isinstance(cmd, list)
+            and len(cmd) >= 4
+            and cmd[0] == "git"
+            and cmd[1] == "-C"
+            and cmd[3] == "push"
+        ):
+            env_kwarg = kwargs.get("env") or {}
+            ssh_cmd = env_kwarg.get("GIT_SSH_COMMAND", "")
+            captured_ssh_cmd.append(ssh_cmd)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(git_ops.subprocess, "run", _capture)
+
+    rc = gh_main.main(["vault-commit-push"])
+    assert rc == 0, f"expected rc=0; got {rc}"
+    capsys.readouterr()
+
+    assert captured_ssh_cmd, (
+        "T1.4: git push was never invoked with a GIT_SSH_COMMAND env override"
+    )
+    ssh_cmd = captured_ssh_cmd[0]
+    # Core anti-injection flags must be present.
+    assert " -F /dev/null " in ssh_cmd or ssh_cmd.endswith(" -F /dev/null"), (
+        f"T1.4: expected '-F /dev/null' in ssh argv; got {ssh_cmd!r}"
+    )
+    assert "IdentitiesOnly=yes" in ssh_cmd, (
+        f"expected IdentitiesOnly=yes; got {ssh_cmd!r}"
+    )
+    assert "StrictHostKeyChecking=accept-new" in ssh_cmd
+    assert "UserKnownHostsFile=" in ssh_cmd
