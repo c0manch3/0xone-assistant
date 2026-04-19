@@ -214,15 +214,79 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 def cmd_rm(args: argparse.Namespace) -> int:
     """Soft-delete via enabled=0. Hard delete would drop trigger history,
-    which phase-7 observability will want to keep around."""
+    which phase-7 observability will want to keep around.
+
+    Phase 8 (B-D1): if the row carried a non-NULL ``seed_key``, insert
+    (or replace) a tombstone row in ``seed_tombstones`` inside the same
+    ``BEGIN IMMEDIATE`` transaction so the next ``Daemon.start()`` does
+    NOT autonomously re-seed. Soft-delete + tombstone must land
+    together — partial failure would either leak a tombstone (owner
+    can't see the disabled row) or leave the seed to be resurrected on
+    restart.
+
+    The existing sync sqlite3 pattern is preserved intentionally (phase-5
+    G-W2-x soft-delete contract). The async ``SchedulerStore.delete_schedule``
+    is left UNCHANGED and is not reachable from this CLI.
+    """
     conn = _connect()
     try:
-        cur = conn.execute("SELECT id FROM schedules WHERE id=?", (args.id,))
-        if cur.fetchone() is None:
+        cur = conn.execute(
+            "SELECT seed_key FROM schedules WHERE id=?", (args.id,)
+        )
+        row = cur.fetchone()
+        if row is None:
             return _fail(EXIT_NOT_FOUND, f"schedule {args.id} not found")
-        conn.execute("UPDATE schedules SET enabled=0 WHERE id=?", (args.id,))
+        seed_key = row[0]
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "UPDATE schedules SET enabled=0 WHERE id=?", (args.id,)
+            )
+            tombstoned: str | None = None
+            if seed_key:
+                conn.execute(
+                    "INSERT OR REPLACE INTO seed_tombstones(seed_key) "
+                    "VALUES (?)",
+                    (seed_key,),
+                )
+                tombstoned = seed_key
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        payload: dict[str, Any] = {"id": args.id, "deleted": True}
+        if tombstoned is not None:
+            payload["tombstoned_seed_key"] = tombstoned
+        return _ok(payload)
+    finally:
+        conn.close()
+
+
+def cmd_revive_seed(args: argparse.Namespace) -> int:
+    """Remove a seed-tombstone so the next ``Daemon.start()`` re-seeds.
+
+    No-op (``tombstone_removed=False``) if no tombstone exists for the
+    supplied ``seed_key`` — the CLI reports the state instead of raising,
+    so a tab-complete-typo or double-invocation is not a script-breaker.
+
+    Note: reviving the tombstone does NOT automatically re-enable any
+    soft-deleted row. The operator must additionally run
+    ``schedule enable <id>`` (on the existing soft-deleted seed row) or
+    restart the Daemon so the seed helper can INSERT a fresh row —
+    documented in ``docs/ops/github-setup.md``.
+
+    Same sync sqlite3 pattern as ``cmd_rm`` — the async
+    ``SchedulerStore.delete_tombstone`` is left UNCHANGED (B-D1).
+    """
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "DELETE FROM seed_tombstones WHERE seed_key=?",
+            (args.seed_key,),
+        )
+        removed = (cur.rowcount or 0) > 0
         conn.commit()
-        return _ok({"id": args.id, "deleted": True})
+        return _ok({"seed_key": args.seed_key, "tombstone_removed": removed})
     finally:
         conn.close()
 
@@ -310,13 +374,29 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # rm / enable / disable — share the positional-ID shape
     for name, func, help_ in (
-        ("rm", cmd_rm, "Soft-delete a schedule (set enabled=0)"),
+        (
+            "rm",
+            cmd_rm,
+            "Soft-delete a schedule (enabled=0); seed rows also get tombstoned",
+        ),
         ("enable", cmd_enable, "Enable a schedule"),
         ("disable", cmd_disable, "Disable a schedule"),
     ):
         sp = sub.add_parser(name, help=help_)
         sp.add_argument("id", type=int)
         sp.set_defaults(func=func)
+
+    # revive-seed
+    p_revive = sub.add_parser(
+        "revive-seed",
+        help="Remove a seed-tombstone so Daemon re-seeds on next start",
+    )
+    p_revive.add_argument(
+        "seed_key",
+        type=str,
+        help="Seed key to revive (e.g. 'vault_auto_commit')",
+    )
+    p_revive.set_defaults(func=cmd_revive_seed)
 
     # history
     p_hist = sub.add_parser("history", help="Show recent trigger rows")
