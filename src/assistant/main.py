@@ -690,7 +690,18 @@ class Daemon:
         # Adapter MUST be built BEFORE the hook factory — the hooks
         # close over it to deliver the notify. Build adapter first, then
         # hooks, then both bridges, then register the handler.
-        self._adapter = TelegramAdapter(self._settings)
+        #
+        # Phase 7 fix-pack C1: the adapter receives the SAME
+        # `_dedup_ledger` the scheduler dispatcher and subagent Stop
+        # hook already share. This closes the I-7.5 gap where main-turn
+        # replies emitting an outbox artefact path were sent as raw
+        # text — they now route through `dispatch_reply`, deliver
+        # photo/document/audio, strip the path token from the cleaned
+        # text, and participate in the shared at-most-once key.
+        self._adapter = TelegramAdapter(
+            self._settings,
+            dedup_ledger=self._dedup_ledger,
+        )
 
         # B-W2-7: the split-notify message differentiates "prior daemon
         # crashed mid-subagent" from "pending CLI request sat past the

@@ -32,9 +32,14 @@ from assistant.main import Daemon
 
 
 class _DummyAdapter:
-    def __init__(self, settings: Any) -> None:
+    def __init__(self, settings: Any, *, dedup_ledger: Any = None) -> None:
+        # Phase 7 fix-pack C1: the daemon now threads the shared
+        # `_DedupLedger` through `TelegramAdapter.__init__`. The dummy
+        # accepts it as a kwarg and records it so the integration test
+        # can assert the same ledger reached all three call-sites.
         del settings
         self._handler: Any = None
+        self._dedup_ledger: Any = dedup_ledger
 
     def set_handler(self, handler: Any) -> None:
         self._handler = handler

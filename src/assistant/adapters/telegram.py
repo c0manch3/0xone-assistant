@@ -22,10 +22,11 @@ from assistant.adapters.base import (
     MediaKind,
     MessengerAdapter,
 )
+from assistant.adapters.dispatch_reply import _DedupLedger, dispatch_reply
 from assistant.config import Settings
 from assistant.logger import get_logger
 from assistant.media.download import SizeCapExceeded, download_telegram_file
-from assistant.media.paths import inbox_dir
+from assistant.media.paths import inbox_dir, outbox_dir
 
 log = get_logger("adapters.telegram")
 
@@ -115,8 +116,24 @@ def split_for_telegram(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
 
 
 class TelegramAdapter(MessengerAdapter):
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        dedup_ledger: _DedupLedger | None = None,
+    ) -> None:
         self._settings = settings
+        # Phase 7 fix-pack C1 — share the Daemon-scoped `_DedupLedger`
+        # so the main-turn outbox path in `_dispatch_to_handler` gets
+        # artefact delivery via `dispatch_reply` (photo/doc/audio
+        # send + cleaned text), participating in the same I-7.5
+        # at-most-once key `(resolved_path, chat_id)` that the
+        # scheduler dispatcher + subagent Stop hook already share.
+        # Back-compat: if the caller does not supply a ledger (legacy
+        # tests), `_dispatch_to_handler` falls back to raw `send_text`
+        # — artefacts will NOT be delivered, but a crash is not
+        # introduced and owner-facing behaviour matches pre-fix.
+        self._dedup_ledger = dedup_ledger
         # parse_mode=None — phase 2 sends plain text (Claude markdown would need
         # escaping); migration to MarkdownV2/HTML is deferred to phase 3+.
         self._bot = Bot(
@@ -513,9 +530,28 @@ class TelegramAdapter(MessengerAdapter):
     async def _dispatch_to_handler(self, chat_id: int, incoming: IncomingMessage) -> None:
         """Shared handler-invocation path for text + media turns.
 
-        Factors the emit-collect + typing-action + send_text tail out
-        of the five media handlers so the retry-wrapper semantics of
-        `send_text` apply uniformly across all ingress paths.
+        Factors the emit-collect + typing-action + reply-dispatch
+        tail out of the five media handlers so the retry-wrapper
+        semantics of `send_text` apply uniformly across all ingress
+        paths.
+
+        Phase 7 fix-pack C1: when a `_DedupLedger` was provided to the
+        adapter, route the final reply through `dispatch_reply` so a
+        main-turn outbox artefact path is delivered as
+        photo/document/audio and the cleaned text follows — identical
+        semantics to the scheduler + subagent Stop hook paths. This
+        also participates in the shared I-7.5 dedup key so the same
+        `(resolved_path, chat_id)` never gets sent twice when both the
+        main turn and a worker-subagent Stop hook mention the same
+        file within the ledger window.
+
+        Fix-pack I5 — the final send runs INSIDE the
+        `ChatActionSender.typing(...)` context. aiogram stops the
+        "typing..." indicator when the context exits; sending after
+        exit would briefly flash "no-typing" before the message
+        lands. Keeping the send inside preserves the UX invariant
+        that the indicator is visible up to the moment the reply
+        appears.
         """
         assert self._handler is not None  # caller guarantees
         chunks: list[str] = []
@@ -526,11 +562,23 @@ class TelegramAdapter(MessengerAdapter):
         async with ChatActionSender.typing(bot=self._bot, chat_id=chat_id):
             await self._handler.handle(incoming, emit)
 
-        full = "".join(chunks).strip()
-        if not full:
-            log.info("empty_reply_skipped", chat_id=chat_id)
-            return
-        await self.send_text(chat_id, full)
+            full = "".join(chunks).strip()
+            if not full:
+                log.info("empty_reply_skipped", chat_id=chat_id)
+                return
+            if self._dedup_ledger is not None:
+                await dispatch_reply(
+                    self,
+                    chat_id,
+                    full,
+                    outbox_root=outbox_dir(self._settings.data_dir),
+                    dedup=self._dedup_ledger,
+                    log_ctx={"origin": "telegram_main_turn"},
+                )
+            else:
+                # Back-compat for tests (+ any future adapter user
+                # that does not build the ledger): plain text path.
+                await self.send_text(chat_id, full)
 
     async def _on_shutdown(self) -> None:
         log.info("telegram_shutdown")
