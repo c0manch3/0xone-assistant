@@ -27,6 +27,7 @@ skills/*
 !skills/memory/
 !skills/scheduler/
 !skills/task/
+!skills/gh/
 
 # Same for runtime-installed tools/<name>/ (bundles that ship a top-level
 # tools/ subdir end up here after atomic_install). Only `ping` and
@@ -45,3 +46,4 @@ tools/*
 !tools/genimage/
 !tools/extract_doc/
 !tools/render_doc/
+!tools/gh/
