@@ -3,12 +3,17 @@
 Three PreToolUse guards register against
 `ClaudeAgentOptions.hooks["PreToolUse"]`:
 
-* `make_bash_hook(project_root)` — strict argv-based allowlist with
-  shell-metacharacter rejection. Slip-guard regex is kept ONLY as a last-ditch
-  defence-in-depth barrier (see `_BASH_SLIP_GUARD_RE`).
-* `make_file_hook(project_root)` — sandboxes `Read/Write/Edit/Glob/Grep` to
-  paths inside `project_root` via `Path.is_relative_to`. Refuses any pattern
-  containing `..` even when relative.
+* `make_bash_hook(project_root, data_dir=None)` — strict argv-based
+  allowlist with shell-metacharacter rejection. Slip-guard regex is kept
+  ONLY as a last-ditch defence-in-depth barrier (see `_BASH_SLIP_GUARD_RE`).
+  When `data_dir` is provided the phase-7 validators (`render_doc`,
+  `genimage`) gain additional path guards bound to
+  `<data_dir>/run/render-stage/`, `<data_dir>/media/outbox/`, etc.
+* `make_file_hook(project_root, data_dir=None)` — sandboxes
+  `Read/Write/Edit/Glob/Grep` to paths inside `project_root` via
+  `Path.is_relative_to`. Refuses any pattern containing `..` even when
+  relative. `data_dir` is reserved for phase-7 extensions (stage-dir
+  allowance) and currently unused.
 * `make_webfetch_hook()` — full SSRF defence: hostname is parsed via
   `urllib.parse`, classified through `ipaddress`, and DNS-resolved (with a
   3-second timeout) so that any A/AAAA pointing at a private/loopback/
@@ -17,6 +22,16 @@ Three PreToolUse guards register against
 Phase 3 adds a PostToolUse matcher (`make_posttool_hooks`) that touches
 `<data_dir>/run/skills.dirty` whenever Write/Edit lands inside `skills/` or
 `tools/` — the sentinel drives hot-reload of the manifest cache.
+
+Phase 7 (commit 11) extends the Bash allowlist with four CLI validators
+(`tools/transcribe`, `tools/genimage`, `tools/extract_doc`, `tools/render_doc`).
+The factory surface gains an optional `data_dir: Path | None = None` kwarg
+so the 9 existing phase-3/5/6 test call sites that construct factories
+without a data dir stay green. When `data_dir is None` and the argv
+targets `tools/render_doc/main.py`, the hook denies with
+"render-doc requires data_dir-bound hooks" — render_doc's path guards
+depend on the `<data_dir>/run/render-stage/` and `<data_dir>/media/outbox/`
+roots, which cannot be validated without the bound directory.
 
 All return the canonical SDK hook reply shape — `{}` (allow / no-op) or
 `_deny(reason)` (PreToolUse deny). Reasoning is logged via the structured
@@ -120,6 +135,35 @@ _SCHEDULE_SUBCMDS: frozenset[str] = frozenset({"add", "list", "rm", "enable", "d
 _SCHEDULE_PROMPT_MAX_BYTES = 2048
 _SCHEDULE_TZ_MAX_CHARS = 64
 _UV_RUN_ALLOWED_PREFIXES: tuple[str, ...] = ("tools/", "skills/")
+
+# Phase 7: argv gates for media CLIs (transcribe / genimage / extract_doc /
+# render_doc). Each mirrors the phase-5/6 shape: enum subcommands where
+# relevant, flag whitelist, dup-flag deny, integer/range caps on free-form
+# values. `render_doc` additionally enforces path roots bound to the
+# daemon's `data_dir` — without it, render invocations are refused entirely
+# (the path guards cannot be satisfied).
+_TRANSCRIBE_LANG_VALUES: frozenset[str] = frozenset({"auto", "en", "ru"})
+_TRANSCRIBE_FORMAT_VALUES: frozenset[str] = frozenset({"segments", "text"})
+_TRANSCRIBE_TIMEOUT_MIN_S = 10
+_TRANSCRIBE_TIMEOUT_MAX_S = 300
+
+_GENIMAGE_PROMPT_MAX_BYTES = 1024
+_GENIMAGE_SIZE_VALUES: frozenset[int] = frozenset({256, 512, 768, 1024})
+_GENIMAGE_STEPS_MIN = 1
+_GENIMAGE_STEPS_MAX = 20
+_GENIMAGE_SEED_MIN = 0
+_GENIMAGE_SEED_MAX = 2**31 - 1
+_GENIMAGE_TIMEOUT_MIN_S = 10
+_GENIMAGE_TIMEOUT_MAX_S = 600
+_GENIMAGE_DAILY_CAP_MIN = 0
+_GENIMAGE_DAILY_CAP_MAX = 1_000
+
+_EXTRACT_DOC_MAX_CHARS_CAP = 2_000_000
+_EXTRACT_DOC_PAGES_RE = re.compile(r"^\d+(-\d+)?$")
+
+_RENDER_DOC_TITLE_MAX_BYTES = 256
+_RENDER_DOC_FONT_MAX_CHARS = 64
+_RENDER_DOC_ALLOWED_OUT_SUFFIXES: tuple[str, ...] = (".pdf", ".docx")
 
 # Phase 6: argv gate for `python tools/task/main.py <sub>`.
 # Mirrors the phase-5 schedule validator — enum subcommands, dup-flag
@@ -276,7 +320,12 @@ def _has_dotdot(parts: tuple[str, ...]) -> bool:
     return any(part == ".." for part in parts)
 
 
-def _validate_python_invocation(argv: list[str], project_root: Path) -> str | None:
+def _validate_python_invocation(
+    argv: list[str],
+    project_root: Path,
+    *,
+    data_dir: Path | None = None,
+) -> str | None:
     if len(argv) < 2:
         return "python requires a script argument"
     script = argv[1]
@@ -298,6 +347,20 @@ def _validate_python_invocation(argv: list[str], project_root: Path) -> str | No
     # Phase 6: argv gate for the task CLI.
     if script == "tools/task/main.py":
         return _validate_task_argv(argv[2:])
+    # Phase 7: argv gates for the four media CLIs. `render_doc` needs
+    # `data_dir` to resolve its two mandatory path roots; denied outright
+    # without it so the refusal carries a precise operator-facing reason
+    # rather than an opaque path-guard failure.
+    if script == "tools/transcribe/main.py":
+        return _validate_transcribe_argv(argv[2:])
+    if script == "tools/genimage/main.py":
+        return _validate_genimage_argv(argv[2:], data_dir=data_dir)
+    if script == "tools/extract_doc/main.py":
+        return _validate_extract_doc_argv(argv[2:], project_root=project_root)
+    if script == "tools/render_doc/main.py":
+        if data_dir is None:
+            return "render-doc requires data_dir-bound hooks"
+        return _validate_render_doc_argv(argv[2:], data_dir=data_dir)
     return None
 
 
@@ -499,6 +562,386 @@ def _validate_task_argv(args: list[str]) -> str | None:
     return f"task subcommand {sub!r} missing validator"
 
 
+# -----------------------------------------------------------------------------
+# Phase 7 media CLIs — transcribe / genimage / extract_doc / render_doc.
+# -----------------------------------------------------------------------------
+
+
+def _is_loopback_only_endpoint(url: str) -> bool:
+    """Quick argv-side sanity check: endpoint must be an http/https URL with a
+    loopback literal as hostname. DNS is NOT resolved here — the CLI itself
+    runs the authoritative `is_loopback_only(url)` check (S-1 spike), so this
+    hook-side rule only needs to block the obvious bypass shapes
+    (schemes other than http(s), missing host, public IP literal, hostname
+    that is neither `localhost` nor a loopback IP literal).
+    """
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    hostname = (parsed.hostname or "").strip().lower()
+    if not hostname:
+        return False
+    if hostname == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        # Non-literal hostname that is not `localhost`. The CLI will run
+        # the full DNS-resolving `is_loopback_only` check at runtime; we
+        # refuse here to keep argv-side behaviour predictable.
+        return False
+    return bool(ip.is_loopback)
+
+
+def _validate_path_argument(
+    arg: str,
+    *,
+    must_be_absolute: bool,
+    label: str,
+) -> tuple[Path | None, str | None]:
+    """Shared path-argv primitive — reject `..`, enforce absolute-ness.
+
+    Returns (resolved_path | None, deny_reason | None). Resolution is
+    lexical (`Path(...)`) — we do NOT touch the filesystem here because
+    the validator runs before the CLI launches.
+    """
+    if not arg:
+        return None, f"{label} requires a non-empty value"
+    if arg.startswith("-"):
+        return None, f"{label} value {arg!r} looks like a flag"
+    path = Path(arg)
+    if _has_dotdot(path.parts):
+        return None, f"{label} must not contain '..'"
+    if must_be_absolute and not path.is_absolute():
+        return None, f"{label} must be an absolute path; got {arg!r}"
+    return path, None
+
+
+def _consume_flag_value(flag: str, remaining: list[str], i: int) -> tuple[str | None, str | None]:
+    """`--flag value` -> (value, None) or (None, deny-reason)."""
+    if i + 1 >= len(remaining):
+        return None, f"flag {flag} requires a value"
+    return remaining[i + 1], None
+
+
+def _validate_transcribe_argv(args: list[str]) -> str | None:
+    """Phase 7 bash-hook gate for `python tools/transcribe/main.py ...`.
+
+    Shape (per tools/transcribe/main.py --help):
+      ``<path> [--language {auto,en,ru}] [--timeout-s N] [--format {segments,text}]
+       [--endpoint URL]``
+
+    * The positional `<path>` must be an absolute file path without `..`.
+    * `--endpoint` must be loopback (http(s) scheme, localhost or a
+      loopback IP literal). DNS resolution is left to the CLI itself.
+    * Flags must not repeat (wave-2 B-W2-5 lesson).
+    """
+    allowed_flags = {"--language", "--timeout-s", "--format", "--endpoint"}
+    positional: list[str] = []
+    seen: set[str] = set()
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok in allowed_flags:
+            if tok in seen:
+                return f"transcribe: duplicate flag {tok!r}"
+            seen.add(tok)
+            val, reason = _consume_flag_value(tok, args, i)
+            if reason is not None:
+                return f"transcribe: {reason}"
+            assert val is not None  # for mypy — _consume_flag_value guarantees pair
+            if tok == "--language" and val not in _TRANSCRIBE_LANG_VALUES:
+                return f"transcribe: --language must be one of {sorted(_TRANSCRIBE_LANG_VALUES)}"
+            if tok == "--format" and val not in _TRANSCRIBE_FORMAT_VALUES:
+                return f"transcribe: --format must be one of {sorted(_TRANSCRIBE_FORMAT_VALUES)}"
+            if tok == "--timeout-s":
+                try:
+                    n = int(val)
+                except ValueError:
+                    return "transcribe: --timeout-s must be integer"
+                if n < _TRANSCRIBE_TIMEOUT_MIN_S or n > _TRANSCRIBE_TIMEOUT_MAX_S:
+                    return (
+                        f"transcribe: --timeout-s must be "
+                        f"{_TRANSCRIBE_TIMEOUT_MIN_S}..{_TRANSCRIBE_TIMEOUT_MAX_S}"
+                    )
+            if tok == "--endpoint" and not _is_loopback_only_endpoint(val):
+                return "transcribe: --endpoint must be http(s) loopback-only"
+            i += 2
+            continue
+        if tok.startswith("-"):
+            return f"transcribe: flag {tok!r} not allowed"
+        positional.append(tok)
+        i += 1
+    if len(positional) != 1:
+        return "transcribe: exactly one positional <path> required"
+    _path, reason = _validate_path_argument(
+        positional[0], must_be_absolute=True, label="transcribe: <path>"
+    )
+    if reason is not None:
+        return reason
+    return None
+
+
+def _validate_genimage_argv(args: list[str], *, data_dir: Path | None) -> str | None:
+    """Phase 7 bash-hook gate for `python tools/genimage/main.py ...`.
+
+    Required flags: ``--prompt TEXT --out PATH``.
+    Optional: ``--width/--height`` ∈ {256,512,768,1024}; ``--steps`` 1..20;
+    ``--seed`` 0..2^31-1; ``--timeout-s`` 10..600; ``--endpoint`` loopback;
+    ``--daily-cap`` 0..1000; ``--quota-file`` absolute.
+
+    When `data_dir` is provided the `--out` path is further constrained to
+    live under ``<data_dir>/media/outbox/`` and the optional
+    ``--quota-file`` under ``<data_dir>/run/``. Without `data_dir` we only
+    require `--out` to be an absolute path (phase-7 daemon always wires
+    `data_dir` in; call sites that lack it stay permissive so phase-3..6
+    tests keep passing).
+    """
+    allowed_flags = {
+        "--prompt",
+        "--out",
+        "--width",
+        "--height",
+        "--steps",
+        "--seed",
+        "--timeout-s",
+        "--endpoint",
+        "--daily-cap",
+        "--quota-file",
+    }
+    required = {"--prompt", "--out"}
+    seen: dict[str, str] = {}
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok not in allowed_flags:
+            return f"genimage: flag {tok!r} not allowed"
+        if tok in seen:
+            return f"genimage: duplicate flag {tok!r}"
+        val, reason = _consume_flag_value(tok, args, i)
+        if reason is not None:
+            return f"genimage: {reason}"
+        assert val is not None
+        seen[tok] = val
+        if tok == "--prompt":
+            if "\n" in val or "\r" in val:
+                return "genimage: --prompt must not contain newlines"
+            if len(val.encode("utf-8")) > _GENIMAGE_PROMPT_MAX_BYTES:
+                return f"genimage: --prompt exceeds {_GENIMAGE_PROMPT_MAX_BYTES} bytes"
+        elif tok == "--out":
+            out_path, path_reason = _validate_path_argument(
+                val, must_be_absolute=True, label="genimage: --out"
+            )
+            if path_reason is not None:
+                return path_reason
+            assert out_path is not None
+            if out_path.suffix.lower() != ".png":
+                return "genimage: --out must end in .png"
+            if data_dir is not None:
+                outbox = data_dir / "media" / "outbox"
+                if not _path_safely_inside(out_path, outbox):
+                    return f"genimage: --out must live under {outbox}"
+        elif tok in ("--width", "--height"):
+            try:
+                n = int(val)
+            except ValueError:
+                return f"genimage: {tok} must be integer"
+            if n not in _GENIMAGE_SIZE_VALUES:
+                return f"genimage: {tok} must be one of {sorted(_GENIMAGE_SIZE_VALUES)}"
+        elif tok == "--steps":
+            try:
+                n = int(val)
+            except ValueError:
+                return "genimage: --steps must be integer"
+            if n < _GENIMAGE_STEPS_MIN or n > _GENIMAGE_STEPS_MAX:
+                return f"genimage: --steps must be {_GENIMAGE_STEPS_MIN}..{_GENIMAGE_STEPS_MAX}"
+        elif tok == "--seed":
+            try:
+                n = int(val)
+            except ValueError:
+                return "genimage: --seed must be integer"
+            if n < _GENIMAGE_SEED_MIN or n > _GENIMAGE_SEED_MAX:
+                return f"genimage: --seed must be {_GENIMAGE_SEED_MIN}..{_GENIMAGE_SEED_MAX}"
+        elif tok == "--timeout-s":
+            try:
+                n = int(val)
+            except ValueError:
+                return "genimage: --timeout-s must be integer"
+            if n < _GENIMAGE_TIMEOUT_MIN_S or n > _GENIMAGE_TIMEOUT_MAX_S:
+                return (
+                    f"genimage: --timeout-s must be "
+                    f"{_GENIMAGE_TIMEOUT_MIN_S}..{_GENIMAGE_TIMEOUT_MAX_S}"
+                )
+        elif tok == "--endpoint":
+            if not _is_loopback_only_endpoint(val):
+                return "genimage: --endpoint must be http(s) loopback-only"
+        elif tok == "--daily-cap":
+            try:
+                n = int(val)
+            except ValueError:
+                return "genimage: --daily-cap must be integer"
+            if n < _GENIMAGE_DAILY_CAP_MIN or n > _GENIMAGE_DAILY_CAP_MAX:
+                return (
+                    f"genimage: --daily-cap must be "
+                    f"{_GENIMAGE_DAILY_CAP_MIN}..{_GENIMAGE_DAILY_CAP_MAX}"
+                )
+        elif tok == "--quota-file":
+            quota_path, path_reason = _validate_path_argument(
+                val, must_be_absolute=True, label="genimage: --quota-file"
+            )
+            if path_reason is not None:
+                return path_reason
+            assert quota_path is not None
+            if data_dir is not None:
+                run_dir = data_dir / "run"
+                if not _path_safely_inside(quota_path, run_dir):
+                    return f"genimage: --quota-file must live under {run_dir}"
+        i += 2
+    missing = required - seen.keys()
+    if missing:
+        return f"genimage: missing required flag(s) {sorted(missing)}"
+    return None
+
+
+def _validate_extract_doc_argv(args: list[str], *, project_root: Path) -> str | None:
+    """Phase 7 bash-hook gate for `python tools/extract_doc/main.py ...`.
+
+    Shape: ``<path> [--max-chars N] [--pages N[-M]]``.
+
+    * Positional `<path>` must not contain `..`; absolute OR relative-to-
+      project_root is acceptable (the CLI resolves + `is_file()` checks).
+    * `--max-chars` ∈ 1..2_000_000 (CLI hard cap).
+    * `--pages` must match ``^\\d+(-\\d+)?$`` (1-based inclusive range).
+    """
+    allowed_flags = {"--max-chars", "--pages"}
+    positional: list[str] = []
+    seen: set[str] = set()
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok in allowed_flags:
+            if tok in seen:
+                return f"extract_doc: duplicate flag {tok!r}"
+            seen.add(tok)
+            val, reason = _consume_flag_value(tok, args, i)
+            if reason is not None:
+                return f"extract_doc: {reason}"
+            assert val is not None
+            if tok == "--max-chars":
+                try:
+                    n = int(val)
+                except ValueError:
+                    return "extract_doc: --max-chars must be integer"
+                if n < 1 or n > _EXTRACT_DOC_MAX_CHARS_CAP:
+                    return f"extract_doc: --max-chars must be 1..{_EXTRACT_DOC_MAX_CHARS_CAP}"
+            elif tok == "--pages":
+                if not _EXTRACT_DOC_PAGES_RE.match(val):
+                    return "extract_doc: --pages must match 'N' or 'N-M'"
+                parts = val.split("-")
+                if len(parts) == 2:
+                    lo, hi = int(parts[0]), int(parts[1])
+                    if lo < 1 or hi < lo:
+                        return "extract_doc: --pages range must be 1-based and ascending"
+                else:
+                    if int(parts[0]) < 1:
+                        return "extract_doc: --pages must be 1-based"
+            i += 2
+            continue
+        if tok.startswith("-"):
+            return f"extract_doc: flag {tok!r} not allowed"
+        positional.append(tok)
+        i += 1
+    if len(positional) != 1:
+        return "extract_doc: exactly one positional <path> required"
+    path_str = positional[0]
+    path, reason = _validate_path_argument(
+        path_str, must_be_absolute=False, label="extract_doc: <path>"
+    )
+    if reason is not None:
+        return reason
+    assert path is not None
+    # Relative paths must still stay inside project_root (defence-in-depth;
+    # absolute paths are left to the CLI's own `is_file()` guard since
+    # media inboxes typically live outside project_root).
+    if not path.is_absolute() and not _path_safely_inside(project_root / path, project_root):
+        return "extract_doc: relative <path> escapes project_root"
+    return None
+
+
+def _validate_render_doc_argv(args: list[str], *, data_dir: Path) -> str | None:
+    """Phase 7 bash-hook gate for `python tools/render_doc/main.py ...`.
+
+    Required: ``--body-file PATH --out PATH``. Optional: ``--title T``,
+    ``--font F``.
+
+    Path roots (bound to `data_dir`):
+      * ``--body-file`` MUST live under ``<data_dir>/run/render-stage/``.
+      * ``--out`` MUST live under ``<data_dir>/media/outbox/`` and end in
+        ``.pdf`` or ``.docx``.
+
+    Callers without a `data_dir` are rejected upstream in
+    `_validate_python_invocation` ("render-doc requires data_dir-bound
+    hooks") — the path guards below assume `data_dir` is a valid Path.
+    """
+    allowed_flags = {"--body-file", "--out", "--title", "--font"}
+    required = {"--body-file", "--out"}
+    seen: dict[str, str] = {}
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok not in allowed_flags:
+            return f"render_doc: flag {tok!r} not allowed"
+        if tok in seen:
+            return f"render_doc: duplicate flag {tok!r}"
+        val, reason = _consume_flag_value(tok, args, i)
+        if reason is not None:
+            return f"render_doc: {reason}"
+        assert val is not None
+        seen[tok] = val
+        if tok == "--body-file":
+            body_path, path_reason = _validate_path_argument(
+                val, must_be_absolute=True, label="render_doc: --body-file"
+            )
+            if path_reason is not None:
+                return path_reason
+            assert body_path is not None
+            stage = data_dir / "run" / "render-stage"
+            if not _path_safely_inside(body_path, stage):
+                return f"render_doc: --body-file must live under {stage}"
+        elif tok == "--out":
+            out_path, path_reason = _validate_path_argument(
+                val, must_be_absolute=True, label="render_doc: --out"
+            )
+            if path_reason is not None:
+                return path_reason
+            assert out_path is not None
+            if out_path.suffix.lower() not in _RENDER_DOC_ALLOWED_OUT_SUFFIXES:
+                return (
+                    f"render_doc: --out must end in one of {list(_RENDER_DOC_ALLOWED_OUT_SUFFIXES)}"
+                )
+            outbox = data_dir / "media" / "outbox"
+            if not _path_safely_inside(out_path, outbox):
+                return f"render_doc: --out must live under {outbox}"
+        elif tok == "--title":
+            if "\n" in val or "\r" in val:
+                return "render_doc: --title must not contain newlines"
+            if len(val.encode("utf-8")) > _RENDER_DOC_TITLE_MAX_BYTES:
+                return f"render_doc: --title exceeds {_RENDER_DOC_TITLE_MAX_BYTES} bytes"
+        elif tok == "--font":
+            if len(val) > _RENDER_DOC_FONT_MAX_CHARS:
+                return f"render_doc: --font exceeds {_RENDER_DOC_FONT_MAX_CHARS} chars"
+        i += 2
+    missing = required - seen.keys()
+    if missing:
+        return f"render_doc: missing required flag(s) {sorted(missing)}"
+    return None
+
+
 def _validate_uv_run(argv: list[str], project_root: Path) -> str | None:
     # `uv run <path>` — no flags, path must live under an allowed prefix.
     if len(argv) < 3:
@@ -687,7 +1130,12 @@ def _validate_echo_invocation(argv: list[str]) -> str | None:
     return None
 
 
-def _validate_bash_argv(argv: list[str], project_root: Path) -> str | None:
+def _validate_bash_argv(
+    argv: list[str],
+    project_root: Path,
+    *,
+    data_dir: Path | None = None,
+) -> str | None:
     if not argv:
         return "empty command"
     program_path = argv[0]
@@ -696,7 +1144,7 @@ def _validate_bash_argv(argv: list[str], project_root: Path) -> str | None:
         return f"program '{program}' is not in allowlist {sorted(_BASH_PROGRAMS)}"
     match program:
         case "python":
-            return _validate_python_invocation(argv, project_root)
+            return _validate_python_invocation(argv, project_root, data_dir=data_dir)
         case "uv":
             return _validate_uv_invocation(argv, project_root)
         case "git":
@@ -715,8 +1163,20 @@ def _validate_bash_argv(argv: list[str], project_root: Path) -> str | None:
             return f"program '{program}' has no validator"
 
 
-def check_bash_command(cmd: str, project_root: Path) -> str | None:
-    """Public for tests: validate a Bash command, return deny-reason or None."""
+def check_bash_command(
+    cmd: str,
+    project_root: Path,
+    *,
+    data_dir: Path | None = None,
+) -> str | None:
+    """Public for tests: validate a Bash command, return deny-reason or None.
+
+    `data_dir` is the phase-7 addition — forwarded to the python-invocation
+    validator so the `render_doc` / `genimage` path guards can bind to
+    ``<data_dir>/run/render-stage/`` and ``<data_dir>/media/outbox/``.
+    Default `None` preserves the phase-3/5/6 call shape; pre-phase-7 test
+    call sites stay green.
+    """
     raw = cmd.strip()
     if not raw:
         return "empty command"
@@ -727,7 +1187,7 @@ def check_bash_command(cmd: str, project_root: Path) -> str | None:
         argv = shlex.split(raw)
     except ValueError as exc:
         return f"unparseable command (shlex): {exc}"
-    reason = _validate_bash_argv(argv, project_root)
+    reason = _validate_bash_argv(argv, project_root, data_dir=data_dir)
     if reason is not None:
         return reason
     if _BASH_SLIP_GUARD_RE.search(cmd):
@@ -735,8 +1195,20 @@ def check_bash_command(cmd: str, project_root: Path) -> str | None:
     return None
 
 
-def make_bash_hook(project_root: Path) -> HookFn:
-    """Build the Bash PreToolUse hook bound to `project_root`."""
+def make_bash_hook(
+    project_root: Path,
+    data_dir: Path | None = None,
+) -> HookFn:
+    """Build the Bash PreToolUse hook bound to `project_root`.
+
+    `data_dir` (phase-7 addition, keyword-defaulted to `None`) binds the
+    `render_doc` / `genimage` path-guard validators to
+    ``<data_dir>/run/render-stage/`` and ``<data_dir>/media/outbox/``.
+    When `None`, any `tools/render_doc/main.py` invocation is denied
+    ("render-doc requires data_dir-bound hooks"); `tools/genimage/main.py`
+    stays permissive on its `--out` / `--quota-file` paths (CLI-side
+    guards remain the authoritative layer).
+    """
 
     async def bash_hook(
         input_data: HookInput,
@@ -748,7 +1220,7 @@ def make_bash_hook(project_root: Path) -> HookFn:
         raw: dict[str, Any] = cast(dict[str, Any], input_data)
         tool_input = raw.get("tool_input") or {}
         cmd = str(tool_input.get("command", "") or "")
-        reason = check_bash_command(cmd, project_root)
+        reason = check_bash_command(cmd, project_root, data_dir=data_dir)
         if reason is not None:
             log.warning(
                 "pretool_decision",
@@ -791,13 +1263,24 @@ def check_file_path(raw_path: str, project_root_resolved: Path) -> str | None:
     return None
 
 
-def make_file_hook(project_root: Path) -> HookFn:
+def make_file_hook(
+    project_root: Path,
+    data_dir: Path | None = None,
+) -> HookFn:
     """Build the file-tool PreToolUse hook bound to `project_root`.
 
     The same hook is registered against Read/Write/Edit/Glob/Grep -- see
     `FILE_TOOLS` for the complete list. SDK gives us `tool_name` so the hook
     can branch on it for tool-specific input keys (Glob has `pattern`, etc.).
+
+    `data_dir` (phase-7 addition, keyword-defaulted to `None`) is reserved
+    for future extensions that allow Write/Edit inside
+    ``<data_dir>/run/render-stage/`` (the body-file source for
+    `tools/render_doc/`). The current policy still sandboxes to
+    `project_root` only — the extension slot exists so upstream callers
+    can migrate without another signature break.
     """
+    del data_dir  # reserved for future use; see docstring
     root_resolved = project_root.resolve()
 
     async def file_hook(
@@ -900,18 +1383,29 @@ def make_webfetch_hook(*, dns_timeout: float = 3.0) -> HookFn:
 # -----------------------------------------------------------------------------
 
 
-def make_pretool_hooks(project_root: Path) -> list[Any]:
+def make_pretool_hooks(
+    project_root: Path,
+    data_dir: Path | None = None,
+) -> list[Any]:
     """Return the canonical PreToolUse `HookMatcher` list for ClaudeBridge.
 
     Importing `HookMatcher` lazily keeps `bridge/hooks.py` a pure-validation
     module with no SDK-options coupling for unit tests; only this aggregator
     pulls in `claude_agent_sdk.HookMatcher`.
+
+    `data_dir` is keyword-defaulted to `None` so the 9 existing phase-3/5/6
+    test call sites that construct the factory without a data dir continue
+    to work. When `None`, the Bash hook refuses `tools/render_doc/main.py`
+    outright (see `make_bash_hook` docstring).
     """
     from claude_agent_sdk import HookMatcher
 
     return [
-        HookMatcher(matcher="Bash", hooks=[make_bash_hook(project_root)]),
-        *[HookMatcher(matcher=t, hooks=[make_file_hook(project_root)]) for t in FILE_TOOLS],
+        HookMatcher(matcher="Bash", hooks=[make_bash_hook(project_root, data_dir)]),
+        *[
+            HookMatcher(matcher=t, hooks=[make_file_hook(project_root, data_dir)])
+            for t in FILE_TOOLS
+        ],
         HookMatcher(matcher="WebFetch", hooks=[make_webfetch_hook()]),
     ]
 
