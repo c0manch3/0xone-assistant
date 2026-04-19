@@ -101,6 +101,14 @@ def make_subagent_hooks(
     # entry since `callback_chat_id == OWNER_CHAT_ID`; the bound is
     # forward-compat defence against phase-8 multi-chat.
     last_notify_at: OrderedDict[int, float] = OrderedDict()
+    # Fix-pack I4: per-chat `asyncio.Lock` to close the TOCTOU window
+    # inside `_throttle`. Without this lock two concurrent Stop hooks
+    # for the SAME chat would both read the stale `last_notify_at`,
+    # both decide the throttle window had elapsed, and both fire the
+    # adapter send in the same tick — defeating the min-interval
+    # invariant. Sharing one OrderedDict with the timestamps keeps
+    # the LRU eviction story simple.
+    throttle_locks: OrderedDict[int, asyncio.Lock] = OrderedDict()
 
     async def on_subagent_start(
         input_data: HookInput,
@@ -270,6 +278,7 @@ def make_subagent_hooks(
         async def _deliver() -> None:
             await _throttle(
                 last_notify_at,
+                throttle_locks,
                 callback_chat_id,
                 throttle_ms,
                 max_entries=_THROTTLE_MAX,
@@ -406,6 +415,7 @@ def _read_last_assistant_from_transcript(path: Path) -> str:
 
 async def _throttle(
     last_notify_at: OrderedDict[int, float],
+    throttle_locks: OrderedDict[int, asyncio.Lock],
     chat_id: int,
     interval_ms: int,
     *,
@@ -413,16 +423,48 @@ async def _throttle(
 ) -> None:
     """Per-chat min-interval throttle with LRU eviction.
 
-    Non-reentrant per chat (single-user bot today — safe). Moves the
-    chat key to the end of the OrderedDict on each use and evicts the
-    oldest entry when the dict grows past `max_entries` (GAP #15).
+    Fix-pack I4: the read → ``await asyncio.sleep`` → write sequence
+    is guarded by a per-chat ``asyncio.Lock`` obtained via
+    ``setdefault``. Without the lock, two concurrent deliveries to
+    the SAME chat both observe the stale ``last_notify_at``, both
+    decide the throttle had elapsed, and both call the adapter in
+    the same scheduler tick — defeating the min-interval invariant
+    that keeps Telegram from flood-waiting us.
+
+    The lock granularity is per-chat, not global: a third chat's
+    throttle is never blocked by chat A's concurrent deliveries.
+    LRU eviction trims the locks dict in lockstep with
+    ``last_notify_at`` so a 10 000-chat burst cannot grow the
+    lock-tracking dict unboundedly.
+
+    Non-reentrant per chat is exactly the guarantee we want: a
+    single delivery pipeline per chat, serialised.
     """
-    now = time.monotonic()
-    last = last_notify_at.get(chat_id, 0.0)
-    delta_ms = (now - last) * 1000.0
-    if delta_ms < interval_ms:
-        await asyncio.sleep((interval_ms - delta_ms) / 1000.0)
-    last_notify_at[chat_id] = time.monotonic()
-    last_notify_at.move_to_end(chat_id)
-    while len(last_notify_at) > max_entries:
-        last_notify_at.popitem(last=False)
+    lock = throttle_locks.get(chat_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        throttle_locks[chat_id] = lock
+    # Move the lock to LRU-end whether or not we created it — tracks
+    # "most recently used" correctly for eviction.
+    throttle_locks.move_to_end(chat_id)
+    async with lock:
+        now = time.monotonic()
+        last = last_notify_at.get(chat_id, 0.0)
+        delta_ms = (now - last) * 1000.0
+        if delta_ms < interval_ms:
+            await asyncio.sleep((interval_ms - delta_ms) / 1000.0)
+        # Read the clock AFTER the optional sleep so the recorded
+        # "last" truly reflects the delivery-ready timestamp. Using
+        # a second `time.monotonic()` here (instead of reusing `now`)
+        # is the difference between "throttle from when we ASKED" and
+        # "throttle from when we were CLEARED" — the latter matches
+        # the adapter's perception of when its traffic left the
+        # process.
+        last_notify_at[chat_id] = time.monotonic()
+        last_notify_at.move_to_end(chat_id)
+        while len(last_notify_at) > max_entries:
+            evicted_chat, _ = last_notify_at.popitem(last=False)
+            # Drop the paired lock. Safe because the lock dict is
+            # keyed identically; any caller still holding a reference
+            # to the lock will continue to function normally.
+            throttle_locks.pop(evicted_chat, None)
