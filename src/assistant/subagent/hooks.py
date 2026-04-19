@@ -50,8 +50,10 @@ from claude_agent_sdk.types import (
 )
 
 from assistant.adapters.base import MessengerAdapter
+from assistant.adapters.dispatch_reply import _DedupLedger, dispatch_reply
 from assistant.config import Settings
 from assistant.logger import get_logger
+from assistant.media.paths import outbox_dir
 from assistant.subagent.context import CURRENT_REQUEST_ID
 from assistant.subagent.format import format_notification
 from assistant.subagent.store import SubagentStore
@@ -72,17 +74,26 @@ def make_subagent_hooks(
     adapter: MessengerAdapter,
     settings: Settings,
     pending_updates: set[asyncio.Task[Any]],
+    dedup_ledger: _DedupLedger,
 ) -> dict[str, list[Any]]:
     """Build SubagentStart + SubagentStop + PreToolUse-cancel-gate hooks.
 
     Pattern: import HookMatcher lazily (pitfall #11 — keeps this module
     pure for unit tests that mock `input_data`). Close over `store`,
-    `adapter`, `settings`, `pending_updates`.
+    `adapter`, `settings`, `pending_updates`, `dedup_ledger`.
 
     Returns a dict keyed by SDK hook-event name. The PreToolUse entry
     carries ONLY the cancel-flag-gate matcher; ClaudeBridge merges it
     with the existing phase-3 PreToolUse list (§3.10 — list-concat, not
     replacement).
+
+    Phase 7 (v2 fix-pack, H-11): the factory gains ONLY `dedup_ledger`;
+    `outbox_root` is intentionally NOT a parameter. The Stop-hook
+    closure derives it via `outbox_dir(settings.data_dir)` on each
+    fire so the two values can never drift apart. Threading
+    `outbox_root` separately would invite a regression where the hook
+    factory is constructed against a stale `data_dir` snapshot while
+    `settings.data_dir` is updated elsewhere.
     """
     from claude_agent_sdk import HookMatcher
 
@@ -263,11 +274,32 @@ def make_subagent_hooks(
                 throttle_ms,
                 max_entries=_THROTTLE_MAX,
             )
+            # Phase 7 (H-11): derive `outbox_root` HERE, not at factory
+            # build time. `settings.data_dir` is the single source of
+            # truth; deriving on every fire makes the two impossible to
+            # drift even if the Settings object were swapped behind
+            # our back.
+            outbox_root = outbox_dir(settings.data_dir)
             try:
-                # The shield keeps the send_text round-trip alive if
+                # The shield keeps the dispatch_reply round-trip alive
+                # (and, through it, send_photo/document/audio/text) if
                 # the outer notify task is cancelled mid-send; the
                 # Daemon.stop drain awaits the shielded coroutine.
-                await asyncio.shield(adapter.send_text(callback_chat_id, body))
+                # Phase 7 (commit 15): migrated from raw `send_text`
+                # to `dispatch_reply` so outbox-artefact paths emitted
+                # by worker sub-agents (e.g. `/…/outbox/x.png`) are
+                # delivered as photos/documents/audio before the
+                # cleaned-text tail.
+                await asyncio.shield(
+                    dispatch_reply(
+                        adapter,
+                        callback_chat_id,
+                        body,
+                        outbox_root=outbox_root,
+                        dedup=dedup_ledger,
+                        log_ctx={"job_id": job_id},
+                    )
+                )
             except asyncio.CancelledError:
                 log.info("subagent_notify_shielded_cancel", job_id=job_id)
                 raise
