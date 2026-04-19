@@ -280,8 +280,9 @@ async def _drain(d: Daemon) -> None:
     Phase 5 added never-ending scheduler bg-tasks (`scheduler_loop`,
     `scheduler_dispatcher`, `scheduler_health`) which would block this
     helper forever. Phase 6 added `subagent_picker` with the same
-    property. Filter both families out — this test's job is to verify
-    the bootstrap marker rotation only.
+    property. Phase 7 (commit 16) added `media_sweeper_loop` — also
+    never-ending. Filter all three families out — this test's job is
+    to verify the bootstrap marker rotation only.
     """
     import asyncio as _asyncio
 
@@ -291,6 +292,7 @@ async def _drain(d: Daemon) -> None:
         if not (
             (t.get_name() or "").startswith("scheduler_")
             or (t.get_name() or "").startswith("subagent_")
+            or (t.get_name() or "") == "media_sweeper_loop"
         )
     ]
     if pending:

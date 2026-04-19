@@ -15,12 +15,15 @@ from typing import Any
 import aiosqlite
 import structlog
 
+from assistant.adapters.dispatch_reply import _DedupLedger
 from assistant.adapters.telegram import TelegramAdapter
 from assistant.bridge.bootstrap import ensure_skills_symlink
 from assistant.bridge.claude import ClaudeBridge
 from assistant.config import Settings, get_settings
 from assistant.handlers.message import ClaudeHandler
 from assistant.logger import get_logger, setup_logging
+from assistant.media.paths import ensure_media_dirs
+from assistant.media.sweeper import media_sweeper_loop
 from assistant.scheduler.dispatcher import ScheduledTrigger, SchedulerDispatcher
 from assistant.scheduler.loop import SchedulerLoop
 from assistant.scheduler.store import SchedulerStore
@@ -118,6 +121,18 @@ class Daemon:
         self._subagent_picker: SubagentRequestPicker | None = None
         self._subagent_pending: set[asyncio.Task[Any]] = set()
         self._picker_bridge: ClaudeBridge | None = None
+        # Phase 7 (commit 16) — shared dedup ledger for dispatch_reply.
+        # The SAME instance is threaded into the main-turn bridge's
+        # adapter path (phase-7 commit 17), the `SchedulerDispatcher`
+        # and the `make_subagent_hooks` factory so invariant I-7.5
+        # (at-most-once artefact send per `(resolved_path, chat_id)`
+        # within the ledger TTL) holds across ALL three call-sites.
+        self._dedup_ledger = _DedupLedger()
+        # Phase 7 (commit 16) — sweeper lifecycle. `asyncio.Event` is
+        # created in `__init__` (not `start`) so `Daemon.stop()` can
+        # unconditionally call `.set()` without a None-check even if
+        # start() was never invoked (test ergonomics).
+        self._media_sweep_stop = asyncio.Event()
 
     # ------------------------------------------------------------------
 
@@ -600,6 +615,17 @@ class Daemon:
         self._settings.db_path.parent.mkdir(parents=True, exist_ok=True)
         (self._settings.data_dir / "run").mkdir(parents=True, exist_ok=True)
         self._ensure_vault()
+
+        # Phase 7 (commit 16) pitfall #14: create the media layout
+        # BEFORE ANY background task is spawned. `media_sweeper_loop`
+        # scans `<data_dir>/media/{inbox,outbox}` on its first tick;
+        # if the dirs don't exist yet, the first sweep logs a spurious
+        # `FileNotFoundError` (harmless but noisy) and — worse — the
+        # adapter download path would hit `OSError: ENOENT` on the
+        # first Telegram file. Ordering is authoritative here: this
+        # call MUST precede every `_spawn_bg` below.
+        await ensure_media_dirs(self._settings.data_dir)
+
         self._conn = await connect(self._settings.db_path)
         await apply_schema(self._conn)
 
@@ -693,6 +719,7 @@ class Daemon:
             adapter=self._adapter,
             settings=self._settings,
             pending_updates=self._subagent_pending,
+            dedup_ledger=self._dedup_ledger,
         )
         sub_agents = build_agents(self._settings)
 
@@ -728,6 +755,7 @@ class Daemon:
             owner_chat_id=self._settings.owner_chat_id,
             settings=self._settings,
             notify_fn=self._scheduler_dispatcher_notify,
+            dedup_ledger=self._dedup_ledger,
         )
         loop_ = SchedulerLoop(
             queue=queue,
@@ -758,6 +786,23 @@ class Daemon:
         # GitHub or `uv sync`; bootstrap has its own 120 s timeout internally.
         self._spawn_bg(self._sweep_run_dirs(), name="sweep_run_dirs")
         self._spawn_bg(self._bootstrap_skill_creator_bg(), name="skill_creator_bootstrap")
+
+        # Phase 7 (commit 16) media-retention sweeper. Pitfall #14:
+        # `ensure_media_dirs()` above created `inbox/` and `outbox/`
+        # so the first `media_sweeper_loop` tick scans existing dirs.
+        # The loop honours `self._media_sweep_stop` for cooperative
+        # shutdown; `Daemon.stop()` sets the event before the bg-task
+        # drain so the loop exits cleanly instead of being cancelled
+        # mid-unlink.
+        self._spawn_bg(
+            media_sweeper_loop(
+                self._settings.data_dir,
+                self._settings,
+                self._media_sweep_stop,
+                self._log,
+            ),
+            name="media_sweeper_loop",
+        )
 
         # GAP #16 / wave-2 G-W2-4: one-shot "missed N reminders" recap.
         # Counted BEFORE the first tick so the recap number is stable
@@ -812,6 +857,11 @@ class Daemon:
                 self._subagent_picker.request_stop()
             except Exception:
                 self._log.warning("stop_step_failed", step="subagent_picker", exc_info=True)
+        # Phase 7 (commit 16): signal media sweeper to exit at the next
+        # `asyncio.wait_for(stop_event.wait(), timeout=interval_s)`
+        # wake-up. Must precede the bg-drain in step 2 so the loop is
+        # already draining when `gather(...)` awaits its task.
+        self._media_sweep_stop.set()
 
         # Step 2.
         if self._bg_tasks:

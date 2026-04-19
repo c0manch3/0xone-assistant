@@ -211,6 +211,7 @@ async def test_bootstrap_failure_notifies_owner_once(
             if not (
                 (t.get_name() or "").startswith("scheduler_")
                 or (t.get_name() or "").startswith("subagent_")
+                or (t.get_name() or "") == "media_sweeper_loop"
             )
         ],
         return_exceptions=True,
@@ -262,6 +263,7 @@ async def test_bootstrap_failure_does_not_renotify(
             if not (
                 (t.get_name() or "").startswith("scheduler_")
                 or (t.get_name() or "").startswith("subagent_")
+                or (t.get_name() or "") == "media_sweeper_loop"
             )
         ],
         return_exceptions=True,
@@ -304,6 +306,7 @@ async def test_bootstrap_happy_path_creates_skill_and_sentinel(
             if not (
                 (t.get_name() or "").startswith("scheduler_")
                 or (t.get_name() or "").startswith("subagent_")
+                or (t.get_name() or "") == "media_sweeper_loop"
             )
         ],
         return_exceptions=True,
