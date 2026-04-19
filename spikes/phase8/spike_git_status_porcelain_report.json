@@ -1,0 +1,49 @@
+{
+  "repo_seed": {
+    "tracked_modified": "to_be_modified.md",
+    "untracked": "untracked.md",
+    "deleted_unstaged": "to_be_deleted.md",
+    "renamed_staged": "renamed.md",
+    "added_staged": "added_staged.md"
+  },
+  "porcelain_v1_raw": "A  added_staged.md\nR  to_be_renamed.md -> renamed.md\n D to_be_deleted.md\n M to_be_modified.md\n?? untracked.md\n",
+  "porcelain_v1_parsed": [
+    {
+      "prefix": "A ",
+      "path": "added_staged.md"
+    },
+    {
+      "prefix": "R ",
+      "path": "to_be_renamed.md -> renamed.md"
+    },
+    {
+      "prefix": " D",
+      "path": "to_be_deleted.md"
+    },
+    {
+      "prefix": " M",
+      "path": "to_be_modified.md"
+    },
+    {
+      "prefix": "??",
+      "path": "untracked.md"
+    }
+  ],
+  "porcelain_v2_raw": "1 A. N... 000000 100644 100644 0000000000000000000000000000000000000000 d5f7fc3f74f7dec08280f370a975b112e8f60818 added_staged.md\n2 R. N... 100644 100644 100644 3b3570473a7fc4ba3bbfa565a2ade87ad77b814c 3b3570473a7fc4ba3bbfa565a2ade87ad77b814c R100 renamed.md\tto_be_renamed.md\n1 .D N... 100644 100644 000000 bd43ee257c3927e4822337584186b2c17e535375 bd43ee257c3927e4822337584186b2c17e535375 to_be_deleted.md\n1 .M N... 100644 100644 100644 4b48deed3a433909bfd6b6ab3d4b91348b6af464 4b48deed3a433909bfd6b6ab3d4b91348b6af464 to_be_modified.md\n? untracked.md\n",
+  "full_status": "On branch main\nChanges to be committed:\n  (use \"git restore --staged <file>...\" to unstage)\n\tnew file:   added_staged.md\n\trenamed:    to_be_renamed.md -> renamed.md\n\nChanges not staged for commit:\n  (use \"git add/rm <file>...\" to update what will be committed)\n  (use \"git restore <file>...\" to discard changes in working directory)\n\tdeleted:    to_be_deleted.md\n\tmodified:   to_be_modified.md\n\nUntracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n\tuntracked.md\n\n",
+  "diff_quiet_worktree_rc": 1,
+  "diff_quiet_cached_rc": 1,
+  "assertions": {
+    "has_untracked_??": true,
+    "has_modified_worktree_prefix_has_M": true,
+    "has_deleted_D": true,
+    "has_renamed_R": true,
+    "has_added_A": true,
+    "diff_quiet_sees_only_modified_or_staged": true
+  },
+  "untracked_only_scenario": {
+    "diff_quiet_rc": 0,
+    "porcelain": "?? only_untracked.md\n",
+    "verdict_b2_justified": true
+  }
+}

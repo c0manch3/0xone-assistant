@@ -1,0 +1,22 @@
+{
+  "empty_home": {
+    "ok": false,
+    "home": "/var/folders/mr/br0y736x2wdgzmqxvxmdpsp40000gn/T/spike_empty_home_w3ing1gh",
+    "rc": 1,
+    "reason": "not_logged_in",
+    "stdout": "",
+    "stderr": "You are not logged into any GitHub hosts. To log in, run: gh auth login\n"
+  },
+  "real_home": {
+    "ok": true,
+    "home": "/Users/agent2",
+    "rc": 0,
+    "reason": "authed",
+    "stdout": "github.com\n  \u2713 Logged in to github.com account c0manch3 (keyring)\n  - Active account: true\n  - Git operations protocol: ssh\n  - Token: gho_************************************\n  - Token scopes: 'admin:public_key', 'gist', 'read:org', 'repo'\n",
+    "stderr": ""
+  },
+  "summary": {
+    "empty_home_expected_not_logged_in": true,
+    "real_home_logged_in": true
+  }
+}

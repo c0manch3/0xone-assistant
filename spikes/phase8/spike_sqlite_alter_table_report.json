@@ -1,0 +1,13 @@
+{
+  "pre_migration_user_version": 3,
+  "pre_migration_row_count": 10,
+  "post_migration_user_version": 5,
+  "rows_with_null_seed_key": 10,
+  "idx_sql": "CREATE UNIQUE INDEX idx_schedules_seed_key\n    ON schedules(seed_key) WHERE seed_key IS NOT NULL",
+  "idx_is_partial": true,
+  "duplicate_non_null_seed_key": "expected_IntegrityError: UNIQUE constraint failed: schedules.seed_key",
+  "another_null_seed_key_allowed": true,
+  "post_v6_user_version": 6,
+  "tombstone_lookup_exists": 1,
+  "tombstone_insert_or_replace_ok": true
+}

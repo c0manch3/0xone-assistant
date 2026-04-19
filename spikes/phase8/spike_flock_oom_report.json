@@ -1,0 +1,7 @@
+{
+  "before_kill_acquire": "expected_BlockingIOError",
+  "after_kill_acquire": {
+    "acquired": true,
+    "elapsed_ms": 0.003166031092405319
+  }
+}

