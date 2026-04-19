@@ -21,6 +21,7 @@ import json
 from pathlib import Path
 
 from assistant.adapters.base import MessengerAdapter
+from assistant.adapters.dispatch_reply import _DedupLedger
 from assistant.config import (
     ClaudeSettings,
     MemorySettings,
@@ -108,6 +109,7 @@ async def test_start_hook_picker_path_patches_row(tmp_path: Path) -> None:
         adapter=adapter,
         settings=settings,
         pending_updates=pending,
+        dedup_ledger=_DedupLedger(),
     )
     start_cb = hooks["SubagentStart"][0].hooks[0]
 
@@ -151,6 +153,7 @@ async def test_start_hook_native_task_path_inserts_row(tmp_path: Path) -> None:
         adapter=adapter,
         settings=settings,
         pending_updates=pending,
+        dedup_ledger=_DedupLedger(),
     )
     start_cb = hooks["SubagentStart"][0].hooks[0]
 
@@ -199,6 +202,7 @@ async def test_start_hook_fallthrough_preserves_cli_attribution(
         adapter=adapter,
         settings=settings,
         pending_updates=pending,
+        dedup_ledger=_DedupLedger(),
     )
     start_cb = hooks["SubagentStart"][0].hooks[0]
 
@@ -263,6 +267,7 @@ async def test_start_hook_fallthrough_vanished_row_uses_unknown_marker(
         adapter=adapter,
         settings=settings,
         pending_updates=pending,
+        dedup_ledger=_DedupLedger(),
     )
     start_cb = hooks["SubagentStart"][0].hooks[0]
 
@@ -296,6 +301,7 @@ async def test_start_hook_no_agent_id_is_noop(tmp_path: Path) -> None:
         adapter=adapter,
         settings=_settings(tmp_path),
         pending_updates=pending,
+        dedup_ledger=_DedupLedger(),
     )
     start_cb = hooks["SubagentStart"][0].hooks[0]
     out = await start_cb({"agent_type": "general"}, None, None)
@@ -316,6 +322,7 @@ async def test_stop_hook_returns_empty_and_registers_pending(tmp_path: Path) -> 
         adapter=adapter,
         settings=settings,
         pending_updates=pending,
+        dedup_ledger=_DedupLedger(),
     )
     start_cb = hooks["SubagentStart"][0].hooks[0]
     stop_cb = hooks["SubagentStop"][0].hooks[0]
@@ -367,6 +374,7 @@ async def test_stop_hook_cancelled_status_stopped(tmp_path: Path) -> None:
         adapter=adapter,
         settings=settings,
         pending_updates=pending,
+        dedup_ledger=_DedupLedger(),
     )
     start_cb = hooks["SubagentStart"][0].hooks[0]
     stop_cb = hooks["SubagentStop"][0].hooks[0]
@@ -425,6 +433,7 @@ async def test_stop_hook_large_transcript_read_does_not_block_event_loop(
         adapter=adapter,
         settings=settings,
         pending_updates=pending,
+        dedup_ledger=_DedupLedger(),
     )
     start_cb = hooks["SubagentStart"][0].hooks[0]
     stop_cb = hooks["SubagentStop"][0].hooks[0]
@@ -521,6 +530,7 @@ async def test_stop_hook_fallback_jsonl_reads_last_assistant_text(tmp_path: Path
         adapter=adapter,
         settings=settings,
         pending_updates=pending,
+        dedup_ledger=_DedupLedger(),
     )
     start_cb = hooks["SubagentStart"][0].hooks[0]
     stop_cb = hooks["SubagentStop"][0].hooks[0]
@@ -581,6 +591,7 @@ async def test_stop_hook_empty_body_notifies_placeholder(tmp_path: Path) -> None
         adapter=adapter,
         settings=settings,
         pending_updates=pending,
+        dedup_ledger=_DedupLedger(),
     )
     start_cb = hooks["SubagentStart"][0].hooks[0]
     stop_cb = hooks["SubagentStop"][0].hooks[0]
@@ -622,6 +633,7 @@ async def test_pretool_cancel_gate_denies_when_flag_set(tmp_path: Path) -> None:
         adapter=adapter,
         settings=_settings(tmp_path),
         pending_updates=pending,
+        dedup_ledger=_DedupLedger(),
     )
     start_cb = hooks["SubagentStart"][0].hooks[0]
     gate_cb = hooks["PreToolUse"][0].hooks[0]
@@ -659,6 +671,7 @@ async def test_pretool_cancel_gate_allows_when_flag_clear(tmp_path: Path) -> Non
         adapter=adapter,
         settings=_settings(tmp_path),
         pending_updates=pending,
+        dedup_ledger=_DedupLedger(),
     )
     start_cb = hooks["SubagentStart"][0].hooks[0]
     gate_cb = hooks["PreToolUse"][0].hooks[0]
@@ -688,6 +701,7 @@ async def test_pretool_cancel_gate_noop_without_agent_id(tmp_path: Path) -> None
         adapter=adapter,
         settings=_settings(tmp_path),
         pending_updates=pending,
+        dedup_ledger=_DedupLedger(),
     )
     gate_cb = hooks["PreToolUse"][0].hooks[0]
     out = await gate_cb({"tool_name": "Bash"}, None, None)

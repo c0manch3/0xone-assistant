@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from assistant.adapters.base import MessengerAdapter
+from assistant.adapters.dispatch_reply import _DedupLedger
 from assistant.bridge.claude import ClaudeBridge
 from assistant.config import (
     ClaudeSettings,
@@ -87,6 +88,7 @@ async def test_daemon_wiring_builds_two_bridges_with_shared_hooks(
         adapter=adapter,
         settings=settings,
         pending_updates=pending,
+        dedup_ledger=_DedupLedger(),
     )
     sub_agents = build_agents(settings)
 
@@ -134,6 +136,7 @@ async def test_hooks_factory_sees_both_bridges(tmp_path: Path) -> None:
         adapter=adapter,
         settings=settings,
         pending_updates=pending,
+        dedup_ledger=_DedupLedger(),
     )
     agents = build_agents(settings)
 
