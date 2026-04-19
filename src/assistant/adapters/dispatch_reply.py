@@ -125,15 +125,20 @@ class _DedupLedger:
         ``now`` MUST be monotonic (ie ``time.monotonic()`` or a mock
         float driven by the test). Wall-clock ``time.time()`` would
         break under NTP slew (phase-5 scheduler precedent).
+
+        Fix-pack I2: the inner TTL re-check is unreachable because
+        ``_evict_expired(now)`` has already purged every entry older
+        than ``now - ttl_s``. If ``key`` survives the eviction pass,
+        by construction ``now - self._entries[key] < self._ttl_s``
+        so the membership test alone is authoritative.
         """
         self._evict_expired(now)
         if key in self._entries:
-            last = self._entries[key]
-            if now - last < self._ttl_s:
-                # Seen within window — refresh LRU position so
-                # subsequent LRU trims evict truly-oldest first.
-                self._entries.move_to_end(key)
-                return True
+            # Post-eviction: a present key is provably within the TTL
+            # window (_evict_expired dropped everyone older). Refresh
+            # LRU position so subsequent trims evict truly-oldest first.
+            self._entries.move_to_end(key)
+            return True
         # Record (insertion order on a fresh key; move_to_end covers
         # the update case identically).
         self._entries[key] = now

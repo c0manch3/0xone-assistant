@@ -87,6 +87,21 @@ _ALL_EXT: Final[tuple[str, ...]] = _PHOTO_EXT + _AUDIO_EXT + _DOC_EXT
 #
 # Case-insensitive so `.PNG` / `.Png` / `.png` all match.
 #
+# ``re.UNICODE`` is the Python 3 default (re.U = 0 in re.compile
+# flag accounting) so ``\s`` matches NBSP (U+00A0) and the rest of
+# the Unicode whitespace class out of the box — this is already
+# load-bearing for Russian-text corpora and the spike S-2 corpus
+# included NBSP cases.
+#
+# Fix-pack D5: the zero-width joiner family (``\u200B`` / ``\u200C``
+# / ``\u200D``) is NOT part of Python's ``\s`` but can legitimately
+# appear in chat text as an invisible separator the model itself did
+# not intend. We add them to the body-forbid set and the stop-set
+# lookahead so ``/abs/x.png\u200Bend`` terminates the path at the
+# ZWSP rather than failing to match altogether — mirroring NBSP
+# behaviour and preventing a hostile client from smuggling invisible
+# separators that silently inflate the path.
+#
 # Known residual false-negatives (documented in S-2):
 #   1. `/abs/x.png/abs/y.pdf` — extracts only the first path;
 #      acceptable per S-2 (the model should not emit two adjacent
@@ -96,11 +111,12 @@ _ALL_EXT: Final[tuple[str, ...]] = _PHOTO_EXT + _AUDIO_EXT + _DOC_EXT
 #      outbox path" ensures the model never produces this form.
 #   3. `/abs/outbox/x.png/y` — matches x.png (trailing `y` treated
 #      as noise); the downstream `exists()` check rejects non-files.
+_ZW_TERMINATORS: Final[str] = "\u200b\u200c\u200d"
 ARTEFACT_RE: re.Pattern[str] = re.compile(
-    r"(?<![\w/.:])(/[^\s`\"'<>()\[\]]+?"
+    rf"(?<![\w/.:])(/[^\s`\"'<>()\[\]{_ZW_TERMINATORS}]+?"
     rf"(?:{'|'.join(re.escape(e) for e in _ALL_EXT)}))"
-    r"(?=[\s`\"'<>()\[\].,;:!?/]|$)",
-    re.IGNORECASE,
+    rf"(?=[\s`\"'<>()\[\].,;:!?/{_ZW_TERMINATORS}]|$)",
+    re.IGNORECASE | re.UNICODE,
 )
 
 

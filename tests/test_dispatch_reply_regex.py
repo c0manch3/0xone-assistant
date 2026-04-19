@@ -215,3 +215,35 @@ def test_xfail_count_matches_spike() -> None:
     # marked xfail"). More than 3 means the regex regressed; fewer
     # means we fixed one without updating the docstring.
     assert len(_ACCEPTED_RESIDUAL_FAILURES) == 3
+
+
+# --- Phase 7 fix-pack D5: Unicode invisible-separator terminators -----------
+
+
+@pytest.mark.parametrize(
+    ("case_id", "text", "expected"),
+    [
+        # NBSP (U+00A0) — already terminated correctly by Python's `\s`
+        # but we keep the case so a future regex change that drops the
+        # `re.UNICODE` flag (or equivalent) immediately fails.
+        ("nbsp_terminator", "/abs/x.png\u00a0end", ["/abs/x.png"]),
+        # Zero-width joiners added explicitly in the v3+D5 regex.
+        ("zwsp_terminator", "/abs/x.png\u200bend", ["/abs/x.png"]),
+        ("zwnj_terminator", "/abs/x.png\u200cend", ["/abs/x.png"]),
+        ("zwj_terminator", "/abs/x.png\u200dend", ["/abs/x.png"]),
+        # Sanity: a ZWSP INSIDE the filename body is treated as a
+        # terminator too — so the path bails mid-name rather than
+        # silently swallowing the invisible character. The regex
+        # then fails to find a valid suffix after the ZWSP, so no
+        # match.
+        ("zwsp_inside_filename_no_match", "/abs/x\u200by.png", []),
+    ],
+)
+def test_artefact_re_unicode_invisible_terminators(
+    case_id: str, text: str, expected: list[str]
+) -> None:
+    """D5: NBSP + ZWSP/ZWNJ/ZWJ must act as path terminators so
+    invisible separators can't smuggle extra text into an extracted
+    path. See plan/phase7 D5 entry for the attack model."""
+    del case_id
+    assert ARTEFACT_RE.findall(text) == expected

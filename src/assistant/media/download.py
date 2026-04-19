@@ -263,14 +263,22 @@ async def download_telegram_file(
     except SizeCapExceeded:
         dest_path.unlink(missing_ok=True)
         raise
-    except (OSError, Exception):
-        # Broad except so partial-file cleanup runs on ANY error --
-        # TelegramAPIError, asyncio.TimeoutError, CancelledError, etc.
-        # We re-raise after the unlink so the caller (adapter) can
-        # decide how to respond to the user (reject vs retry vs
-        # surface error). `CancelledError` is intentionally NOT
-        # suppressed: `raise` re-raises the original exception so
-        # cooperative cancellation works.
+    except Exception:
+        # Fix-pack I6: `(OSError, Exception)` was a tautology — OSError
+        # is a subclass of Exception, so the broader alternative
+        # subsumed it. The intent is "any error other than
+        # SizeCapExceeded" so partial-file cleanup runs uniformly;
+        # `except Exception` expresses that directly without the
+        # misleading implication that OSError is handled specially.
+        #
+        # TelegramAPIError, asyncio.TimeoutError, etc. all surface via
+        # this branch and re-raise after the unlink so the caller
+        # (adapter) decides how to respond (reject vs retry vs
+        # surface). `CancelledError` inherits from BaseException (not
+        # Exception) so it is intentionally NOT caught here — a
+        # cancelled download propagates cleanly without the cleanup
+        # step, which is fine because the aiohttp body drain handles
+        # its own cleanup when cancelled mid-stream.
         dest_path.unlink(missing_ok=True)
         raise
 
