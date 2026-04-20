@@ -1,0 +1,45 @@
+# Virtualenvs / build output — must be rebuilt inside the image.
+.venv/
+dist/
+*.egg-info/
+
+# Byte-compiled / tool caches.
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# VCS metadata — the runtime image does not need full history. (Phase-8
+# vault auto-commit operates on $ASSISTANT_DATA_DIR/vault, which is a
+# separate git repo bootstrapped at first push, not on this tree.)
+.git/
+.gitignore
+
+# Tests + planning artefacts — not needed at runtime, and pulling them in
+# would roughly double the image size.
+tests/
+spikes/
+plan/
+docs/
+
+# Local state / secrets — never bake into the image.
+.env
+.env.*
+data/
+.claude/
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# Editor / OS noise.
+.DS_Store
+.idea/
+.vscode/
+
+# The deploy descriptors themselves don't belong in the build context.
+Dockerfile
+.dockerignore
+docker-compose.yml
+docker-compose.*.yml

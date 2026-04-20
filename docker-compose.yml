@@ -1,0 +1,34 @@
+# 0xone-assistant — production compose file.
+#
+# Deploy target: /opt/0xone-assistant/ on 193.233.87.118.
+# Mirrors the midomis-bot pattern (shared-proxy network, ~/.claude bind-mount
+# for OAuth) with a distinct container name so both bots can coexist.
+services:
+  bot:
+    build: .
+    container_name: claude-0xone-daemon
+    restart: unless-stopped
+    env_file:
+      - .env
+    # Let Claude SDK + tools reach services bound to the host (e.g. Caddy on
+    # 127.0.0.1, local MCP helpers) via host.docker.internal.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Persistent application state: SQLite DB, media inbox/outbox, vault.
+      - ./data:/app/data
+      # OAuth credentials for the `claude` CLI. Bind-mounted read-write
+      # because the SDK refreshes tokens in place.
+      - /home/0xone/.claude:/root/.claude
+      - /home/0xone/.claude.json:/root/.claude.json
+    networks:
+      - shared-proxy
+    # Phase-7 Daemon.stop() drains the dispatcher queue and the media-sweeper
+    # background task; 30s gives both a comfortable buffer before SIGKILL.
+    stop_grace_period: 30s
+
+# The shared-proxy network is provisioned out-of-band (Caddy + midomis
+# already attach to it). We opt in as an external consumer only.
+networks:
+  shared-proxy:
+    external: true

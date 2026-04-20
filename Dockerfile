@@ -1,0 +1,75 @@
+# syntax=docker/dockerfile:1.7
+#
+# 0xone-assistant — production image.
+#
+# Base: uv's official Debian bookworm-slim image with Python 3.12 and uv
+# pre-installed (~180 MB). Keeps parity with midomis-bot; no separate
+# builder stage because dependencies are pure Python + small C ext shims
+# (Pillow, lxml) already provided as manylinux wheels for py3.12.
+#
+# Runs as root. This matches the midomis pattern: OAuth credentials live
+# in `/root/.claude/` via bind-mount from the host's `/home/0xone/.claude`.
+# Switching to a non-root UID would require re-chowning the bind-mounted
+# OAuth dir on the host, which is out of scope for phase 8.
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+
+# ── System deps ──────────────────────────────────────────────────────────
+# git + openssh-client: phase-8 vault auto-commit (GitPython push via SSH).
+# gh: GitHub CLI, used by tools/gh/ read-only helpers. Installed from the
+#     official cli.github.com apt repo because Debian bookworm does not
+#     ship `gh` in its default archive.
+# ca-certificates + curl: TLS trust store + fetcher for the gh repo key.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        gnupg \
+        openssh-client; \
+    install -m 0755 -d /etc/apt/keyrings; \
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        | gpg --dearmor -o /etc/apt/keyrings/githubcli-archive-keyring.gpg; \
+    chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg; \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends gh; \
+    apt-get purge -y --auto-remove gnupg; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
+
+# uv tunables: never download a different Python interpreter, always use the
+# one baked into the base image; install into the project's .venv.
+ENV UV_PYTHON_DOWNLOADS=never \
+    UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /app
+
+# ── Dependency layer ─────────────────────────────────────────────────────
+# Copy only the manifest + lockfile first so that code edits don't bust the
+# (expensive) dependency install cache.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project \
+    && rm -rf /root/.cache
+
+# ── Project layer ────────────────────────────────────────────────────────
+# The full source (src/, tools/, skills/, daemon/, etc.) lands here. The
+# .dockerignore drops caches, tests, secrets, and local state.
+COPY . .
+
+# Install the project itself (editable-equivalent, from local sources).
+RUN uv sync --frozen --no-dev \
+    && rm -rf /root/.cache
+
+# Data dir is a mount point; create it so first-boot works even if the
+# host-side volume is empty.
+RUN mkdir -p /app/data
+
+# No EXPOSE / HEALTHCHECK: phase 8 is Telegram long-polling only, with no
+# HTTP surface. Phase 9 will add /health + /metrics and the corresponding
+# directives.
+CMD ["uv", "run", "python", "-m", "assistant"]
