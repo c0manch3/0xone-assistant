@@ -1,9 +1,0 @@
-{
-  "reader_samples": 808,
-  "violations_count": 0,
-  "violations_first_5": [],
-  "final_trigger_count": 20,
-  "final_last_fire_at": "2026-04-17T09:19:00Z",
-  "atomicity_ok": true,
-  "notes": "Two SELECT statements cannot share a snapshot without an explicit BEGIN. Violations here are NOT atomicity failures of the writer; they are reader-side multi-statement visibility issues. Recommend: if the dispatcher needs consistent (trigger, last_fire_at) reads, wrap in BEGIN/COMMIT or read-through a single JOIN query."
-}

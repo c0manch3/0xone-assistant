@@ -1,17 +1,12 @@
 # 0xone-assistant
 
-Персональный Telegram-бот (single-user) на Claude Code SDK.
+Personal Telegram bot on Claude Agent SDK.
 
-## Запуск
+**Status:** rebuild in progress — previous 8-phase batch deploy resulted in cascading production bugs. New methodology: deploy after each phase.
 
-    uv sync
-    cp .env.example .env   # заполнить TELEGRAM_BOT_TOKEN, OWNER_CHAT_ID
-    just run
+All research preserved in `plan/` — phase descriptions, detailed plans, spike findings, implementation prescriptions, devil's advocate analysis, wave plans, summaries.
 
-Архитектура и фазы — `plan/README.md`.
+Approach per phase:
+1. description → Q&A → devil wave 1 → researcher spike → devil wave 2 → researcher fix-pack → parallel-split → multi-wave coder → parallel reviewers → fix-pack → **deploy + owner smoke test** → summary + next phase plan.
 
-## Phases shipped
-
-- **Phase 8** — GitHub CLI wrapper (`tools/gh/`) + daily vault auto-commit to
-  a separate GitHub account via SSH deploy key. See
-  [`docs/ops/github-setup.md`](docs/ops/github-setup.md) for the setup playbook.
+Implementation code wiped at commit `<this commit>`; rebuilding from phase 1 (skeleton + Telegram echo) per `plan/README.md`.

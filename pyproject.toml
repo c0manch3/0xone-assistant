@@ -1,74 +1,13 @@
 [project]
-name = "assistant"
-version = "0.1.0"
-requires-python = ">=3.12,<3.13"
-dependencies = [
-  "aiogram>=3.26,<4",
-  "pydantic>=2.9",
-  "pydantic-settings>=2.6",
-  "aiosqlite>=0.20,<0.22",
-  "structlog>=25.1",
-  "claude-agent-sdk>=0.1.59,<0.2",
-  "pyyaml>=6.0",
-  # Phase 7 — media tools (shared main venv, see detailed-plan.md §9 + S-4/S-8)
-  # Pillow floor ≥10.4 is the oldest release without known RCE/decoder
-  # CVEs at time of planning (H-8); fpdf2 declares Pillow!=9.2.*,>=8.3.2
-  # so we tighten the floor further. Upper bound <13 protects against
-  # upstream API churn (Pillow 12→13 bump).
-  "Pillow>=10.4,<13",
-  "pypdf>=4.0,<7",
-  "python-docx>=1.0,<2",
-  "openpyxl>=3.1,<4",
-  "striprtf>=0.0.28",
-  "defusedxml>=0.7",
-  "fpdf2>=2.7,<3",
-  # lxml pulled in transitively by python-docx; pin explicitly so
-  # security updates are visible in this manifest (H-8).
-  "lxml>=5.0,<7",
-]
-
-[dependency-groups]
-dev = [
-  "pytest>=8.3",
-  "pytest-asyncio>=1.0",
-  "ruff>=0.8",
-  "mypy>=1.13",
-  "types-pyyaml>=6.0",
-]
+name = "0xone-assistant"
+version = "0.0.0"
+description = "Personal Telegram bot on Claude Agent SDK — rebuild in progress (see plan/)"
+requires-python = ">=3.12"
+dependencies = []
 
 [build-system]
-requires = ["uv_build>=0.8,<0.12"]
-build-backend = "uv_build"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
-[tool.uv.build-backend]
-module-name = "assistant"
-module-root = "src"
-
-[tool.ruff]
-line-length = 100
-target-version = "py312"
-extend-exclude = ["spikes", "plan"]
-
-[tool.ruff.lint]
-select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF", "ASYNC"]
-# ASYNC240 flags pathlib in `async def`. Our file-hook's Path.resolve is an
-# in-memory symbolic operation (no disk I/O on each hop once cached), and
-# swapping to anyio.Path here would add a dep boundary for no real benefit.
-ignore = ["ASYNC240"]
-
-[tool.ruff.lint.isort]
-# Phase 7 (Q9a tech-debt close): `tools/` is a real Python package, so
-# `tools.memory._lib.*` and `tools.skill_installer._lib.*` are first-party
-# by virtue of `assistant` + `tools` living in the same repo. The legacy
-# bare-name `_lib` package imports were removed; tests now address the
-# canonical fully-qualified paths and `tests/conftest.py` no longer
-# carries the historical `sys.path` shim.
-known-first-party = ["assistant", "tools", "tests"]
-
-[tool.mypy]
-strict = true
-python_version = "3.12"
-exclude = ["^spikes/", "^plan/"]
-
-[tool.pytest.ini_options]
-asyncio_mode = "auto"
+[tool.hatch.build.targets.wheel]
+packages = ["src/assistant"]
