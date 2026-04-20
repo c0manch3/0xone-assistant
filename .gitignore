@@ -6,44 +6,8 @@ data/
 *.db
 *.db-wal
 *.db-shm
-*.lock
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
 dist/
 *.egg-info/
-
-# Phase 2: bootstrap-created symlink (regenerated on daemon start).
-.claude/skills
-
-# Spike probes generate machine-readable reports; keep source files, skip reports.
-spikes/sdk_probe*_report.json
-
-# Phase 3: skills installed at runtime via marketplace/installer. The two
-# canonical skills that ARE tracked are explicitly whitelisted below.
-skills/*
-!skills/ping/
-!skills/skill-installer/
-!skills/memory/
-!skills/scheduler/
-!skills/task/
-!skills/gh/
-
-# Same for runtime-installed tools/<name>/ (bundles that ship a top-level
-# tools/ subdir end up here after atomic_install). Only `ping` and
-# `skill_installer` (phase 3, renamed in phase 7 from the legacy hyphenated
-# directory name to match the Python-package form), `memory` (phase 4),
-# `schedule` (phase 5), `task` (phase 6), and the phase-7 media CLIs
-# (`transcribe`, `genimage`, `extract_doc`, `render_doc`) are tracked.
-tools/*
-!tools/__init__.py
-!tools/ping/
-!tools/skill_installer/
-!tools/memory/
-!tools/schedule/
-!tools/task/
-!tools/transcribe/
-!tools/genimage/
-!tools/extract_doc/
-!tools/render_doc/
-!tools/gh/
