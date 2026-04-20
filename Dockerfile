@@ -89,7 +89,14 @@ RUN uv sync --frozen --no-dev \
 # host-side volume is empty.
 RUN mkdir -p /app/data
 
+# Copy entrypoint shim for overlay-FS migration (phase-8 deploy fix).
+# Migrates /root/.local/share/0xone-assistant/ (pre-aedbe6f) to the
+# bind-mounted /app/data on first start after upgrade. Idempotent.
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
 # No EXPOSE / HEALTHCHECK: phase 8 is Telegram long-polling only, with no
 # HTTP surface. Phase 9 will add /health + /metrics and the corresponding
 # directives.
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["uv", "run", "python", "-m", "assistant"]

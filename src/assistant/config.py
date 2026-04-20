@@ -33,9 +33,15 @@ def _default_data_dir() -> Path:
     # every `docker compose up --force-recreate` to destroy turns, scheduler
     # state, and subagent history that had been written to the container
     # overlay filesystem.
-    override = os.environ.get("ASSISTANT_DATA_DIR")
+    #
+    # SF-1 align: `.strip()` rejects whitespace-only overrides (an empty
+    # or space-only env var is indistinguishable from "unset"). `.expanduser()`
+    # accepts `~/...` shapes the same way the CLI helpers do, so operators
+    # who set `ASSISTANT_DATA_DIR=~/mydata` in .env get the correct resolved
+    # path instead of a literal `~` directory.
+    override = os.environ.get("ASSISTANT_DATA_DIR", "").strip()
     if override:
-        return Path(override)
+        return Path(override).expanduser()
     base = os.environ.get("XDG_DATA_HOME")
     root = Path(base) if base else Path.home() / ".local" / "share"
     return root / "0xone-assistant"

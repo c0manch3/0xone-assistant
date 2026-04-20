@@ -20,6 +20,8 @@ from assistant.state.conversations import ConversationStore
 from assistant.state.db import apply_schema, connect
 from tests._helpers.history_seed import (
     seed_assistant_text_row,
+    seed_tool_result_row,
+    seed_tool_use_row,
     seed_user_text_row,
 )
 
@@ -86,6 +88,109 @@ async def test_multiple_turns_interleaved_user_assistant(tmp_path: Path) -> None
         assistant_content = assistant_env["message"]["content"]
         assert isinstance(assistant_content, list)
         assert assistant_content[0]["text"] == a
+
+    await conn.close()
+
+
+async def test_only_last_text_block_emitted_when_turn_has_preface_and_answer(
+    tmp_path: Path,
+) -> None:
+    """Phase-8 T2 mitigation: preface TextBlock dropped, only final answer replayed.
+
+    Scenario: a single turn contains
+        user question
+        -> assistant preface TextBlock ("I'll check...")
+        -> assistant tool_use
+        -> tool_result
+        -> assistant final-answer TextBlock
+
+    Before the fix, both assistant TextBlocks were joined with "\\n\\n" and
+    the model re-ran the tool on the next turn because the preface read as
+    a still-pending commitment. The fix keeps only the final TextBlock; the
+    synthetic `[system-note: ...]` prepended to the next user envelope
+    already recaps the tool invocation for context.
+    """
+    conn = await connect(tmp_path / "assistant-preface.db")
+    await apply_schema(conn)
+    conv = ConversationStore(conn)
+    chat_id = 94
+
+    await seed_user_text_row(
+        conn, chat_id=chat_id, turn_id="t1", text="что там в календаре?"
+    )
+    await seed_assistant_text_row(
+        conn,
+        chat_id=chat_id,
+        turn_id="t1",
+        text="Сейчас проверю календарь...",
+    )
+    await seed_tool_use_row(
+        conn,
+        chat_id=chat_id,
+        turn_id="t1",
+        tool_use_id="tu_1",
+        tool_name="schedule",
+        tool_input={"action": "list"},
+    )
+    await seed_tool_result_row(
+        conn,
+        chat_id=chat_id,
+        turn_id="t1",
+        tool_use_id="tu_1",
+        content='{"items":[]}',
+    )
+    await seed_assistant_text_row(
+        conn,
+        chat_id=chat_id,
+        turn_id="t1",
+        text="Сегодня ничего не запланировано.",
+    )
+
+    rows = await conv.load_recent(chat_id, limit_turns=10)
+    envelopes = list(history_to_user_envelopes(rows, chat_id))
+
+    # Expect exactly one user envelope + one assistant envelope.
+    assert len(envelopes) == 2, envelopes
+    assert envelopes[0]["type"] == "user"
+    assert envelopes[1]["type"] == "assistant"
+
+    assistant_content = envelopes[1]["message"]["content"]
+    assert isinstance(assistant_content, list)
+    final_text = assistant_content[0]["text"]
+
+    # Only the final TextBlock is retained — preface is dropped entirely.
+    assert final_text == "Сегодня ничего не запланировано."
+    assert "Сейчас проверю" not in final_text
+    assert "\n\n" not in final_text  # no concatenation happened
+
+    await conn.close()
+
+
+async def test_whitespace_only_assistant_block_does_not_override_real_answer(
+    tmp_path: Path,
+) -> None:
+    """T2 guard: whitespace-only TextBlock must not shadow a real reply.
+
+    If the final row's TextBlock contained only whitespace (defensive case;
+    the handler should not persist those, but the history code must not
+    trust that), the previous non-empty TextBlock should be retained.
+    """
+    conn = await connect(tmp_path / "assistant-whitespace.db")
+    await apply_schema(conn)
+    conv = ConversationStore(conn)
+    chat_id = 95
+
+    await seed_user_text_row(conn, chat_id=chat_id, turn_id="t1", text="q")
+    await seed_assistant_text_row(conn, chat_id=chat_id, turn_id="t1", text="real answer")
+    await seed_assistant_text_row(conn, chat_id=chat_id, turn_id="t1", text="   \n\n  ")
+
+    rows = await conv.load_recent(chat_id, limit_turns=10)
+    envelopes = list(history_to_user_envelopes(rows, chat_id))
+
+    assert len(envelopes) == 2
+    assistant_content = envelopes[1]["message"]["content"]
+    assert isinstance(assistant_content, list)
+    assert assistant_content[0]["text"] == "real answer"
 
     await conn.close()
 

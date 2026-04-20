@@ -133,13 +133,25 @@ def history_to_user_envelopes(
 
     Phase-8 production fix-pack: each turn yields a `"type":"user"` envelope
     AND, when present, a following `"type":"assistant"` envelope carrying
-    the concatenated `TextBlock` content of the assistant's reply in that
-    turn. The earlier spike-R1 assumption ("SDK reconstructs context from
-    user envelopes alone") did NOT hold in practice — in production the
-    model saw N user questions with zero assistant answers and replied
-    with an identical canned greeting every turn, treating each message
-    as a first contact. Emitting the assistant side explicitly restores
-    multi-turn continuity.
+    ONLY the final `TextBlock` of the assistant's reply in that turn. The
+    earlier spike-R1 assumption ("SDK reconstructs context from user
+    envelopes alone") did NOT hold in practice — in production the model
+    saw N user questions with zero assistant answers and replied with an
+    identical canned greeting every turn, treating each message as first
+    contact. Emitting the assistant side explicitly restores multi-turn
+    continuity.
+
+    Phase-8 post-deploy (T2 mitigation): the assistant envelope carries
+    ONLY the LAST assistant TextBlock of the turn, not every text block
+    joined with "\\n\\n". Devil's-advocate empirical testing showed that
+    replaying a `pre-tool preface` + `final answer` pair ("I'll check the
+    calendar...\\n\\nHere is what I found:") as one concatenated assistant
+    message induced the model to re-run the tool on the next turn — it
+    reads the preface as a still-pending commitment. The synthetic
+    `[system-note: ...]` prepended to the NEXT user envelope already
+    recaps the tools that were invoked, so the model retains the context
+    without needing the preface. Retaining only the final TextBlock
+    removes the ambiguity without losing information.
 
     Phase 4 Q1 extension: tool_use / tool_result blocks are STILL not
     replayed to the SDK directly (U1 unverified). Instead a synthetic
@@ -170,7 +182,11 @@ def history_to_user_envelopes(
 
     for turn_id in order:
         user_texts: list[str] = []
-        assistant_texts: list[str] = []
+        # Phase-8 post-deploy (T2 mitigation): retain only the FINAL assistant
+        # TextBlock per turn. Overwritten on every assistant/text row walked
+        # in insertion order; the last non-empty value wins. See the
+        # docstring for the empirical rationale (tool-rerun ambiguity).
+        final_assistant_text: str | None = None
         tool_names: list[str] = []
         results_by_name: dict[str, list[dict[str, Any]]] = {}
 
@@ -180,14 +196,21 @@ def history_to_user_envelopes(
                 # envelope so the SDK model actually sees its prior replies.
                 # `tool_use` assistant rows are handled by the dedicated
                 # branch below; pure text replies land here.
+                #
+                # T2 mitigation: within a single row's content list (handler
+                # persists one text block per row in practice, but the loop
+                # stays defensive), keep only the LAST non-whitespace text
+                # block. `.strip()` guards against whitespace-only blocks
+                # that would otherwise replace a genuine answer with "" on
+                # the subsequent row.
                 for block in row["content"]:
                     if not isinstance(block, dict):
                         continue
                     if block.get("type") != "text":
                         continue
                     text = block.get("text")
-                    if isinstance(text, str) and text:
-                        assistant_texts.append(text)
+                    if isinstance(text, str) and text.strip():
+                        final_assistant_text = text
                 continue
             if row["role"] == "user":
                 for block in row["content"]:
@@ -260,10 +283,14 @@ def history_to_user_envelopes(
             "session_id": session_id,
         }
 
-        if assistant_texts:
-            # Emit one assistant envelope per turn. Multiple TextBlocks in the
-            # same assistant row (or across rows) are joined with blank lines
-            # so the model reads a single coherent reply. Interrupted /
+        if final_assistant_text is not None:
+            # Emit one assistant envelope per turn carrying ONLY the final
+            # TextBlock of the assistant's reply. Pre-tool prefaces (e.g.
+            # "I'll check the calendar...") are intentionally dropped: the
+            # synthetic `[system-note: ...]` on the NEXT user envelope
+            # already recaps which tools ran, and empirical testing showed
+            # that replaying the preface made the model re-run the tool on
+            # the following turn (phase-8 T2 mitigation). Interrupted /
             # text-less turns produce no assistant envelope — matches the
             # phase-2 invariant that the SDK never sees half-finished replies.
             yield {
@@ -271,7 +298,7 @@ def history_to_user_envelopes(
                 "message": {
                     "role": "assistant",
                     "content": [
-                        {"type": "text", "text": "\n\n".join(assistant_texts)}
+                        {"type": "text", "text": final_assistant_text}
                     ],
                 },
                 "parent_tool_use_id": None,

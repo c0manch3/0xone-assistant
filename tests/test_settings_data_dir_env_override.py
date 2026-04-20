@@ -74,3 +74,57 @@ def test_settings_data_dir_honors_env(
 
     s = Settings()  # type: ignore[call-arg]
     assert s.data_dir == target
+
+
+def test_assistant_data_dir_expands_tilde(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SF-1 align: ``~/...`` in ASSISTANT_DATA_DIR resolves to ``$HOME/...``.
+
+    Matches the behavior of the inline ``_data_dir()`` helper in
+    tools/*/main.py so operators who set the env var in .env the same way
+    they would at a shell prompt do not end up with a literal ``~``
+    directory under the container root.
+    """
+    from assistant.config import _default_data_dir
+
+    monkeypatch.setenv("ASSISTANT_DATA_DIR", "~/mydata")
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+
+    result = _default_data_dir()
+    assert result == Path.home() / "mydata"
+
+
+def test_assistant_data_dir_empty_falls_through(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """SF-1 align: empty / whitespace-only ASSISTANT_DATA_DIR acts as unset.
+
+    A value like ``ASSISTANT_DATA_DIR=`` (an operator left the RHS blank in
+    .env) previously returned ``Path("")`` — a subtly broken path that
+    later made ``Path / "assistant.db"`` produce ``/assistant.db``. The
+    ``.strip()`` guard now falls through to the XDG branch so this class
+    of misconfiguration is silently harmless.
+    """
+    from assistant.config import _default_data_dir
+
+    monkeypatch.setenv("ASSISTANT_DATA_DIR", "")
+    xdg = tmp_path / "xdg"
+    monkeypatch.setenv("XDG_DATA_HOME", str(xdg))
+
+    result = _default_data_dir()
+    assert result == xdg / "0xone-assistant"
+
+
+def test_assistant_data_dir_whitespace_only_falls_through(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Whitespace-only override also falls through (SF-1 ``.strip()``)."""
+    from assistant.config import _default_data_dir
+
+    monkeypatch.setenv("ASSISTANT_DATA_DIR", "   \t ")
+    xdg = tmp_path / "xdg"
+    monkeypatch.setenv("XDG_DATA_HOME", str(xdg))
+
+    result = _default_data_dir()
+    assert result == xdg / "0xone-assistant"
