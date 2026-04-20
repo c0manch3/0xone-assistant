@@ -26,6 +26,16 @@ def _default_config_dir() -> Path:
 
 
 def _default_data_dir() -> Path:
+    # Honor ASSISTANT_DATA_DIR first so the daemon resolves the same path as
+    # the inline `_data_dir()` helper used by tools/*/main.py. Without this
+    # override the daemon silently fell back to XDG / ~/.local/share/ even
+    # when ASSISTANT_DATA_DIR pointed at a bind-mounted /app/data, causing
+    # every `docker compose up --force-recreate` to destroy turns, scheduler
+    # state, and subagent history that had been written to the container
+    # overlay filesystem.
+    override = os.environ.get("ASSISTANT_DATA_DIR")
+    if override:
+        return Path(override)
     base = os.environ.get("XDG_DATA_HOME")
     root = Path(base) if base else Path.home() / ".local" / "share"
     return root / "0xone-assistant"
