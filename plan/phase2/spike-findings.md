@@ -90,3 +90,413 @@ Devil's review над `implementation.md` v1 подсветил нескольк
 - `https://docs.claude.com/en/api/agent-sdk/python` — Python SDK reference (cross-checked for `ClaudeAgentOptions` and streaming-input mode docs).
 - GitHub `anthropics/claude-agent-sdk-python` — used offline via installed package source (same as above cache path).
 - `claude-agent-sdk==0.1.59` release notes (via `uv pip show`).
+
+---
+
+## 6. Second-wave spike findings (R7–R12, 2026-04-20)
+
+Added after devil's advocate wave 1 surfaced spike-resolvable questions on top
+of v2 implementation.md. Claude CLI under test: `2.1.114` (OAuth via
+`~/.claude/`). SDK pin unchanged (`claude-agent-sdk==0.1.59`). All probes live
+in `/Users/agent2/Documents/0xone-assistant/plan/phase2/spikes/`.
+
+### R7 — Prompt caching in SDK 0.1.59
+
+**Question:** does the SDK/CLI automatically place `cache_control` markers on
+the system prompt + prior turns, or must we do it manually via `extra_args`?
+
+**Probe:** `plan/phase2/spikes/r7_prompt_caching.py` — two sequential
+`query()` calls with an identical ~800-char system prompt.
+
+**Finding — automatic caching is ACTIVE at the CLI layer, and it uses the
+1-hour ephemeral cache tier.** Both calls reported identical usage:
+
+```
+input_tokens: 6
+cache_creation_input_tokens: 5710  (ephemeral_1h_input_tokens: 5710)
+cache_read_input_tokens:     17404
+cache_creation.ephemeral_5m_input_tokens: 0
+total_cost_usd:              ~$0.04
+```
+
+Even the first call showed `cache_read=17404` — that is the Claude Code CLI's
+own system-prompt scaffold already cached across user sessions. OUR system
+prompt adds ~5710 tokens of cache_creation which then becomes reusable for an
+hour. Phase 2 needs **no manual cache_control wiring.**
+
+**Follow-up caveat:** caching granularity is `system_prompt + prior turns` as
+a unit. Changing our system prompt text (e.g. manifest rebuild when a new
+skill is installed) invalidates the system-prompt cache segment for that
+hour. Cost of rebuild: ~5700 cache_creation tokens ≈ $0.02. Acceptable —
+skill-installer runs are rare. Keep the `build_manifest` mtime cache (it
+reduces unnecessary prompt churn so we don't break cache needlessly).
+
+**Implementation impact:** zero code change.
+
+### R8 — Bash hook compound-command bypass matrix
+
+**Question:** the allowlist-first + slip-guard combination from
+implementation.md §2.1 — which bypass vectors does it actually block?
+
+**Probe:** `plan/phase2/spikes/r8_bash_bypass.py` — 36 dry-run cases against
+a strengthened slip-guard (added command-chaining and escape-sequence
+catches beyond v1).
+
+**Finding — 36 / 36 pass.** The v1 slip-guard was missing command-chaining
+metacharacters, command-substitution, and escape sequences. All compound
+bypasses (`;`, `&&`, `|`, ``` ` ``` , `$()`), env-dump variants (`env`,
+`printenv`, `set`), base64/hex/openssl decode, PATH prefix injection, and
+`python -c` escape trickery are now denied. Legitimate allowlisted commands
+(`python tools/…`, `git status`, `cat README.md`) pass.
+
+**Hardened slip-guard (replaces v1 `_BASH_SLIP_GUARD_RE`):**
+
+```python
+_BASH_SLIP_GUARD_RE = re.compile(
+    r"(\benv\b|\bprintenv\b|\bset\b\s*$|"
+    r"\.env|\.ssh|\.aws|secrets|\.db\b|token|password|ANTHROPIC_API_KEY|"
+    r"\$'\\[0-7]|"
+    r"base64\s+-d|openssl\s+enc|xxd\s+-r|"
+    r"[A-Za-z0-9+/]{48,}={0,2}|"
+    r"[;&|`]|\$\(|<\(|>\(|"
+    r"\\x[0-9a-f]{2}|\\[0-7]{3}"
+    r")",
+    re.IGNORECASE,
+)
+```
+
+Also added `python3 tools/` prefix to allowlist (v1 only listed `python
+tools/`; model may emit `python3` on some configs).
+
+**Remaining gap:** slip-guard will false-positive on legitimate allowlisted
+commands whose arguments happen to contain `password`, `token`, or a long
+base64 blob. Accepted: phase 2 ships no tool that needs such inputs; phase
+3+ skill-installer will whitelist specific tool argument shapes via
+`allowed-tools` frontmatter — NOT by weakening the guard.
+
+**Regression test:** the full 36-case table belongs in
+`tests/test_bash_hook_bypass.py` (hermetic, no SDK needed).
+
+### R9 — WebFetch SSRF guard: DNS rebinding
+
+**Question:** is string-prefix hostname matching enough, or should we resolve
+DNS and check the resulting IP?
+
+**Probe:** `plan/phase2/spikes/r9_webfetch_ssrf.py` — 10 direct cases + two
+`unittest.mock.patch('socket.getaddrinfo')` scenarios.
+
+**Finding — string-only guard catches literal private/loopback/IMDS URLs
+(10/10 direct cases pass) but is blind to a public-looking hostname whose
+DNS resolves to a private IP.** Adding `socket.getaddrinfo` +
+`ipaddress.ip_address(…).is_private|is_loopback|is_link_local|is_reserved`
+closes that gap: `totally-innocent.example` → mocked `127.0.0.1` → blocked
+with reason `DNS → 127.0.0.1 (loopback)`.
+
+**Recommended `_make_webfetch_hook` upgrade** (replaces implementation.md
+§2.1):
+
+```python
+import ipaddress, socket
+from urllib.parse import urlparse
+
+def _ip_is_blocked(ip_str: str) -> str | None:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return f"invalid IP {ip_str!r}"
+    if ip.is_loopback: return "loopback"
+    if ip.is_private: return "private"
+    if ip.is_link_local: return "link_local"
+    if ip.is_reserved: return "reserved"
+    if ip.is_multicast: return "multicast"
+    if ip.is_unspecified: return "unspecified"
+    return None
+
+def _make_webfetch_hook() -> Any:
+    async def webfetch_hook(input_data, tool_use_id, ctx):
+        url = (input_data.get("tool_input", {}) or {}).get("url", "").strip()
+        if not url:
+            return {}
+        try:
+            host = (urlparse(url).hostname or "").lower()
+        except ValueError:
+            return _deny(f"malformed URL: {url!r}")
+        raw = url.lower()
+        # Layer 1: literal string match (cheap)
+        for needle in _WEBFETCH_BLOCKED_HOSTS:
+            if host.startswith(needle.rstrip(".").rstrip("]")) or needle in raw:
+                return _deny(f"blocked host literal: {host!r}")
+        if not host:
+            return _deny("empty host")
+        # Layer 2: DNS + IP category check
+        try:
+            infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        except socket.gaierror:
+            return {}  # NXDOMAIN / transient DNS → allow (CLI will fail it)
+        for _, _, _, _, sockaddr in infos:
+            reason = _ip_is_blocked(sockaddr[0])
+            if reason:
+                return _deny(f"DNS → {sockaddr[0]} ({reason})")
+        return {}
+    return webfetch_hook
+```
+
+**Residual risk: TOCTOU DNS rebinding.** Milliseconds elapse between our
+`getaddrinfo` and the CLI's actual fetch — an attacker-controlled DNS RR-cycle
+can rotate to a private IP for the fetch. Only hard mitigation is an
+OS-level egress ACL (`iptables -A OUTPUT -d 10.0.0.0/8 -j REJECT` and
+friends). Record as **U9** in `unverified-assumptions.md`. Phase 2 accepts
+best-effort defence-in-depth.
+
+**`socket.getaddrinfo` is blocking — does it matter?** Yes, it blocks the
+event loop up to the system DNS timeout (~5s). For a single-user bot this
+is acceptable (one WebFetch in flight, nobody else on the loop). If it hurts
+in phase 5+ scheduler, swap to `asyncio.get_running_loop().getaddrinfo(...)`.
+
+### R10 — Session_id collision in concurrent queries
+
+**Question:** if we pass the same `session_id="chat-<id>"` to two parallel
+`query()` calls (phase 5 scheduler scenario), does SDK corrupt state / crash
+/ serialize?
+
+**Probe:** `plan/phase2/spikes/r10_session_id.py` — `asyncio.gather(q1, q2)`
+both with envelope `session_id="chat-collide-42"`.
+
+**Finding — SDK IGNORES our envelope `session_id` entirely in streaming-input
+mode. It assigns a fresh UUID per query.** Both gathered calls succeeded
+with distinct SDK-side session_ids (`a916eecd-…` and `f084753e-…`), and the
+CLI wrote two separate JSONL files under
+`~/.claude/projects/<cwd-slug>/<uuid>.jsonl`. No collision possible.
+
+**Implications:**
+
+- Our `session_id=f"chat-{chat_id}"` in envelopes is harmless client-side
+  labeling; it is **not** honored by the CLI. Keep it as a human-readable
+  breadcrumb in our logs, but document that it's cosmetic.
+- **No need for a per-chat-id `asyncio.Semaphore(1)`** — SDK will not
+  cross-pollute concurrent turns. `max_concurrent=2` already in phase 2 is
+  safe.
+- Our ConversationStore remains the single source of truth. The CLI's
+  per-query JSONL files are ephemeral; we must not take a dependency on
+  them.
+
+**Zero implementation change needed.** Add a comment in
+`_history_to_user_envelopes` noting that `session_id` is cosmetic.
+
+### R11 — Migration 0002 transaction safety
+
+**Question:** is the recreate-table migration atomic under crash, and
+idempotent on re-run?
+
+**Probe:** `plan/phase2/spikes/r11_migration_crash_sim.py` — three scenarios:
+happy path, crash during `INSERT INTO conversations_new`, re-run on an
+already-migrated DB.
+
+**Finding — all three pass.**
+
+1. **Happy path:** before `v=1, conversations=4, no turns`; after `v=2,
+   conversations=4, turns=2, conversations_cols=[…+block_type]`.
+2. **Crash during insert_rows:** `ROLLBACK` restored `v=1, no turns table,
+   original conversations columns`. Re-running migration on the rolled-back
+   DB reaches `v=2`.
+3. **Re-run on `v=2`:** counts stable — `DROP TABLE IF EXISTS
+   conversations_new` protects recreate from leftover debris; `INSERT OR
+   IGNORE` on `turns.turn_id UNIQUE` makes turns-backfill a no-op.
+
+**Canonical migration SQL** (goes into
+`src/assistant/state/migrations/0002_turns_block_type.sql`):
+
+```sql
+-- Runner MUST wrap this in: BEGIN EXCLUSIVE; ...SQL...; PRAGMA user_version=2; COMMIT;
+-- and ROLLBACK on exception. Runner checks PRAGMA user_version < 2 before applying
+-- so re-running on v=2 is a no-op at the Python layer. The SQL itself is also
+-- idempotent (guards below), so even if the guard races, the re-run converges.
+
+DROP TABLE IF EXISTS conversations_new;
+
+CREATE TABLE conversations_new (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id      INTEGER NOT NULL,
+    turn_id      TEXT NOT NULL,
+    role         TEXT NOT NULL,
+    content_json TEXT NOT NULL,
+    meta_json    TEXT,
+    created_at   TEXT NOT NULL,
+    block_type   TEXT NOT NULL DEFAULT 'text'
+);
+
+INSERT INTO conversations_new (
+    id, chat_id, turn_id, role, content_json, meta_json, created_at, block_type
+)
+SELECT id, chat_id, turn_id, role, content_json, meta_json, created_at, 'text'
+FROM conversations;
+
+DROP TABLE conversations;
+ALTER TABLE conversations_new RENAME TO conversations;
+
+CREATE INDEX IF NOT EXISTS idx_conversations_chat_time
+    ON conversations(chat_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_conversations_turn
+    ON conversations(chat_id, turn_id);
+
+CREATE TABLE IF NOT EXISTS turns (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id      INTEGER NOT NULL,
+    turn_id      TEXT NOT NULL UNIQUE,
+    status       TEXT NOT NULL DEFAULT 'pending',
+    created_at   TEXT NOT NULL,
+    completed_at TEXT,
+    meta_json    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_turns_chat_status
+    ON turns(chat_id, status, completed_at);
+
+INSERT OR IGNORE INTO turns (chat_id, turn_id, status, created_at, completed_at)
+SELECT chat_id, turn_id, 'complete', MIN(created_at), MAX(created_at)
+FROM conversations
+GROUP BY chat_id, turn_id;
+```
+
+**Runner responsibilities (Python side, pseudocode):**
+
+```python
+async def _apply_0002(conn) -> None:
+    cur = await conn.execute("PRAGMA user_version")
+    if (await cur.fetchone())[0] >= 2:
+        return
+    await conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        await conn.execute("BEGIN EXCLUSIVE")
+        try:
+            await conn.executescript(MIGRATION_0002_SQL)
+            await conn.execute("PRAGMA user_version=2")
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
+    finally:
+        await conn.execute("PRAGMA foreign_keys=ON")
+```
+
+**Note on FK:** migration does NOT add a `FOREIGN KEY (turn_id) REFERENCES
+turns(turn_id)` on `conversations`. Rationale: SQLite forbids adding FK via
+ALTER; recreate-add-FK requires `turns` populated first, which in turn
+depends on `conversations`. Phase 2 ships without FK; phase 4 can add it
+with a second recreate if needed. detailed-plan §7a's pragmatic stance is
+preserved.
+
+### R12 — NULL `block_type` handling in history replay
+
+**Question:** can `block_type IS NULL` reach `_history_to_user_envelopes`?
+What happens if it does?
+
+**Finding — on a freshly-migrated DB, no row can have NULL `block_type`
+(migration sets `DEFAULT 'text'` + backfills all legacy rows to `'text'`).
+But defensive handling costs nothing and future-proofs against migration
+bugs:**
+
+Two changes to `implementation.md §2.2 _history_to_user_envelopes`:
+
+```python
+# before:
+if row.get("block_type") == "thinking": continue
+# after:
+btype = row.get("block_type") or "text"  # NULL → text (defensive)
+if btype == "thinking": continue
+```
+
+And further down, where the code distinguishes tool_use rows:
+
+```python
+# before:
+elif row.get("block_type") == "tool_use":
+# after:
+elif btype == "tool_use":  # btype computed above
+```
+
+**Regression test (`tests/test_history_null_block_type.py`):** insert a row
+with `block_type=NULL` directly via `aiosqlite.execute` (bypassing the
+`append()` kwarg), call `load_recent` → `_history_to_user_envelopes`; assert
+no exception and the row is treated as text.
+
+---
+
+### R13 — Assistant envelope replay in streaming-input mode (fix-pack live probe)
+
+**Context:** devil-wave-2 flagged that `history_to_user_envelopes` in v2
+implementation.md dropped all assistant rows and injected a synthetic
+Russian-language tool-note. This was originally a mitigation for **U1** (the
+assumption that feeding `tool_use`/`tool_result` blocks back triggers SDK
+rejection). But it also meant phase-2 bots had no multi-turn memory of their
+own assistant replies — "what did you just say" would fail.
+
+**Question:** does the SDK accept a streaming-input envelope of the form
+`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":...}],"model":...}}`
+and does the model see it in context for subsequent user turns?
+
+**Probe:** `plan/phase2/spikes/r13_assistant_envelope_replay.py` — sentinel
+differential. The assistant envelope contains a 6-digit SENTINEL ("424242")
+and is sandwiched between two user turns:
+
+- user1: `"What's my LUCKY_NUMBER? Please tell me now."`
+- assistant1 (injected): `"Your LUCKY_NUMBER is 424242. I'll remember it."`
+- user2: `"Please repeat back my LUCKY_NUMBER. Reply with ONLY the 6-digit number."`
+
+Baseline (control): same user1 and user2, **no** assistant envelope.
+
+**Finding — SDK accepts assistant envelope and model honors it.** Live
+run, OAuth, claude-agent-sdk==0.1.59, CLI 2.1.114:
+
+```
+# probe_without_assistant_baseline
+reply:  "I don't have any record of a LUCKY_NUMBER for you."
+contains_sentinel: false   ✓ (expected — no sentinel in input)
+
+# probe_with_assistant_envelope
+reply:  "Your LUCKY_NUMBER is 424242."
+contains_sentinel: true    ✓ (sentinel sourced ONLY from assistant envelope)
+error:  null               ✓ (no SDK rejection)
+```
+
+Clean differential. `envelope_accepted=True`, `envelope_honored=True`.
+
+**Implementation impact (supersedes phase-2 v2 synthetic-note approach):**
+
+- Rename `history_to_user_envelopes` → `history_to_sdk_envelopes`.
+- Emit full envelope list: user rows → `{"type":"user",...}`, assistant rows
+  → `{"type":"assistant","message":{"role":"assistant","content":...}}`.
+- Keep `thinking` filter (U2 stands — cross-session thinking signature
+  rejected, separate probe).
+- Delete `test_u1_tool_block_roundtrip_xfail.py` (U1 resolved in favor of
+  the synthetic-note DELETION path — we now replay verbatim).
+
+**Envelope `model` field:** R13 probe sent `"model": "claude-opus-4-6"` on
+the inner assistant message. SDK did not complain. Implementation omits the
+field when not known (the row's `meta_json` doesn't currently round-trip
+`model`; the SDK tolerates omission based on the probe's error=None).
+
+**Regression test:** `tests/test_history_assistant_replay.py` —
+hermetic unit test covering row-to-envelope mapping. Live-smoke step §3.6
+4bis covers end-to-end "remember 777333 → what number did I give you?".
+
+**Cost:** $0.02 for the full R13 probe (two sequential `query()` calls with
+~$0.01 each for the sentinel scenario and the baseline).
+
+**Residual risk — U10:** assistant envelope shape stability across SDK
+versions. R13 validates 0.1.59; if the SDK (or CLI) tightens schema
+validation in a point release and rejects our envelopes, history replay
+silently loses assistant context. Add `tests/test_u10_assistant_envelope_shape_live.py`
+(marker `requires_claude_cli`) as a manual regression on SDK upgrades.
+Recorded in `unverified-assumptions.md §U10` for future audits.
+
+---
+
+## 7. Wave-2 bibliography (probes + docs consulted)
+
+- Live spike probes: `/Users/agent2/Documents/0xone-assistant/plan/phase2/spikes/r7_prompt_caching.py`, `r8_bash_bypass.py`, `r9_webfetch_ssrf.py`, `r10_session_id.py`, `r11_migration_crash_sim.py` + generated `.json` reports.
+- Claude Agent SDK 0.1.59 source (cache_creation structure): `_internal/client.py:157` → ResultMessage construction; cache keys `ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens` surfaced via SDK passthrough.
+- Anthropic prompt caching docs: https://docs.claude.com/en/docs/build-with-claude/prompt-caching — confirms automatic CLI cache_control for system prompt + long-lived context.
+- Python `ipaddress` stdlib: https://docs.python.org/3/library/ipaddress.html — `is_private`, `is_link_local`, `is_reserved` properties cover RFC1918, RFC3927, RFC5737 ranges.
+- OWASP SSRF Prevention Cheatsheet: https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html — DNS rebinding as "unsolvable at application layer; egress ACL only".
+- SQLite ALTER TABLE docs (recreate pattern): https://sqlite.org/lang_altertable.html#otheralter — "12-step procedure" for schema changes under concurrent access.
+- SQLite `PRAGMA user_version`: https://sqlite.org/pragma.html#pragma_user_version — single 32-bit counter, ideal for monotonic schema-revision tracking.

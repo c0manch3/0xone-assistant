@@ -11,3 +11,12 @@ data/
 .pytest_cache/
 dist/
 *.egg-info/
+
+# Phase 2: .claude/ is the per-project CLI dir. `skills` is a generated
+# symlink (bootstrap rewrites it on every start); settings files may be
+# created manually by the owner and should never be committed. Harness
+# may also drop runtime artefacts (scheduled_tasks.lock, etc.).
+.claude/
+
+# Spike scripts live in-repo; their generated reports are throwaway.
+plan/phase2/spikes/*.json

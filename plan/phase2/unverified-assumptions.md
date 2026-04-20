@@ -16,26 +16,32 @@ defence (none for U3 today).
 
 ## U1 — Direct replay of `tool_use` / `tool_result` blocks in history envelopes
 
-**Assumption.** The SDK refuses (or at minimum behaves badly with) a user
-envelope whose `content` list contains raw `tool_use` and `tool_result`
-blocks reconstructed from a prior session. We therefore strip those blocks in
-`bridge/history.py::history_to_user_envelopes` and replace them with a
-synthetic Russian-language system-note listing tool names that ran.
+**Status (2026-04-20):** PARTIALLY RESOLVED by R13. Assistant envelopes with
+text blocks ARE honored by the SDK (verified in
+`plan/phase2/spikes/r13_assistant_envelope_replay.py`). The v2.1 implementation
+replays user AND assistant turns verbatim via `history_to_sdk_envelopes`.
 
-**How to verify (cost: ~$0.01 per attempt).**
+**What remains unverified (narrower scope):** specifically feeding an
+assistant envelope whose `content` list contains `tool_use` + `tool_result`
+mixed with text — the R13 probe only validated text-only assistant replay.
 
-1. Build a `prompt_stream` async generator that yields one envelope of the
-   form documented in `bridge/history.py` but with `content=[ToolUseBlock,
-   ToolResultBlock, TextBlock("continue")]`, then a follow-up `text` user
-   envelope.
-2. Call `query(prompt=stream, options=ClaudeAgentOptions(...))` against the
-   live SDK with `setting_sources=["project"]`.
-3. Observe whether the SDK raises, returns an `is_error=True` ResultMessage,
-   or accepts the envelope cleanly.
+**How to verify (cost: ~$0.02).**
 
-**If verified safe → change.** Drop the synthetic-note fallback in
-`history_to_user_envelopes` and emit tool_use/tool_result verbatim. Phase-4
-memory plumbing wins multi-turn fidelity.
+1. In turn 1, have the model call a Bash tool (e.g. `run python
+   tools/ping/main.py`). Capture the full AssistantMessage.content list
+   (TextBlock? + ToolUseBlock + ToolResultBlock — note ToolResultBlock
+   lives on `role='user'` not `role='assistant'` per B5).
+2. In turn 2, feed exactly that envelope sequence plus a follow-up
+   `"what tool did you just call?"` user envelope.
+3. Observe whether the SDK raises, returns `is_error=True`, or the model
+   correctly references the tool_use call.
+
+**If verified safe → change.** The current `_classify_block` already routes
+tool_use to `role='assistant'` and tool_result to `role='user'` (B5). If
+replay works, no additional change is needed — the v2.1 code already emits
+those envelopes. If replay fails, the fallback is to filter tool_use /
+tool_result rows out of `history_to_sdk_envelopes` and reintroduce the
+synthetic-note shim (reverting R13's simplification for tool rows only).
 
 ---
 
@@ -99,6 +105,82 @@ Glob, Grep, WebFetch). If the SDK accepted regex, we could collapse to two
 
 **If verified safe → change.** Collapse the seven matchers in
 `bridge/claude.py::_build_options` to two; keep the same hook closures.
+
+---
+
+## U9 — WebFetch SSRF guard residual: TOCTOU DNS rebinding
+
+**Assumption.** Our two-layer WebFetch guard (literal hostname strings +
+`socket.getaddrinfo` → `ipaddress` category check, see spike-findings §R9
+and `implementation.md §2.1 _make_webfetch_hook`) blocks every direct SSRF
+attempt we can enumerate. A motivated attacker controlling a DNS zone can
+still evade it: return a public IP to our `getaddrinfo` call, then rotate
+RR-records so the CLI resolves a private IP microseconds later. Our hook
+returns `allow`; the fetch hits `127.0.0.1` / `169.254.169.254` / the
+internal network.
+
+**How to verify (cost: $0; requires setting up an attacker DNS server).**
+
+1. Run a local `dnsmasq` with a zone serving two A records that alternate
+   in priority (or a tiny python+dnslib responder).
+2. Send a prompt that triggers WebFetch against `http://<attacker-host>/`
+   where the first getaddrinfo hit returns a public IP (e.g. `93.184.216.34`)
+   and the second returns `169.254.169.254`.
+3. Observe whether the hook allows and the fetch reaches the private IP.
+
+**If verified exploitable (high confidence a priori) → mitigations.** This is
+well-documented in the OWASP SSRF cheatsheet as "unsolvable at application
+layer". Options:
+
+- OS-level egress ACL (`iptables`/`pf` blocking RFC1918/link-local outbound
+  from the daemon's UID). Hardest, most effective.
+- Pin the resolution: `socket.getaddrinfo` once in the hook, then pass the IP
+  (not the hostname) to WebFetch. Requires CLI tool to accept IP-literal URL
+  with `Host:` header override — current CLI does not expose this.
+- Remove `WebFetch` from `allowed_tools` entirely until phase 6+ hardening.
+
+**Phase-2 posture:** accept the residual risk. The bot is single-user on an
+owner workstation, not on EC2 (no IMDS target) and not on a corporate LAN
+with juicy targets. Document in `README.md` "Security considerations" section
+so the owner knows that WebFetch is best-effort-guarded. The two-layer hook
+still blocks the trivial cases (direct IP-literal URLs, localhost), which
+covers ~99% of real prompt-injection attempts.
+
+---
+
+## U10 — Assistant envelope shape stability across SDK versions
+
+**Assumption.** R13 (2026-04-20) verified live on `claude-agent-sdk==0.1.59`
++ CLI `2.1.114` that streaming-input envelopes of shape
+`{"type":"assistant","message":{"role":"assistant","content":[...],"model":...}}`
+are accepted AND honored (model sees prior assistant turns in context). A
+future SDK or CLI point-release could tighten schema validation — for
+example, reject envelopes where `session_id` on the inner message is
+missing or mismatches, or require `model` to be a valid model id — and
+silently break history replay.
+
+**Impact if broken.** `history_to_sdk_envelopes` would emit envelopes the
+SDK rejects OR quietly drops. In the drop case the bot loses multi-turn
+continuity (which was U1's original symptom before R13 resolved it). In
+the reject case, the bridge raises `ClaudeBridgeError("sdk error: …")` and
+the user sees a generic failure message.
+
+**How to verify on any SDK upgrade (cost: ~$0.02).**
+
+1. Re-run `uv run python plan/phase2/spikes/r13_assistant_envelope_replay.py`
+   after any `claude-agent-sdk` or `claude` CLI upgrade.
+2. Check the JSON report: `verdict.envelope_accepted` AND
+   `verdict.envelope_honored` must both be `true`.
+3. If either is `false`, fall back to the synthetic-note approach (drop
+   assistant rows from `history_to_sdk_envelopes`, reintroduce
+   `[system-note: в прошлом ходе ассистент ответил …]`-style summaries).
+
+**Tracked via:** `tests/test_u10_assistant_envelope_shape_live.py` with
+marker `requires_claude_cli` — skipped in CI, owner-invoked on upgrade.
+
+**Phase-2 posture:** accept this risk. The SDK is pinned
+`claude-agent-sdk>=0.1.59,<0.2` so minor releases can change behaviour but
+we see the upgrade and re-run R13. Major (0.2) requires a new spike anyway.
 
 ---
 
