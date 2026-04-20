@@ -50,6 +50,24 @@ async def seed_user_text_row(
     await conn.commit()
 
 
+async def seed_assistant_text_row(
+    conn: aiosqlite.Connection,
+    *,
+    chat_id: int,
+    turn_id: str,
+    text: str,
+) -> None:
+    """Insert an `assistant`/`text` conversation row (phase-8 fix-pack)."""
+    await _ensure_turn(conn, chat_id=chat_id, turn_id=turn_id)
+    payload = [{"type": "text", "text": text}]
+    await conn.execute(
+        "INSERT INTO conversations(chat_id, turn_id, role, content_json, block_type) "
+        "VALUES (?, ?, 'assistant', ?, 'text')",
+        (chat_id, turn_id, json.dumps(payload, ensure_ascii=False)),
+    )
+    await conn.commit()
+
+
 async def seed_tool_use_row(
     conn: aiosqlite.Connection,
     *,

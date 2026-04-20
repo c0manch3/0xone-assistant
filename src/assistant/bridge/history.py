@@ -129,11 +129,17 @@ def history_to_user_envelopes(
     *,
     tool_result_truncate: int = TOOL_RESULT_TRUNCATE,
 ) -> Iterator[dict[str, Any]]:
-    """Convert ConversationStore rows -> SDK user-envelope stream.
+    """Convert ConversationStore rows -> SDK replay-envelope stream.
 
-    Per spike R1: history is fed as a sequence of `"type":"user"` envelopes.
-    Assistant turns do NOT need to be emitted back — the SDK reconstructs
-    context from the user envelopes in stream order.
+    Phase-8 production fix-pack: each turn yields a `"type":"user"` envelope
+    AND, when present, a following `"type":"assistant"` envelope carrying
+    the concatenated `TextBlock` content of the assistant's reply in that
+    turn. The earlier spike-R1 assumption ("SDK reconstructs context from
+    user envelopes alone") did NOT hold in practice — in production the
+    model saw N user questions with zero assistant answers and replied
+    with an identical canned greeting every turn, treating each message
+    as a first contact. Emitting the assistant side explicitly restores
+    multi-turn continuity.
 
     Phase 4 Q1 extension: tool_use / tool_result blocks are STILL not
     replayed to the SDK directly (U1 unverified). Instead a synthetic
@@ -164,10 +170,25 @@ def history_to_user_envelopes(
 
     for turn_id in order:
         user_texts: list[str] = []
+        assistant_texts: list[str] = []
         tool_names: list[str] = []
         results_by_name: dict[str, list[dict[str, Any]]] = {}
 
         for row in by_turn[turn_id]:
+            if row["role"] == "assistant" and row.get("block_type") == "text":
+                # Phase-8 fix-pack: replay assistant TextBlocks as their own
+                # envelope so the SDK model actually sees its prior replies.
+                # `tool_use` assistant rows are handled by the dedicated
+                # branch below; pure text replies land here.
+                for block in row["content"]:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") != "text":
+                        continue
+                    text = block.get("text")
+                    if isinstance(text, str) and text:
+                        assistant_texts.append(text)
+                continue
             if row["role"] == "user":
                 for block in row["content"]:
                     if not isinstance(block, dict):
@@ -238,3 +259,21 @@ def history_to_user_envelopes(
             "parent_tool_use_id": None,
             "session_id": session_id,
         }
+
+        if assistant_texts:
+            # Emit one assistant envelope per turn. Multiple TextBlocks in the
+            # same assistant row (or across rows) are joined with blank lines
+            # so the model reads a single coherent reply. Interrupted /
+            # text-less turns produce no assistant envelope — matches the
+            # phase-2 invariant that the SDK never sees half-finished replies.
+            yield {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "\n\n".join(assistant_texts)}
+                    ],
+                },
+                "parent_tool_use_id": None,
+                "session_id": session_id,
+            }
