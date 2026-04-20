@@ -34,7 +34,7 @@ Background subagents (two paths):
 - For long-running work (>30 s) that should NOT block the main turn, run
   `python tools/task/main.py spawn --kind <general|worker|researcher>
   --task "<text>"` via Bash. This path is ASYNCHRONOUS — the CLI returns
-  `{"job_id": N, "status": "requested"}` immediately, the daemon's picker
+  `{{"job_id": N, "status": "requested"}}` immediately, the daemon's picker
   dispatches the subagent in the background, and the final reply is
   delivered to the owner via Telegram automatically. Your main turn can
   close with a short confirmation ("окей, запустил job N в фоне").
