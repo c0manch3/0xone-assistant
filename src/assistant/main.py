@@ -50,13 +50,13 @@ class Daemon:
                 stderr=asyncio.subprocess.PIPE,
             )
             try:
-                _out, err = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+                _out, err = await asyncio.wait_for(proc.communicate(), timeout=45.0)
             except TimeoutError:
                 proc.kill()
                 await proc.wait()
                 plog.error(
                     "claude_cli_timeout",
-                    hint="`claude --print ping` hung for 15s",
+                    hint="`claude --print ping` hung for 45s",
                 )
                 sys.exit(3)
         except FileNotFoundError:
