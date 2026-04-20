@@ -39,6 +39,26 @@ RUN set -eux; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/*
 
+# ── Node.js 20 + Claude Code CLI ─────────────────────────────────────────
+# The `claude` CLI is a Node.js tool distributed as the npm package
+# `@anthropic-ai/claude-code`. The Python `claude-agent-sdk` invokes it
+# via subprocess, so the binary must live on PATH inside the container.
+# Phase-2 preflight (daemon startup) hard-stops if `claude --version`
+# is not resolvable — see commit 54d41b0.
+#
+# NodeSource's setup script pins the apt repo for Node.js 20.x (LTS);
+# we then install the CLI globally and smoke-test it in the same layer
+# so a missing/broken binary fails the build rather than runtime.
+RUN set -eux; \
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -; \
+    apt-get install -y --no-install-recommends nodejs; \
+    npm install -g @anthropic-ai/claude-code@latest; \
+    node --version; \
+    npm --version; \
+    claude --version; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/* /root/.npm
+
 # uv tunables: never download a different Python interpreter, always use the
 # one baked into the base image; install into the project's .venv.
 ENV UV_PYTHON_DOWNLOADS=never \
