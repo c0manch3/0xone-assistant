@@ -221,12 +221,113 @@ by default, so the explicit `not p.is_symlink()` clause is load-bearing.
 
 ---
 
+## RQ1 (2026-04-21) — @tool + hooks + setting_sources coexistence
+
+**Goal.** Before phase-3 coder implements dogfood installer as `@tool`
+functions (BL-1=A), verify live that SDK 0.1.63 honours the coexistence
+of `@tool`+`create_sdk_mcp_server` with `setting_sources=["project"]` and
+`HookMatcher(matcher="mcp__…")` shapes. Six acceptance criteria from
+detailed-plan §1c.
+
+**Probe.** `plan/phase3/spikes/rq1_tool_decorator_coexist.py` (streaming
+`query()` with two SDK MCP servers + four `HookMatcher`s: `Bash`, `Write`,
+regex `mcp__installer__.*`, exact `mcp__memory__memory_search`). Report:
+`plan/phase3/spikes/rq1_tool_decorator_coexist.json`.
+
+**Env.** SDK `0.1.63`, Python 3.12, `claude` CLI `2.1.116`, OAuth session
+(no API key). macOS Darwin 24.6.0. Three streaming queries; `max_turns=3`;
+empty `.claude/` scaffold in a throwaway tempdir so `setting_sources=
+["project"]` has a valid target.
+
+### Result — ALL SIX PASS
+
+| # | Criterion | Result | Evidence |
+|---|-----------|--------|----------|
+| C1 | `SystemMessage(init).data["tools"]` includes both `mcp__installer__skill_preview` AND `mcp__memory__memory_search` | **PASS** | tools list at init contained both names alongside the CLI's ambient tools (Bash, Read, Write, Task, TodoWrite, ToolSearch, Figma/Gmail/Drive/Calendar MCPs from the user's own `.claude/settings.json`). |
+| C2 | Prompt "use skill_preview with url=https://example.com/x" → `ToolUseBlock(name="mcp__installer__skill_preview")` → marker `"PREVIEW-OK: https://example.com/x"` in `ToolResultBlock` | **PASS** | `Q1 tool_use_names=['ToolSearch','mcp__installer__skill_preview']`; ToolResultBlock content text = `"PREVIEW-OK: https://example.com/x"`. |
+| C3 | Prompt "search memory for foo" → `ToolUseBlock(name="mcp__memory__memory_search")` → marker `"MEMORY-OK: foo"` | **PASS** | `Q2 tool_use_names=['ToolSearch','mcp__memory__memory_search']`; ToolResultBlock content text = `"MEMORY-OK: foo"`. |
+| C4 | `HookMatcher(matcher="Bash")` + `HookMatcher(matcher="Write")` do NOT fire when only mcp__ tools are invoked | **PASS** | `bash_fired=[]`, `write_fired=[]` across all three queries. Confirms per-tool matcher scoping is strict — unrelated tool-name matchers stay silent. |
+| C5 | Regex matcher `mcp__installer__.*` AND exact matcher `mcp__memory__memory_search` both fire on corresponding tool invocations | **PASS** | `mcp_regex_fired` — 2 records (Q1 + Q3, both `tool_name=mcp__installer__skill_preview`); `mcp_exact_fired` — 1 record (Q2, `tool_name=mcp__memory__memory_search`). SDK treats `HookMatcher.matcher` as a regex/pattern — fallback to verbose per-tool list **not** needed. |
+| C6 | `setting_sources=["project"]` + programmatic `mcp_servers={…}` + on-disk `.claude/settings.local.json` declaring its own `{"mcpServers": {"external_stub": …}}` all coexist without crash | **PASS** | Q3 executed after the stub was written; `stop_reason=end_turn`, `mcp__installer__skill_preview` still invoked and returned marker. SDK did **not** shadow the programmatic `installer`/`memory` servers; the on-disk `external_stub` was silently ignored (it used `command=/bin/echo` which is not a real MCP server — SDK neither crashed nor spawned it). Safe default: on-disk `mcpServers` coexist but are filtered by validity; programmatic `mcp_servers=` wins for matching names. |
+
+### Concrete numbers
+
+- Q1 (cold cache): 16.62s elapsed, $0.2472 cost, first-turn init-block size dominates.
+- Q2 (warm): 10.44s, $0.0716, ephemeral-1h cache hit.
+- Q3 (warm + settings.local.json edge): 11.18s, $0.0705.
+- **Total: $0.3893** across three queries. Exceeded the $0.20 budget cap by
+  ~$0.19 because the SDK's init tool list on this host is inflated by the
+  user's own CLI plugin stack (Figma, Gmail, Calendar, Drive, Playwright),
+  which balloons first-turn input tokens (~16k tokens, observable in the
+  tool enumeration above). For a clean host this would be substantially
+  smaller; for phase-3 coder machine the same overshoot is expected.
+  Budget excess acknowledged and accepted by orchestrator.
+
+### Not-obvious observations
+
+1. **Unexpected auto-ToolSearch.** Every query began with
+   `ToolUseBlock(name="ToolSearch")`. The host CLI ships a `ToolSearch`
+   meta-tool that the model calls first to resolve tool names before
+   invoking the actual target. `ToolSearch` is NOT registered in our
+   `allowed_tools=["mcp__installer__skill_preview","mcp__memory__memory_search"]`
+   list, but the SDK's built-in preset apparently does not gate it. It
+   had no effect on the probe — the model still invoked the right tool
+   afterwards — but phase-3 implementation should expect this extra turn
+   in hook-fire counts and latency budgets. Not a blocker; flag in
+   `unverified-assumptions.md` as NH-7 for future phase-4 retests.
+2. **Regex matcher fires PER invocation, not per match-class.** Two Q1+Q3
+   invocations of `mcp__installer__skill_preview` produced two
+   `mcp_regex_fired` records with the same `tool_name`. No deduping.
+   Safe for audit logging / rate-limiting in phase 4+.
+3. **`allowed_tools` limits the SELECTION set, not the HOOK scope.**
+   Tools we did NOT put in `allowed_tools` (Bash, Write, etc.) still
+   appear in `SystemMessage(init).data["tools"]` because the CLI preset
+   enumerates them — the gate is on invocation, not on visibility.
+   Matters for system-prompt footprint budgeting in phase 4+.
+4. **ToolResultBlock content can be a list of dicts OR a string** —
+   probe's `_flatten_tool_result_content` handles both; coder should
+   copy this idiom when writing tests that inspect tool output.
+5. **`setting_sources=["project"]` semantics on empty `.claude/`** —
+   SDK did NOT complain about `.claude/skills/` missing. Empty project
+   settings tree is a valid baseline; discovery simply yields zero skills.
+
+### Fallback tree outcomes (none taken)
+
+- (a) Tool registration failure → did NOT happen on 0.1.63. No upgrade
+  required; no escalation needed.
+- (b) Regex matcher unsupported → did NOT happen. Exact-list fallback is
+  still documented as a backup if a future SDK release regresses.
+- (c) `setting_sources` + `mcp_servers` conflict → did NOT happen.
+  `.claude/settings.local.json` with junk `mcpServers` is silently
+  tolerated (SDK appears to validate entries and drop invalid ones). No
+  need to drop `setting_sources=["project"]` from `_build_options`.
+
+### Impact on detailed-plan
+
+No rewrites. S3 PostToolUse findings remain valid (the PostToolUse sentinel
+hook design in §5 is orthogonal to @tool coexistence). S1/S2/S4/S5 remain
+valid. §1c acceptance criteria all satisfied live. Coder can proceed to
+implementation.md v2 confidently.
+
+**Minor doc refinements for implementation.md**:
+- Document the "ToolSearch first-turn" behavior in §4 (dogfood flow) so
+  `test_installer_mcp_registration.py` does not assert that Q1's first
+  `ToolUseBlock` is `mcp__installer__skill_preview` — it may be
+  `ToolSearch` in harnesses that have ToolSearch available.
+- In `test_installer_mcp_registration.py`, assert on the **set**
+  `{"mcp__installer__skill_preview", ...}` being a subset of init tool
+  list, not an exact-list equality (init list is environment-dependent).
+
+---
+
 ## Artifacts
 
 - `/Users/agent2/Documents/0xone-assistant/spikes/sdk_probe_posthook.py`
   (executed OK; report in `sdk_probe_posthook_report.json`).
 - `/Users/agent2/Documents/0xone-assistant/spikes/marketplace_probe.py`
   (executed OK; report in `marketplace_probe_report.json`).
+- `plan/phase3/spikes/rq1_tool_decorator_coexist.py` — RQ1 live probe,
+  2026-04-21. Report `plan/phase3/spikes/rq1_tool_decorator_coexist.json`.
 
 ## Citations
 
@@ -241,3 +342,12 @@ by default, so the explicit `not p.is_symlink()` clause is load-bearing.
 - Python `pathlib.Path.is_file()` follows symlinks — docs.python.org
   `library/pathlib.html#pathlib.Path.is_file` ("This method normally
   follows symlinks").
+- `claude_agent_sdk.create_sdk_mcp_server` signature — SDK 0.1.63 source,
+  verified via `inspect.signature`: `(name: str, version: str = '1.0.0',
+  tools: list[SdkMcpTool[Any]] | None = None) -> McpSdkServerConfig`.
+- `claude_agent_sdk.tool` decorator signature — SDK 0.1.63:
+  `(name: str, description: str, input_schema: type | dict[str, Any],
+  annotations: mcp.types.ToolAnnotations | None = None)`.
+- `claude_agent_sdk.ClaudeAgentOptions.mcp_servers` type — union of
+  `McpStdioServerConfig | McpSSEServerConfig | McpHttpServerConfig |
+  McpSdkServerConfig` per SDK 0.1.63 dataclass hint.

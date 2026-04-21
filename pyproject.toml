@@ -35,7 +35,7 @@ target-version = "py312"
 # Spikes are reference material frozen in-repo; they intentionally use
 # style that the main codebase rejects (e.g. nested with statements,
 # noqa for BLE001). Keep them out of ruff + mypy.
-extend-exclude = ["plan/phase2/spikes"]
+extend-exclude = ["plan/phase2/spikes", "plan/phase3/spikes"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF", "ASYNC"]

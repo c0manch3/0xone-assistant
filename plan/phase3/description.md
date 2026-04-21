@@ -2,27 +2,54 @@
 
 **Цель:** бот умеет нативно расширять себя двумя путями: (1) модель сама пишет новый скилл через встроенный Write tool, опираясь на Anthropic's `skill-creator` skill (берётся из публичного marketplace); (2) пользователь/модель ставит готовый скилл по URL или из marketplace.
 
-**Вход:** phase 2 (ClaudeBridge + hooks + manifest cache + `invalidate_manifest_cache()` + `touch_skills_dir()` API + sandboxed Write path-guard).
+**Вход:** phase 2 shipped (commit `fbd9c18`): `ClaudeBridge` + 7 PreToolUse hooks + `_MANIFEST_CACHE` mtime-max dict (no public invalidation API yet) + sandboxed Write/Edit path-guard + `SystemPromptPreset` preset-append. Phase 3 **introduces** public helpers `invalidate_manifest_cache()` + `touch_skills_dir()` in `bridge/skills.py` and extracts `_normalize_allowed_tools` as a named helper.
 
 **Выход:** два рабочих сценария через бот:
 1. "сделай скилл для погоды" → модель подтягивает `skills/skill-creator/SKILL.md` (установленный при auto-bootstrap из Anthropic marketplace) → через Write пишет `skills/weather/SKILL.md` + `tools/weather/main.py` (Write sandboxed phase 2) → PostToolUse hook touch'ит `data/run/skills.dirty` → следующий же запрос видит новый скилл в manifest.
-2. "какие есть готовые скилы?" → модель зовёт `skill-installer marketplace list` → JSON-список → пользователь выбирает → `skill-installer marketplace install NAME` → preview → "да" → atomic copy → готово. Либо тот же flow с произвольным URL: `skill-installer install <URL>`.
+2. "какие есть готовые скилы?" → модель вызывает `mcp__installer__marketplace_list` → JSON-список → пользователь выбирает → `mcp__installer__marketplace_install(name="NAME")` → preview → "да" → `mcp__installer__skill_install(url=..., confirmed=true)` → atomic copy → готово. Либо тот же flow с произвольным URL: `mcp__installer__skill_preview(url=<URL>)` → confirm → `skill_install`.
 
-**Источник marketplace:** Anthropic's skills лежат в подкаталоге `skills/` своего репо. API-путь — `/repos/anthropics/skills/contents/skills` (не корень), а tree-URL-шаблон — `https://github.com/anthropics/skills/tree/main/skills/<name>/`. Hardcoded в `tools/skill-installer/_lib/marketplace.py` (`MARKETPLACE_URL`, `MARKETPLACE_BASE_PATH="skills"`).
+**Источник marketplace:** Anthropic's skills лежат в подкаталоге `skills/` своего репо. API-путь — `/repos/anthropics/skills/contents/skills` (не корень), а tree-URL-шаблон — `https://github.com/anthropics/skills/tree/main/skills/<name>/`. Hardcoded constants (`MARKETPLACE_URL`, `MARKETPLACE_BASE_PATH="skills"`) живут в `src/assistant/tools_sdk/_installer_core.py` (imported shared helpers module for all installer `@tool` functions). Fetch chooses первое из available: `gh api`, `git clone --depth=1`, `httpx` (raw.githubusercontent.com fallback для single-file fetches).
 
 ## Задачи
 
-- **PostToolUse tool-invocation enforcement** — блокер для phase 4. Обеспечивает что Claude реально выполняет Bash/tool command из SKILL.md body, НЕ просто читает body и отвечает текстом. Кандидаты: `UserPromptSubmit` hook re-injection, `PostToolUse(Skill)` → `PreToolUse(Bash)` verification, ИЛИ архитектурный pivot на `@tool`-decorator custom tools для CLI tools. См. `plan/phase2/known-debt.md#D1`.
+- **@tool-decorator pivot (D1 closeout, owner-decided Q-D1=c, 2026-04-21)** — Opus 4.7 системно игнорирует imperative "run X via Bash" в skill body (GH #39851/#41510); owner выбрал architectural pivot вместо PostToolUse enforcement. Phase 3 **не добавляет** D1 hooks или cross-turn state tracking. Вместо этого:
+  - Skills остаются prompt-expansions only (phase-2 ping pattern, midomis-style): SKILL.md body описывает поведение как text-gen / reference / workflow guidance, НЕ как Bash-macro.
+  - Phase 3 вводит **groundwork** для `@tool`-decorator custom SDK tools: в `bridge/claude.py` добавляется `mcp_servers={}` slot в `ClaudeAgentOptions` (пустой в phase 3, заполнится в phase 4+ memory).
+  - Researcher spike RQ1 в step 4 MUST verify: (a) `claude_agent_sdk.tool` decorator + `create_sdk_mcp_server` live-работают, (b) custom tools видны model'ю через `SystemMessage(init).data["tools"]`, (c) существующие PreToolUse hooks intercept custom-tool calls (Bash/Read/Write still gated), (d) `setting_sources=["project"]` + `mcp_servers=` coexist без конфликта.
+  - Phase 4 memory precondition: memory_search/memory_write будут `@tool` functions в `src/assistant/tools_sdk/memory.py`, зарегистрированные через `create_sdk_mcp_server`. SKILL.md-based memory tool **отменён**.
+  - Phase 8 gh tool аналогично.
+  
+  Acceptance criterion: researcher spike RQ1 PASSES (hermetic live test с 1 dummy `@tool`) + phase-4 plan description.md обновлён что memory = `@tool`.
+  
+  См. `plan/phase2/known-debt.md#D1` + `memory/reference_claude_agent_sdk_gotchas.md`.
 
-1. **`tools/skill-installer/main.py` + `_lib/`** — CLI установки по URL **и** из marketplace. Подкоманды:
-   - `preview <URL>` / `install --confirm --url <URL>` — базовый flow fetch → static-validate → preview → re-fetch → SHA-compare → atomic copy. Cache-by-URL (`sha256(canonical_url)[:16]`), TOCTOU-защита через повторный fetch + сравнение `sha256_of_tree(bundle)`; расхождение → `exit 7` "source changed since preview".
-   - `marketplace list` — скачивает index публичного Anthropic-маркета (`MARKETPLACE_URL = "https://github.com/anthropics/skills"`, hardcoded; `gh api /repos/anthropics/skills/contents/skills`), возвращает JSON `[{name, description}, ...]`.
-   - `marketplace info NAME` — fetch SKILL.md конкретного скилла (`/repos/anthropics/skills/contents/skills/<NAME>/SKILL.md`) + краткое превью.
-   - `marketplace install NAME` — shortcut: строит tree-URL `https://github.com/anthropics/skills/tree/main/skills/<NAME>/` и делегирует `install`.
-   - `status NAME` — прогресс асинхронного `uv sync` (Q8).
-2. **Auto-bootstrap Anthropic's `skill-creator` (fire-and-forget).** В `Daemon.start()` после `ensure_skills_symlink` стартуем фоновую задачу через `asyncio.create_task(self._bootstrap_skill_creator_bg())` — **без** `await`. Задача сама проверяет наличие `skills/skill-creator/` и, если нет, зовёт `python tools/skill-installer/main.py marketplace install skill-creator --confirm` с внутренним таймаутом 120 сек. Любой исход (`ok` / `failed` / `timeout` / `exception`) уходит в `log.info` / `log.warning`; главный flow бота и `Daemon.start()` никогда не ждут bootstrap. Owner в Telegram про это не видит.
-3. **`skills/skill-installer/SKILL.md`** — описание для модели как вызывать CLI (preview+confirm flow, marketplace subcommands, примеры диалогов). `skills/skill-creator/` ставится автоматически при первом старте — не кладём в репо.
-4. **URL detector в `handlers/message.py`** — регексп на http(s)/git@; если URL найден — одноразовая system-note ("пользователь прислал URL X; возможно хочет поставить скилл — проверь через `skill-installer preview`, иначе игнорируй").
+1. **`src/assistant/tools_sdk/installer.py`** — `@tool`-decorator functions replacing legacy CLI approach. Dogfood pivot per BL-1 (2026-04-21): model invokes installer как first-class SDK tools, не через SKILL.md+Bash body-instruction pattern. Functions:
+   - `@tool("skill_preview", "Fetch + validate skill from URL, return preview JSON", {"url": str})` — базовый flow: fetch (gh api | git clone | httpx для raw) → static validate (SKILL.md frontmatter, Python AST, no path traversal, size limits) → preview JSON с `{name, description, files, sha}`. Cache в `<data_dir>/installer-cache/<sha256_of_url[:16]>/`, TTL 7 days.
+   - `@tool("skill_install", "Install previewed skill after user confirmation", {"url": str, "confirmed": bool})` — requires prior `skill_preview` in same session; re-fetches, SHA-compares с cached bundle → расхождение = `{"error": "source changed since preview", "code": 7}` (model surfaces to user). Atomic copy skills/<name>/ + tools/<name>/ via tmp+rename. Returns `{"installed": true, "name": name, "sync_pending": true}`.
+   - `@tool("skill_uninstall", "Remove installed skill", {"name": str, "confirmed": bool})` — requires `confirmed=true`. rmtree skills/<name> + tools/<name>, sentinel touch. Idempotent on missing → `{"removed": false, "reason": "not installed"}`.
+   - `@tool("marketplace_list", "List available skills from Anthropic marketplace", {})` — hardcoded `gh api /repos/anthropics/skills/contents/skills` → JSON `[{name, description}]`. Gated behind `shutil.which("gh")`; если нет — fallback `git clone --depth=1 --sparse` на `<data_dir>/run/tmp/anthropics-skills/` (if `git` available). Если ни `gh`, ни `git` — returns `{"error": "marketplace requires gh or git", "code": 9}`.
+   - `@tool("marketplace_info", "Show SKILL.md for marketplace skill", {"name": str})` — fetch конкретный SKILL.md через `gh api contents/skills/<NAME>/SKILL.md` (или git sparse).
+   - `@tool("marketplace_install", "Shortcut to install from marketplace by name", {"name": str})` — строит tree-URL `https://github.com/anthropics/skills/tree/main/skills/<NAME>/` и делегирует `skill_install` flow (preview inclusive).
+   - `@tool("skill_sync_status", "Check async uv sync status for installed skill", {"name": str})` — читает `<data_dir>/run/sync/<name>.status.json` → `{"status": "pending|ok|failed", "elapsed_sec": N, "error": ...}`.
+
+   All `@tool`s register через `create_sdk_mcp_server(name="installer", version="0.1.0", tools=[...])` и передаются в `ClaudeAgentOptions.mcp_servers={"installer": ...}`. Internal helpers live в `src/assistant/tools_sdk/_installer_core.py` (fetch, validate, atomic_install, etc.) — importable units, не `@tool`.
+
+   Legacy `tools/skill-installer/main.py` CLI **не создаётся**. Если owner захочет manual invocation outside of chat — future phase (или direct Python module invocation). Phase 3 single entry point = model через `@tool`.
+
+   **BL-2 closeout:** installer detects missing `gh` AND missing `git` в `_gh_wrapper`/`_git_wrapper` helpers → returns `{"error": "marketplace requires gh or git", "code": 9}` в tool response. Partial-install detection: `atomic_install` touch'ит marker `.0xone-installed` AFTER atomic rename; bootstrap checks marker (not directory existence) to detect partial installs. `<data_dir>/run/tmp/` auto-cleaned on `Daemon.start()` via existing `_sweep_run_dirs`.
+2. **Auto-bootstrap Anthropic's `skill-creator` via direct Python fetch+Write (fire-and-forget).** В `Daemon.start()` после `ensure_skills_symlink` запускаем `asyncio.create_task(self._bootstrap_skill_creator_bg())`. Task:
+   - Check marker `skills/skill-creator/.0xone-installed` → if exists, return (idempotent).
+   - Attempt fetch bundle (gh api OR git clone fallback) in `<data_dir>/run/tmp/skill-creator-boot/`.
+   - Validate bundle (same static checks as `_installer_core`): SKILL.md frontmatter valid, files within size limits, Python AST OK, no path traversal.
+   - Atomic copy (tmp+rename) → `skills/skill-creator/`. Touch `skills/skill-creator/.0xone-installed` marker.
+   - Touch sentinel `<data_dir>/run/skills.dirty`.
+   - Log `skill_creator_bootstrap_ok` or `_failed` / `_timeout` (120s task-internal timeout) / `_exception`.
+
+   **Key change vs pre-wipe plan:** bootstrap is direct Python fetch+Write inside `_bootstrap_skill_creator_bg`, NOT `marketplace install skill-creator` subprocess (which would rely on skill-installer being already available — chicken-and-egg). Body-compliance issue (#39851) bypassed entirely: no model, no body-following, just Python I/O.
+
+   `Daemon.start()` never awaits this task. `shutil.which("gh")` None AND `shutil.which("git")` None → bootstrap skipped immediately, log.warning surfaces in daemon log (owner может проверить через `tail /tmp/0xone-phase2-daemon.log`). Acceptance criterion (§"Критерии"): bootstrap exit состояние `ok|failed|timeout|skipped_no_gh_nor_git` всегда logged.
+3. **`skills/skill-installer/SKILL.md`** — thin description (не body-instruction). Frontmatter: `name: skill-installer`, `description: Manage skill installation from GitHub/marketplace. Use when user wants to preview, install, or uninstall a skill.`. Body покрывает **когда** использовать `skill_preview/skill_install/marketplace_list/etc.` tools (с trigger phrases "поставь скилл", "какие скилы есть", "удали скилл X"), с examples диалогов. Но body НЕ говорит "run via Bash" — tools first-class через MCP. Model увидит tool names в `SystemMessage(init).data["tools"]`, description/triggers в skill body = discoverability aid.
+4. **URL detector в `handlers/message.py`** — регексп на http(s)/git@; если URL найден — одноразовая system-note ("пользователь прислал URL X; если похоже на skill bundle, используй `skill_preview` tool, иначе игнорируй").
 5. **Расширение Bash-allowlist в `bridge/hooks.py`** (phase 2 `_BASH_PROGRAMS`):
    - `git clone --depth=1 <https-url> <dest>` — schema-check + path-guard на dest.
    - `uv sync --directory tools/<name>` — path-guard.
@@ -31,13 +58,13 @@
    - Остальные `gh` и `git` подкоманды остаются закрытыми.
    - Требуется `gh` на хосте — задокументировано в README; при отсутствии `shutil.which("gh")` в `Daemon.start()` логируем `log.error` и отключаем marketplace-функционал, CLI в целом остаётся живым.
 6. **PostToolUse hook для auto-sentinel.** В `bridge/hooks.py::make_posttool_hooks(data_dir)` возвращаем `[HookMatcher(matcher="Write"), HookMatcher(matcher="Edit")]`: если `file_path` лежит внутри `skills/` или `tools/` — `touch data/run/skills.dirty`. Это полностью заменяет необходимость CLI `skill-creator` самому дёргать sentinel: любой Write/Edit модели в skills/tools авто-инвалидирует кэш. `ClaudeBridge._build_options` мержит PreToolUse + PostToolUse hook'и.
-7. **Hot-reload скилов через sentinel-файл.** `ClaudeBridge._render_system_prompt` в начале каждого query чекает `data/run/skills.dirty` → `invalidate_manifest_cache()` + `touch_skills_dir()` + `unlink(sentinel)`.
+7. **Hot-reload скилов через sentinel-файл.** Phase 3 добавляет в `bridge/skills.py` публичные `invalidate_manifest_cache()` (сбрасывает `_MANIFEST_CACHE` dict) и `touch_skills_dir(skills_dir)` (делает `os.utime(skills_dir)` — bumps mtime так что phase-2 cache-key fires). `ClaudeBridge._render_system_prompt` в начале каждого query проверяет `data/run/skills.dirty` → вызывает оба helper'а + `unlink(sentinel)`.
 8. **Тесты:** marketplace list/install happy-path (mock `gh api` subprocess), installer git-mock, installer ssrf-deny, path-traversal, size limits, URL detector, PostToolUse hook → sentinel, auto-bootstrap (mock subprocess → skill-creator появляется), bash allowlist для `gh api` и `git clone`.
 
 ## Критерии готовности
 
-- Диалог "сделай скилл echo" → модель через Anthropic's `skill-creator` (установленный при бутстрапе) пишет `skills/echo/SKILL.md` + `tools/echo/main.py` через Write → PostToolUse hook touch'ит sentinel → следующий turn видит `echo` в `{skills_manifest}` system prompt'а.
-- Диалог "какие есть скилы в marketplace" → `marketplace list` → JSON со списком → пользователь выбирает → `marketplace install NAME` → preview → "да" → установлено → виден в manifest.
+- Диалог "сделай скилл echo" → skill-creator installed через auto-bootstrap (direct Python — no model body-following) → model invoked `mcp__installer__skill_preview(url=<tree-URL>)` или напрямую использует skill-creator guidance → пишет `skills/echo/SKILL.md` + `tools/echo/main.py` через `Write` tool (phase-2 path-guard) → PostToolUse hook touch'ит sentinel → следующий turn видит `echo` в manifest.
+- Диалог "какие есть скилы в marketplace" → model invokes `mcp__installer__marketplace_list` → Telegram sees `[{name, description}, ...]` → owner "поставь weather" → model `mcp__installer__marketplace_install(name="weather")` → preview text inlined в response → owner "да" → model `mcp__installer__skill_install(url=<cached-preview-url>, confirmed=true)` → atomic copy → async `uv sync` starts → `{"installed": true, "sync_pending": true}` → manifest обновлён на след. turn.
 - Auto-bootstrap **не блокирует `Daemon.start()`** — старт завершается за <2 сек независимо от доступности GitHub; `skills/skill-creator/` появляется асинхронно. Fail → `log.warning skill_creator_bootstrap_failed` (или `_timeout` / `_exception`), бот продолжает работать.
 - PostToolUse hook: Write в `skills/test/SKILL.md` → `data/run/skills.dirty` существует сразу после возврата Write'а.
 - Bash allowlist:
@@ -52,10 +79,28 @@
 - TOCTOU detection: `preview <URL>` → bundle v1 → изменить источник → `install --confirm --url <URL>` → re-fetch видит bundle v2 → SHA-compare fail → `exit 7` с сообщением "bundle on source changed since preview".
 - URL на `http://169.254.169.254/latest/meta-data` — SSRF guard режет fetch up-front.
 - `<data_dir>/run/` sweeper при старте: `tmp/` >1ч и `installer-cache/` >7д удаляются.
+- **@tool groundwork + dogfood installer (Q-D1=c + BL-1=A closeout):** `ClaudeAgentOptions.mcp_servers={"installer": <create_sdk_mcp_server>}` wired в `_build_options`. `src/assistant/tools_sdk/installer.py` defines `@tool("skill_preview"|"skill_install"|"skill_uninstall"|"marketplace_list"|"marketplace_info"|"marketplace_install"|"skill_sync_status")` — 7 tools total. Researcher spike RQ1 pass hermetically: (a) registered tools visible в SystemMessage(init).data["tools"] as `mcp__installer__*`, (b) model invokes any installer tool + receives ToolResultBlock, (c) PreToolUse hooks на Bash/Read/Write still fire when installer internals call Bash (e.g. `gh api` subprocess via `asyncio.create_subprocess_exec`) — hook intercepts Bash invocation regardless of parent `@tool` context.
+
+## Closed architectural decisions (Q&A 2026-04-21)
+
+| Q | Решение | Impact |
+|---|---|---|
+| Q-D1 | (c) @tool-decorator pivot | Phase 3 scope **уменьшается**: no D1 enforcement hooks. Groundwork `mcp_servers={}` in ClaudeAgentOptions. Phase 4 memory = @tool. Phase 8 gh = @tool. Researcher spike RQ1 в step 4 verifies `@tool`+`setting_sources` coexistence. |
+| Q2 | All together | Marketplace + installer + @tool groundwork shipped in single phase-3 pass. |
+| Q3 | Hardcoded marketplace | `MARKETPLACE_URL = "https://github.com/anthropics/skills"` — no env-var configuration. |
+| Q4 | GitHub + gist + raw | `gh api` + `git clone --depth=1` + `httpx` for raw. SSRF guard bounded. |
+| Q5 | Plain-text confirm | `install --confirm` через "да"/"нет" в Telegram. Inline keyboards — phase 8. |
+| Q6 | URL detector all URLs | Regexp emit system-note per any URL. Hermetic test asserts note fires, model decides install. |
+| Q7 | Fire-and-forget bootstrap | Anthropic's skill-creator auto-installed через background task 120s timeout. `Daemon.start()` не ждёт. |
+| Q8 | gh required + git fallback | `shutil.which("gh")` None → log.error + disable marketplace subcommands; ad-hoc URL install через git clone. |
+| Q9 *(pre-wipe; dogfood form in BL-1=A)* | Async uv sync | Per-tool `uv sync --directory` в background; `skill-installer status NAME` polls. **Dogfood form:** polling через `@tool("skill_sync_status", {"name": str})`. |
+| Q10 *(pre-wipe; dogfood form in BL-1=A)* | Uninstall subcommand | `skill-installer uninstall NAME` = rmtree skills+tools + sentinel touch. ~30 LOC. **Dogfood form:** `@tool("skill_uninstall", {"name": str, "confirmed": bool})`. |
+| Q11 | Sentinel: skills/+tools/ | PostToolUse(Write|Edit) triggers on both dirs. |
+| Q12 | Cache TTL 7 days | `installer-cache/` old entries pruned на install + boot. |
 
 ## Зависимости
 
-Phase 2 (manifest cache + `invalidate_manifest_cache()` + Bash/file/WebFetch hooks + Write path-guard).
+Phase 2 shipped (commit `fbd9c18`): `ClaudeBridge` streaming-input, manifest mtime-max cache, Bash/file/WebFetch PreToolUse hooks, sandboxed Write path-guard. Phase 3 **вводит** публичные `invalidate_manifest_cache` / `touch_skills_dir` helpers поверх phase-2 internal cache dict.
 
 ## Явно НЕ в phase 3
 

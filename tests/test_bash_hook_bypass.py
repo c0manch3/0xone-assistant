@@ -104,6 +104,15 @@ DENY_CASES = [
     "echo token=abc",
     "echo password=abc",
     "echo ANTHROPIC_API_KEY=leak",
+    # B2 (wave-3): bash variable expansion must not slip through. The
+    # ``cat $HOME/...`` cases bypass the literal-path allowlist because
+    # ``$HOME`` is not expanded before containment checks. The slip-guard
+    # is universal so even allowlisted ``echo`` is denied once a ``$VAR``
+    # appears (plain ``echo hello world`` still allows — no expansion).
+    "cat $HOME/.ssh/config",
+    "cat ${HOME}/.ssh/config",
+    "echo $PATH",
+    "echo ${HOME}",
 ]
 
 

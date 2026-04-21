@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil as _shutil
 import signal
 import sys
+from typing import Any
 
 import aiosqlite
 
@@ -18,6 +20,8 @@ from assistant.handlers.message import ClaudeHandler
 from assistant.logger import get_logger, setup_logging
 from assistant.state.conversations import ConversationStore
 from assistant.state.db import apply_schema, connect
+from assistant.tools_sdk import _installer_core as _core
+from assistant.tools_sdk import installer as _installer_mod
 
 log = get_logger("main")
 
@@ -27,6 +31,7 @@ class Daemon:
         self._settings = settings
         self._conn: aiosqlite.Connection | None = None
         self._adapter: TelegramAdapter | None = None
+        self._bg_tasks: set[asyncio.Task[Any]] = set()
 
     async def _preflight_claude_auth(self) -> None:
         """Fail-fast if the ``claude`` CLI is missing or unauthenticated.
@@ -88,6 +93,20 @@ class Daemon:
         )
         ensure_skills_symlink(self._settings.project_root)
 
+        # Phase 3: configure installer BEFORE ClaudeBridge is constructed —
+        # the bridge imports ``INSTALLER_SERVER`` at module load; the @tool
+        # handlers need ``project_root`` / ``data_dir`` resolved at call
+        # time through the shared ``_CTX`` dict.
+        _installer_mod.configure_installer(
+            project_root=self._settings.project_root,
+            data_dir=self._settings.data_dir,
+        )
+        # Sweep stale tmp / cache dirs + crashed-install staging dirs.
+        self._spawn_bg(_core.sweep_run_dirs(self._settings.data_dir))
+        self._spawn_bg(_core.sweep_legacy_stage_dirs(self._settings.project_root))
+        # Bootstrap Anthropic's skill-creator bundle on first boot.
+        self._spawn_bg(self._bootstrap_skill_creator_bg())
+
         # Q2: ensure the XDG data dir + its parent exist before sqlite opens.
         self._settings.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = await connect(self._settings.db_path)
@@ -106,10 +125,94 @@ class Daemon:
         await self._adapter.start()
         log.info("daemon_started", owner=self._settings.owner_chat_id)
 
+    def _spawn_bg(self, coro: Any) -> None:
+        """Anchor a background coroutine so it is not GC'd mid-flight
+        (NH-5: ``asyncio.create_task`` orphan risk)."""
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    async def _bootstrap_skill_creator_bg(self) -> None:
+        """Best-effort first-boot install of Anthropic's ``skill-creator``.
+
+        Runs concurrently with the rest of ``start()`` — a slow GitHub
+        fetch must not block Telegram polling. All exceptions are logged
+        and swallowed (the daemon still starts without skill-creator;
+        the user can re-attempt via ``mcp__installer__marketplace_install``).
+
+        NH-1: the marker file ``.0xone-installed`` is the idempotency
+        gate. A partial ``atomic_install`` failure leaves no marker, so
+        the next daemon boot retries.
+        """
+        skills_dir = self._settings.project_root / "skills"
+        skill_dir = skills_dir / "skill-creator"
+        marker = skill_dir / ".0xone-installed"
+        if marker.is_file():
+            return
+        # B1 fix (wave-3): recover from a previous partial install. If the
+        # skill directory exists but the idempotency marker does NOT, a
+        # prior bootstrap crashed between ``atomic_install`` rename and the
+        # ``.0xone-installed`` touch. Leaving the dir in place makes the
+        # next ``atomic_install`` raise ``InstallError`` ("already installed")
+        # and the skill is permanently broken until manual cleanup. Clean
+        # up the stale directory before re-fetching.
+        if skill_dir.exists():
+            log.warning(
+                "skill_creator_partial_install_detected_cleanup",
+                path=str(skill_dir),
+            )
+            _shutil.rmtree(skill_dir, ignore_errors=True)
+        try:
+            fetch = _core._fetch_tool()
+        except _core.FetchToolMissing:
+            log.warning("skill_creator_bootstrap_skipped_no_gh_nor_git")
+            return
+        log.info("skill_creator_bootstrap_starting", via=fetch)
+        tmp = self._settings.data_dir / "run" / "tmp" / "skill-creator-boot"
+        if tmp.exists():
+            _shutil.rmtree(tmp, ignore_errors=True)
+        try:
+
+            async def _run() -> None:
+                url = _core.marketplace_tree_url("skill-creator")
+                await _core.fetch_bundle_async(url, tmp)
+                report = await asyncio.to_thread(_core.validate_bundle, tmp)
+                await asyncio.to_thread(
+                    _core.atomic_install,
+                    tmp,
+                    report,
+                    project_root=self._settings.project_root,
+                )
+                sentinel = self._settings.data_dir / "run" / "skills.dirty"
+                sentinel.parent.mkdir(parents=True, exist_ok=True)
+                sentinel.touch()
+
+            await asyncio.wait_for(_run(), timeout=120)
+            log.info("skill_creator_bootstrap_ok")
+        except TimeoutError:
+            log.warning("skill_creator_bootstrap_timeout")
+        except Exception as exc:  # surface everything, never re-raise
+            log.warning("skill_creator_bootstrap_failed", error=str(exc))
+        finally:
+            if tmp.exists():
+                _shutil.rmtree(tmp, ignore_errors=True)
+
     async def stop(self) -> None:
         log.info("daemon_stopping")
         if self._adapter is not None:
             await self._adapter.stop()
+        # S8 (wave-3): cancel tracked bg coroutines (skill_creator bootstrap,
+        # sweepers) BEFORE closing the sqlite connection. Otherwise a
+        # long-running ``fetch_bundle_async`` could try to touch the DB-adjacent
+        # sentinel after ``close()``. ``gather(..., return_exceptions=True)``
+        # swallows the CancelledError so shutdown stays clean.
+        for t in list(self._bg_tasks):
+            t.cancel()
+        if self._bg_tasks:
+            await asyncio.gather(*self._bg_tasks, return_exceptions=True)
+        self._bg_tasks.clear()
+        # Cancel installer-spawned uv-sync tasks (module-level set).
+        await _core.cancel_bg_tasks()
         if self._conn is not None:
             await self._conn.close()
         log.info("daemon_stopped")

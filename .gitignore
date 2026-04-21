@@ -20,3 +20,18 @@ dist/
 
 # Spike scripts live in-repo; their generated reports are throwaway.
 plan/phase2/spikes/*.json
+
+# Runtime-installed skills (via installer tool or auto-bootstrap).
+# Only skills shipped with repo: ping, skill-installer.
+skills/*
+!skills/.gitkeep
+!skills/ping/
+!skills/ping/**
+!skills/skill-installer/
+!skills/skill-installer/**
+
+# Tools installed with skills (only ping is repo-shipped).
+tools/*
+!tools/.gitkeep
+!tools/ping/
+!tools/ping/**

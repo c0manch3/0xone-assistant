@@ -13,6 +13,7 @@ from claude_agent_sdk import (
     HookContext,
     HookInput,
     HookJSONOutput,
+    HookMatcher,
 )
 
 from assistant.logger import get_logger
@@ -44,6 +45,10 @@ BASH_ALLOWLIST_PREFIXES: tuple[str, ...] = (
     "python tools/",
     "python3 tools/",
     "uv run tools/",
+    # NEW phase-3 entries — Anthropic skill-creator ships scripts/*.py
+    "python skills/",
+    "python3 skills/",
+    "uv run skills/",
     "git status ",
     "git log ",
     "git diff ",
@@ -83,6 +88,13 @@ BASH_SLIP_GUARD_RE = re.compile(
     r"base64\s+-d|openssl\s+enc|xxd\s+-r|"
     r"[A-Za-z0-9+/]{48,}={0,2}|"
     r"[;&|`]|\$\(|<\(|>\(|"
+    # B2 (wave-3): reject ``$VAR`` / ``${VAR}`` expansion — without this,
+    # ``cat $HOME/.ssh/config`` slips past the literal-path allowlist because
+    # ``$HOME`` is a string token, not an expanded path. The guard is
+    # applied universally (after the per-command allowlist), so even
+    # ``echo $PATH`` is denied — the owner can use ``printenv`` via an
+    # explicit tools/ entry if env-dumping is genuinely wanted.
+    r"\$\{|\$[A-Za-z_]|"
     r"\\x[0-9a-f]{2}|\\[0-7]{3}"
     r")",
     re.IGNORECASE,
@@ -167,12 +179,142 @@ def _cat_targets_ok(args: list[str], project_root: Path) -> tuple[bool, str | No
     return True, None
 
 
+# ---------------------------------------------------------------------------
+# Phase 3 argv-level validators for gh / git clone / uv sync.
+#
+# The allowlist-prefix layer (``BASH_ALLOWLIST_PREFIXES``) is string-level;
+# it admits ``gh api ...`` as a prefix, but the model could smuggle flags
+# like ``--hostname evil.com`` into the tail. B11 (wave-2) closes this with
+# an argv-level FLAG ALLOW-LIST: only ``-H Accept:*`` headers are permitted
+# alongside the endpoint path. Every other flag is denied by default.
+# ---------------------------------------------------------------------------
+_GH_AUTH_ALLOWED_SUBSUB: frozenset[str] = frozenset({"status"})
+# S9 (wave-3): negative lookahead against ``..`` anywhere in the path. The
+# owner-controlled ``[A-Za-z0-9_.-]+`` classes admit literal ``..`` (it
+# matches dot-dot because ``.`` is in the class), so without the lookahead
+# a crafted endpoint like ``/repos/owner/repo/contents/a/../b`` would pass
+# validation and let the server resolve outside the intended subtree. The
+# same regex is duplicated in ``_installer_core._GH_API_SAFE_ENDPOINT_RE``
+# and MUST be kept in sync.
+_GH_API_SAFE_ENDPOINT_RE = re.compile(
+    r"^/repos/(?!.*\.\.)[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/"
+    r"(contents(/[^?\s]*)?|tarball(/[^?\s]*)?)"
+    r"(\?[^\s]*)?$"
+)
+_GH_API_ALLOWED_HEADER_PREFIX = "accept:"
+
+# DEPRECATED: _GH_FORBIDDEN_FLAGS is no longer consulted.
+# Retained only as a breadcrumb for the pre-B11 deny-list approach.
+# The whitelist in ``_validate_gh_argv`` is authoritative.
+_GH_FORBIDDEN_FLAGS: frozenset[str] = frozenset()
+
+
+def _validate_gh_argv(argv: list[str]) -> str | None:
+    """Return error string if argv is not a safe read-only gh invocation.
+
+    Only two invocations pass:
+        gh auth status
+        gh api [<-H Accept:...> ...] /<read-only endpoint>
+
+    Every other gh subcommand and every non-Accept ``-H`` header is denied.
+    Any unknown flag (``--hostname``, ``--paginate``, ``-X``, ...) is denied
+    by default — the allow-list is authoritative.
+    """
+    if len(argv) < 2 or argv[0] != "gh":
+        return "not gh command"
+    sub = argv[1]
+    if sub == "auth":
+        if len(argv) == 3 and argv[2] in _GH_AUTH_ALLOWED_SUBSUB:
+            return None
+        return "only `gh auth status` is allowed"
+    if sub != "api":
+        return f"gh {sub!r}: only `gh api` and `gh auth status` are whitelisted"
+    # sub == "api" — walk argv[2:] and accept only endpoint + -H Accept:*.
+    i = 2
+    saw_endpoint = False
+    while i < len(argv):
+        tok = argv[i]
+        if tok.startswith("/"):
+            if saw_endpoint:
+                return "gh api: multiple endpoints not allowed"
+            if not _GH_API_SAFE_ENDPOINT_RE.match(tok):
+                return f"gh api: endpoint {tok!r} not in read-only whitelist"
+            saw_endpoint = True
+            i += 1
+            continue
+        if tok == "-H":
+            if i + 1 >= len(argv):
+                return "gh api: -H requires header argument"
+            hdr = argv[i + 1]
+            if not hdr.lower().startswith(_GH_API_ALLOWED_HEADER_PREFIX):
+                return f"gh api: -H {hdr!r}: only Accept headers allowed"
+            i += 2
+            continue
+        return f"gh api: flag {tok!r} not in read-only allow-list"
+    if not saw_endpoint:
+        return "gh api requires endpoint path"
+    return None
+
+
+def _validate_git_clone_argv(argv: list[str], project_root: Path) -> str | None:
+    if len(argv) < 4:
+        return "git clone requires --depth=1 URL DEST"
+    if argv[2] != "--depth=1":
+        return "only --depth=1 is allowed for git clone"
+    url = argv[3]
+    if not (url.startswith("https://github.com/") or url.startswith("git@github.com:")):
+        return "only https://github.com/ or git@github.com: URLs are allowed"
+    if len(argv) < 5:
+        return "git clone requires DEST"
+    dest = argv[4]
+    try:
+        dp = Path(dest).expanduser()
+        resolved = (project_root / dp).resolve() if not dp.is_absolute() else dp.resolve()
+    except OSError as exc:
+        return f"invalid dest path: {exc}"
+    if not resolved.is_relative_to(project_root.resolve()):
+        return "git clone dest must be inside project_root"
+    return None
+
+
+def _validate_uv_sync_argv(argv: list[str], project_root: Path) -> str | None:
+    if len(argv) < 2:
+        return "uv requires subcommand"
+    if argv[1] != "sync":
+        return None  # other uv subcommands covered by existing `uv run` prefix
+    dir_arg = next((a for a in argv[2:] if a.startswith("--directory")), None)
+    if not dir_arg:
+        return "uv sync requires --directory=tools/<name> or skills/<name>"
+    if "=" in dir_arg:
+        path_val = dir_arg.split("=", 1)[1]
+    else:
+        idx = argv.index(dir_arg)
+        if idx + 1 >= len(argv):
+            return "uv sync --directory requires a value"
+        path_val = argv[idx + 1]
+    try:
+        dp = Path(path_val).expanduser()
+        full = (project_root / dp).resolve() if not dp.is_absolute() else dp.resolve()
+    except OSError as exc:
+        return f"invalid directory path: {exc}"
+    pr = project_root.resolve()
+    if not (full.is_relative_to(pr / "tools") or full.is_relative_to(pr / "skills")):
+        return "uv sync --directory must target tools/ or skills/"
+    return None
+
+
 def _bash_allowlist_check(cmd: str, project_root: Path) -> str | None:
     """Return a deny-reason iff ``cmd`` is NOT allowed. ``None`` → allow.
 
     BW2: exact matches checked separately so ``ls``/``pwd`` don't re-admit
     ``lsof``/``pwdx``/``lsblk`` via naive ``startswith``.
+
+    Phase 3: ``gh`` / ``git clone`` / ``uv sync`` are gated through
+    dedicated argv validators (NH-10: ``shlex.split`` may raise on
+    unbalanced quotes — we translate that to a deny-reason).
     """
+    import shlex
+
     stripped = cmd.strip()
     if not stripped:
         return "empty command"
@@ -180,6 +322,18 @@ def _bash_allowlist_check(cmd: str, project_root: Path) -> str | None:
         return None
     if any(stripped.startswith(p) for p in BASH_ALLOWLIST_PREFIXES):
         return None
+    try:
+        argv = shlex.split(stripped)
+    except ValueError as exc:
+        return f"unparseable Bash command: {exc}"
+    if not argv:
+        return "empty argv"
+    if argv[0] == "gh":
+        return _validate_gh_argv(argv)
+    if argv[0] == "git" and len(argv) > 1 and argv[1] == "clone":
+        return _validate_git_clone_argv(argv, project_root)
+    if argv[0] == "uv" and len(argv) > 1 and argv[1] == "sync":
+        return _validate_uv_sync_argv(argv, project_root)
     # Special-case `cat <path>...` — allow iff ALL args resolve inside project_root.
     if stripped.startswith("cat "):
         args = stripped[4:].strip().split()
@@ -189,7 +343,9 @@ def _bash_allowlist_check(cmd: str, project_root: Path) -> str | None:
         return reason or "cat target outside project_root"
     return (
         "Bash command not in allowlist. If you need this operation, ask the "
-        "owner to add it to tools/<name>/main.py or expand the allowlist."
+        "owner to add it to tools/<name>/main.py or expand the allowlist. "
+        "Note: installer @tool calls bypass this allowlist entirely "
+        "(enforced at @tool function arg-validation time)."
     )
 
 
@@ -432,3 +588,77 @@ def make_webfetch_hook() -> Hook:
         return _allow()
 
     return webfetch_hook
+
+
+# ---------------------------------------------------------------------------
+# PostToolUse factory — sentinel touch on Write/Edit into skills/tools
+# ---------------------------------------------------------------------------
+def _is_inside_skills_or_tools(raw_path: str, project_root: Path) -> bool:
+    """True iff ``raw_path`` resolves under ``skills/`` or ``tools/``.
+
+    RS-3 (re-verified 2026-04-21): ``HookMatcher.matcher`` is a regex on
+    ``tool_name``. There is no per-file-path matcher API, so file-path
+    filtering MUST happen inside the hook body.
+    """
+    if not raw_path:
+        return False
+    # Reject obvious traversal signals BEFORE filesystem resolution so
+    # that a synthetic test input with ``..`` cannot accidentally resolve
+    # to a path that happens to be inside project_root.
+    if ".." in Path(raw_path).parts:
+        return False
+    try:
+        p = Path(raw_path).expanduser()
+        resolved = p.resolve() if p.is_absolute() else (project_root / p).resolve()
+    except (OSError, ValueError):
+        return False
+    root = project_root.resolve()
+    for sub in ("skills", "tools"):
+        try:
+            if resolved.is_relative_to(root / sub):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def make_posttool_hooks(project_root: Path, data_dir: Path) -> list[HookMatcher]:
+    """Build PostToolUse matchers for Write + Edit → sentinel touch.
+
+    On any Write/Edit whose ``file_path`` resolves under
+    ``<project_root>/skills/`` or ``<project_root>/tools/``, touch
+    ``<data_dir>/run/skills.dirty`` so that the next
+    ``_render_system_prompt`` detects the change and rebuilds the
+    manifest (hot-reload path).
+    """
+    sentinel = data_dir / "run" / "skills.dirty"
+
+    async def on_write_edit(
+        input_data: HookInput,
+        tool_use_id: str | None,
+        ctx: HookContext,
+    ) -> HookJSONOutput:
+        del tool_use_id, ctx
+        raw = cast(dict[str, Any], input_data)
+        ti = raw.get("tool_input") or {}
+        file_path = str(ti.get("file_path") or "")
+        if _is_inside_skills_or_tools(file_path, project_root):
+            try:
+                sentinel.parent.mkdir(parents=True, exist_ok=True)
+                sentinel.touch()
+                log.info(
+                    "posttool_sentinel_touched",
+                    tool_name=raw.get("tool_name"),
+                    file_path=file_path[:200],
+                )
+            except OSError as exc:
+                log.warning(
+                    "posttool_sentinel_touch_failed",
+                    error=repr(exc),
+                )
+        return cast(HookJSONOutput, {})
+
+    return [
+        HookMatcher(matcher="Write", hooks=[on_write_edit]),
+        HookMatcher(matcher="Edit", hooks=[on_write_edit]),
+    ]

@@ -1,6 +1,6 @@
 # Phase 4 — Memory tool + skill (Obsidian vault + FTS5)
 
-> **Precondition:** phase 4 memory skill requires Bash-from-skill-body execution (FTS5 SQLite query через `tools/memory` CLI). Phase 4 is BLOCKED on phase 3 delivering PostToolUse tool-invocation enforcement OR on phase 3/4 architectural pivot to `@tool`-decorator custom SDK tools. See `plan/phase2/known-debt.md#D1`. Do NOT start phase 4 implementation without verifying this precondition.
+> **Precondition (updated 2026-04-21 per phase-3 Q-D1=c):** Phase 4 memory skill will NOT be SKILL.md+CLI. Instead, memory_search/memory_write/etc. будут `@tool`-decorator custom SDK tools в `src/assistant/tools_sdk/memory.py`, registered via `create_sdk_mcp_server(name="memory", tools=[...])` и wired в `ClaudeAgentOptions.mcp_servers={"memory": ...}`. Skills останутся prompt-expansions only (midomis / phase-2 ping pattern). SKILL.md может существовать как guidance document ("to save something to memory, use memory_write tool..."), но tool invocation — first-class через SDK custom tools. Precondition для start: researcher spike RQ1 в phase 3 step 4 passes (verify `@tool`+`setting_sources` coexist). См. `plan/phase3/description.md` "@tool groundwork".
 
 **Цель:** долговременная память через Obsidian-совместимый vault + FTS5 CLI,
 доступный модели только через скилл `memory`. Новая сессия должна помнить факты

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterable, AsyncIterator
 from typing import Any, Literal
 
@@ -21,11 +22,20 @@ from assistant.bridge.hooks import (
     FILE_TOOL_NAMES,
     make_bash_hook,
     make_file_hook,
+    make_posttool_hooks,
     make_webfetch_hook,
 )
-from assistant.bridge.skills import build_manifest
+from assistant.bridge.skills import (
+    build_manifest,
+    invalidate_manifest_cache,
+    touch_skills_dir,
+)
 from assistant.config import Settings
 from assistant.logger import get_logger
+from assistant.tools_sdk.installer import (
+    INSTALLER_SERVER,
+    INSTALLER_TOOL_NAMES,
+)
 
 log = get_logger("bridge.claude")
 
@@ -51,6 +61,7 @@ async def _safe_query(*args: Any, **kwargs: Any) -> AsyncIterator[Any]:
             log.warning("sdk_unknown_message_type", error=str(exc))
             return  # graceful end-of-stream, don't crash
         raise
+
 
 # Keyed against the SDK's full hook-event Literal union so
 # ``ClaudeAgentOptions.hooks`` accepts our dict. We populate only the
@@ -113,12 +124,14 @@ class ClaudeBridge:
         project-specific instructions on top.
         """
         pr = self._settings.project_root
+        dd = self._settings.data_dir
         hooks: dict[HookEventName, list[HookMatcher]] = {
             "PreToolUse": [
                 HookMatcher(matcher="Bash", hooks=[make_bash_hook(pr)]),
                 *[HookMatcher(matcher=t, hooks=[make_file_hook(pr)]) for t in FILE_TOOL_NAMES],
                 HookMatcher(matcher="WebFetch", hooks=[make_webfetch_hook()]),
-            ]
+            ],
+            "PostToolUse": make_posttool_hooks(pr, dd),
         }
         thinking_kwargs: dict[str, Any] = {}
         if self._settings.claude.thinking_budget > 0:
@@ -134,6 +147,9 @@ class ClaudeBridge:
             cwd=str(pr),
             setting_sources=["project"],
             max_turns=self._settings.claude.max_turns,
+            # S6 fix (wave-2): derive installer tool names from the
+            # installer module's constant instead of duplicating here;
+            # adding a new @tool now requires only one edit in installer.py.
             allowed_tools=[
                 "Bash",
                 "Read",
@@ -143,13 +159,16 @@ class ClaudeBridge:
                 "Grep",
                 "WebFetch",
                 "Skill",
+                *INSTALLER_TOOL_NAMES,
             ],
+            mcp_servers={"installer": INSTALLER_SERVER},
             hooks=hooks,
             system_prompt=system_prompt_preset,
             **thinking_kwargs,
         )
 
     def _render_system_prompt(self) -> str:
+        self._check_skills_sentinel()
         template = (
             self._settings.project_root / "src" / "assistant" / "bridge" / "system_prompt.md"
         ).read_text(encoding="utf-8")
@@ -158,6 +177,25 @@ class ClaudeBridge:
             project_root=str(self._settings.project_root),
             skills_manifest=manifest,
         )
+
+    def _check_skills_sentinel(self) -> None:
+        """Hot-reload path: if ``data/run/skills.dirty`` exists, drop the
+        manifest cache + bump the skills-dir mtime so the next call to
+        ``build_manifest`` sees the freshly installed/removed skills.
+
+        Two concurrent turns both observing the sentinel both invoke
+        ``invalidate_manifest_cache`` (``dict.clear`` — idempotent) and
+        ``touch_skills_dir`` (``os.utime`` — idempotent); one wins the
+        ``unlink`` race, the other catches ``FileNotFoundError``.
+        """
+        sentinel = self._settings.data_dir / "run" / "skills.dirty"
+        if not sentinel.exists():
+            return
+        invalidate_manifest_cache()
+        touch_skills_dir(self._settings.project_root / "skills")
+        with contextlib.suppress(FileNotFoundError):
+            sentinel.unlink()
+        log.info("skills_cache_invalidated_via_sentinel")
 
     # ------------------------------------------------------------------
     # Public API

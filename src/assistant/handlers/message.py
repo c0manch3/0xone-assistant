@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re as _re
 from typing import Any
 
 from claude_agent_sdk import (
@@ -17,6 +18,32 @@ from assistant.logger import get_logger
 from assistant.state.conversations import ConversationStore
 
 log = get_logger("handlers.message")
+
+# ---------------------------------------------------------------------------
+# URL detector (phase 3)
+#
+# B9 fix (wave-2): trailing punctuation was captured into the URL, so
+# "see https://github.com/foo/bar." would yield the literal string
+# "https://github.com/foo/bar." (trailing dot) — which then fails
+# GitHub routing and confuses the system-note hint to the model.
+# Approach: keep the broad ``\S+`` match, then strip trailing punctuation
+# characters that are almost never part of a real URL.
+# ---------------------------------------------------------------------------
+_URL_RE = _re.compile(r"https?://\S+|git@[^\s:]+:\S+", _re.IGNORECASE)
+# S7 wave-3: backtick added — markdown inline code like ``\`https://foo\```
+# previously emitted ``https://foo`` ``with trailing backtick intact``,
+# which fails downstream URL routing. Backtick is not a valid trailing
+# character in any URL form we accept.
+_TRAILING_PUNCT = ".,;:!?)\\]\"'`"
+
+
+def _detect_urls(text: str) -> list[str]:
+    urls: list[str] = []
+    for m in _URL_RE.finditer(text):
+        u = m.group(0).rstrip(_TRAILING_PUNCT)
+        if u:
+            urls.append(u)
+    return urls
 
 
 def _classify_block(
@@ -118,6 +145,8 @@ class ClaudeHandler:
             chat_id=msg.chat_id,
             message_id=msg.message_id,
         )
+        # User row written with the ORIGINAL text (no system-note leak
+        # into persisted history).
         await self._conv.append(
             msg.chat_id,
             turn_id,
@@ -129,10 +158,27 @@ class ClaudeHandler:
         # The current turn is still 'pending' so load_recent's 'complete'
         # filter excludes it — we won't replay our own user row to the model.
 
+        # Phase 3: URL detector enriches the envelope sent to the SDK
+        # without touching the persisted user row. If the owner pasted a
+        # URL we tell the model that the installer @tool is a reasonable
+        # first call; otherwise the envelope is unchanged.
+        urls = _detect_urls(msg.text)
+        if urls:
+            hint = (
+                "\n\n[system-note: the user's message contains URL(s) "
+                f"{urls[:3]!r}. If one looks like a GitHub skill bundle, "
+                "consider calling `mcp__installer__skill_preview(url=...)` to "
+                "fetch a preview before asking the user to confirm install. "
+                "Otherwise treat the URL as reference content.]"
+            )
+            user_text_for_sdk = msg.text + hint
+        else:
+            user_text_for_sdk = msg.text
+
         completed = False
         last_meta: dict[str, Any] | None = None
         try:
-            async for item in self._bridge.ask(msg.chat_id, msg.text, history):
+            async for item in self._bridge.ask(msg.chat_id, user_text_for_sdk, history):
                 role, payload, text_out, block_type = _classify_block(item)
                 if role == "result":
                     # Fix C (incident S13): accumulate last meta; complete
