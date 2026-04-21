@@ -500,3 +500,49 @@ Recorded in `unverified-assumptions.md §U10` for future audits.
 - OWASP SSRF Prevention Cheatsheet: https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html — DNS rebinding as "unsolvable at application layer; egress ACL only".
 - SQLite ALTER TABLE docs (recreate pattern): https://sqlite.org/lang_altertable.html#otheralter — "12-step procedure" for schema changes under concurrent access.
 - SQLite `PRAGMA user_version`: https://sqlite.org/pragma.html#pragma_user_version — single 32-bit counter, ideal for monotonic schema-revision tracking.
+
+---
+
+## S13 Addendum — R13 re-interpretation (2026-04-21)
+
+R13's live probe confirmed that the SDK **accepts** assistant envelopes
+in streaming-input mode. That finding still holds for the single-envelope
+case. However, R13 did **not** exercise multi-envelope queue behaviour,
+and it is precisely that gap which produced incident S13.
+
+Follow-up forensics (see `plan/phase2/incident-S13-marker-drop.md`)
+revealed:
+
+- Per-row user envelopes in stream_input → CLI queues **each** envelope
+  as a separate pending prompt.
+- CLI processes its queue **sequentially**, so a turn with N prior user
+  rows triggers N API iterations inside one `query()` call.
+- Each API iteration ends with its own `ResultMessage`. Our `bridge.ask`
+  had `return` after the first `ResultMessage`, so every iteration
+  beyond the first — including the one that actually carried the
+  user-facing reply to the current message — was silently dropped on
+  the floor. They did still land in the CLI's JSONL journal, which is
+  how we recovered them for post-mortem.
+- From the owner's perspective every turn replied with "Йо. Чё делаем?"
+  (the model's greeting to the very first prior `user` envelope, which
+  happened to be "Йо") regardless of what they typed.
+
+Fix applied:
+
+- `history_to_sdk_envelopes` now emits **at most one** collapsed context
+  envelope containing a plain-text rendering of prior turns. The CLI
+  therefore sees exactly two pending prompts (context + current) and
+  runs exactly one API iteration.
+- `bridge.ask` changed `return` → `continue` after the `ResultMessage`
+  yield so the generator survives any future multi-iteration case
+  (e.g. genuine tool-use loops).
+- `handlers/message.py` accumulates `last_meta` across the stream and
+  completes the turn exactly once when the generator closes cleanly.
+- `_safe_query` wraps `claude_agent_sdk.query` and swallows "Unknown
+  message type" so future SDK/CLI bumps that introduce new message
+  variants degrade into graceful end-of-stream instead of a crash.
+
+R13's verdict stands for the single-envelope replay case, but NOT for
+multi-envelope history replay. Future SDK-adjacent integrations must
+be tested against the multi-pending-prompt CLI queue semantics.
+

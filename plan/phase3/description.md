@@ -12,6 +12,8 @@
 
 ## Задачи
 
+- **PostToolUse tool-invocation enforcement** — блокер для phase 4. Обеспечивает что Claude реально выполняет Bash/tool command из SKILL.md body, НЕ просто читает body и отвечает текстом. Кандидаты: `UserPromptSubmit` hook re-injection, `PostToolUse(Skill)` → `PreToolUse(Bash)` verification, ИЛИ архитектурный pivot на `@tool`-decorator custom tools для CLI tools. См. `plan/phase2/known-debt.md#D1`.
+
 1. **`tools/skill-installer/main.py` + `_lib/`** — CLI установки по URL **и** из marketplace. Подкоманды:
    - `preview <URL>` / `install --confirm --url <URL>` — базовый flow fetch → static-validate → preview → re-fetch → SHA-compare → atomic copy. Cache-by-URL (`sha256(canonical_url)[:16]`), TOCTOU-защита через повторный fetch + сравнение `sha256_of_tree(bundle)`; расхождение → `exit 7` "source changed since preview".
    - `marketplace list` — скачивает index публичного Anthropic-маркета (`MARKETPLACE_URL = "https://github.com/anthropics/skills"`, hardcoded; `gh api /repos/anthropics/skills/contents/skills`), возвращает JSON `[{name, description}, ...]`.

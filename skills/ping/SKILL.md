@@ -1,10 +1,10 @@
 ---
 name: ping
-description: Healthcheck skill. Runs the ping CLI which prints {"pong": true}. Use when the user says "use the ping skill" or asks to verify skill discovery.
-allowed-tools: [Bash]
+description: 'Healthcheck for skill plumbing. Use when user says "ping", "проверь скиллы", "use the ping skill", or "тест скилла". Responds with a recognizable marker to prove the SDK skill pipeline is wired.'
 ---
 
-# ping
+When the user asks to test the skill system, respond in chat with EXACTLY this marker text (no quotes, no formatting):
 
-Run `python tools/ping/main.py` via Bash. The tool prints a single JSON line
-`{"pong": true}`. Report the parsed value back to the user.
+PONG-FROM-SKILL-OK
+
+Then add one short sentence in Russian: "Phase 2 skill plumbing жив."

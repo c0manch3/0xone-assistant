@@ -130,17 +130,19 @@ class ClaudeHandler:
         # filter excludes it — we won't replay our own user row to the model.
 
         completed = False
+        last_meta: dict[str, Any] | None = None
         try:
             async for item in self._bridge.ask(msg.chat_id, msg.text, history):
                 role, payload, text_out, block_type = _classify_block(item)
                 if role == "result":
-                    await self._conv.complete_turn(turn_id, meta=payload)
-                    completed = True
-                    log.info(
-                        "turn_complete",
-                        turn_id=turn_id,
-                        cost_usd=payload.get("cost_usd"),
-                    )
+                    # Fix C (incident S13): accumulate last meta; complete
+                    # only after the generator closes cleanly. With Fix A
+                    # lifted from bridge.ask, the SDK may emit multiple
+                    # ``ResultMessage`` instances per ``query()`` (e.g. when
+                    # stream_input carries > 1 pending prompt or the model
+                    # iterates via tool_use). Completing on the first one
+                    # would race against subsequent block persistence.
+                    last_meta = payload
                     continue
                 if role is None:
                     continue
@@ -154,6 +156,15 @@ class ClaudeHandler:
                 )
                 if text_out:
                     await emit(text_out)
+            # After async-for exits cleanly, mark complete once.
+            if last_meta is not None:
+                await self._conv.complete_turn(turn_id, meta=last_meta)
+                completed = True
+                log.info(
+                    "turn_complete",
+                    turn_id=turn_id,
+                    cost_usd=last_meta.get("cost_usd"),
+                )
         except ClaudeBridgeError as exc:
             log.warning("bridge_error", turn_id=turn_id, error=str(exc))
             await emit(f"\n\n(ошибка: {exc})")

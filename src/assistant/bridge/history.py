@@ -4,78 +4,91 @@ from collections.abc import Iterator
 from typing import Any
 
 
-def history_to_sdk_envelopes(rows: list[dict[str, Any]], chat_id: int) -> Iterator[dict[str, Any]]:
-    """Convert ConversationStore rows → SDK streaming-input envelope stream.
+def history_to_sdk_envelopes(
+    rows: list[dict[str, Any]], chat_id: int
+) -> Iterator[dict[str, Any]]:
+    """Render prior conversation history as a single plain-text context
+    envelope.
 
-    Row → envelope mapping (R13-verified, S7 fix):
-      role='user',      block_type='text'        → user envelope (text block)
-      role='user',      block_type='tool_result' → user envelope (tool_result block)
-      role='assistant', block_type='text'        → assistant envelope (text block)
-      role='assistant', block_type='tool_use'    → assistant envelope (tool_use block)
-      block_type='thinking'                      → DROPPED
-        (U2: SDK rejects cross-session thinking signature.)
+    Fix B (incident S13): the previous implementation emitted **one
+    stream_input envelope per prior row (or per consecutive same-role
+    group)**. The Claude Code CLI treats each ``type: 'user'`` envelope
+    as a **separate pending prompt** — so a 9-row history produced ~10
+    pending prompts, and the CLI processed them sequentially across N
+    API iterations inside a single ``query()``.  Combined with the
+    bridge's original ``return`` after the first ``ResultMessage``, this
+    silently dropped every iteration beyond the first — the owner saw
+    stale greetings on every turn instead of the real (latest) reply.
 
-    R12 defence: treat NULL ``block_type`` as ``'text'`` (shouldn't happen
-    after migration 0002 but the runtime default is free insurance).
-    R10 note: ``session_id`` is cosmetic; the SDK ignores it in streaming-
-    input mode and assigns its own UUID. We keep it so the envelope stays
-    self-consistent with our logs.
+    Fixed shape: we emit **at most one** user envelope whose content is
+    a plain-text transcript of the prior turns, wrapped in markers that
+    tell the model "this is context, not a live prompt". The caller
+    appends the current user message as a separate envelope, so the CLI
+    sees exactly two pending prompts (context + current) and runs one
+    API iteration — matching every other chat integration we've seen.
 
-    Rows are grouped by consecutive ``(turn_id, role)`` so that multiple
-    same-role rows within a turn become a single multi-block envelope,
-    matching the shape the SDK originally produced.
+    Rules:
+      - Thinking blocks are dropped (U2: SDK rejects cross-session
+        thinking signatures).
+      - Unknown block shapes are skipped defensively.
+      - Empty history → no envelopes at all.
+      - Tool use / tool results are rendered as short, annotated lines
+        so the model can see what happened without us having to replay
+        the structured blocks (which would reintroduce the multi-envelope
+        queue behaviour).
     """
-    session_id = f"chat-{chat_id}"
+    if not rows:
+        return
 
-    # Preserve temporal order (load_recent already ORDER BY id ASC).
-    current_key: tuple[str, str] | None = None
-    buffer: list[dict[str, Any]] = []
-
-    def flush() -> Iterator[dict[str, Any]]:
-        if not buffer or current_key is None:
-            return
-        _turn_id, role = current_key
-        content: Any
-        # Collapse a single user text-block to the plain-string shape —
-        # the SDK accepts either, and mirroring the original turn is
-        # friendlier to the model.
-        if len(buffer) == 1 and buffer[0].get("type") == "text" and role == "user":
-            content = buffer[0]["text"]
-        else:
-            content = list(buffer)
-        envelope: dict[str, Any] = {
-            "type": role,  # "user" or "assistant"
-            "message": {"role": role, "content": content},
-            "parent_tool_use_id": None,
-            "session_id": session_id,
-        }
-        yield envelope
-
+    lines: list[str] = []
     for row in rows:
         btype = row.get("block_type") or "text"  # R12 defence
         if btype == "thinking":
             # U2: SDK rejects cross-session thinking signature.
             continue
 
-        role = row["role"]
-        # Normalize role: B5 — DB stores tool_result rows with role='user'
-        # (because the handler classifies ToolResultBlock as role='user'
-        # per the Anthropic tools API). No remapping needed here.
-        turn_id = row["turn_id"]
-        key = (turn_id, role)
-
-        if current_key != key:
-            # Boundary — flush accumulated buffer for the previous (turn, role).
-            yield from flush()
-            current_key = key
-            buffer = []
+        role = row.get("role")
+        if role not in ("user", "assistant"):
+            continue
 
         blocks = row.get("content") or []
-        if isinstance(blocks, list):
-            buffer.extend(blocks)
-        else:
-            # Defensive: legacy single-block dict.
-            buffer.append(blocks)
+        if not isinstance(blocks, list):
+            blocks = [blocks]
 
-    # Final flush after loop.
-    yield from flush()
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            btype_inner = block.get("type")
+            if btype_inner == "text":
+                text = str(block.get("text", "")).strip()
+                if text:
+                    lines.append(f"{role}: {text}")
+            elif btype_inner == "tool_use":
+                name = block.get("name", "?")
+                lines.append(f"{role}: [invoked tool {name}]")
+            elif btype_inner == "tool_result":
+                content = block.get("content")
+                snippet = str(content)[:200] if content is not None else "(empty)"
+                lines.append(f"{role}: [tool_result: {snippet}]")
+            # Unknown block types intentionally skipped.
+
+    if not lines:
+        return
+
+    body = "\n".join(lines)
+    yield {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": (
+                "[Previous conversation context — for your reference; "
+                "do not respond to it directly unless the current message "
+                "references it]\n"
+                f"{body}\n"
+                "[End of previous context]"
+            ),
+        },
+        "parent_tool_use_id": None,
+        # R10: cosmetic — SDK assigns its own UUID per query.
+        "session_id": f"chat-{chat_id}",
+    }

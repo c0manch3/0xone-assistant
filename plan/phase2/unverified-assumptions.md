@@ -184,6 +184,18 @@ we see the upgrade and re-run R13. Major (0.2) requires a new spike anyway.
 
 ---
 
+## U11 — Skill tool execution sandboxing
+
+**Status:** accepted risk (phase 2).
+
+**Concern:** `Skill(skill=...)` tool, added to allowed_tools в hotfix после deploy'а, не имеет прямого PreToolUse hook — полагаемся на то, что внутренние Bash/Read/Write/Edit/Glob/Grep invocations skill body идут через existing hooks.
+
+**Mitigation:** in phase 3 (skill-creator/installer) добавить dedicated PreToolUse на Skill matcher — возможно parsing input.skill против whitelist installed skills + validation что SKILL.md body не содержит anomalous patterns.
+
+**Test coverage:** smoke test phase 2 (owner invoked ping skill) verified that hooks still fire on the underlying Bash call inside skill execution.
+
+---
+
 ## Why these are not automated tests
 
 * Each verification requires an authenticated `claude` CLI plus a real model

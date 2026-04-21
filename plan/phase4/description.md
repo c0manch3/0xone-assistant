@@ -1,5 +1,7 @@
 # Phase 4 — Memory tool + skill (Obsidian vault + FTS5)
 
+> **Precondition:** phase 4 memory skill requires Bash-from-skill-body execution (FTS5 SQLite query через `tools/memory` CLI). Phase 4 is BLOCKED on phase 3 delivering PostToolUse tool-invocation enforcement OR on phase 3/4 architectural pivot to `@tool`-decorator custom SDK tools. See `plan/phase2/known-debt.md#D1`. Do NOT start phase 4 implementation without verifying this precondition.
+
 **Цель:** долговременная память через Obsidian-совместимый vault + FTS5 CLI,
 доступный модели только через скилл `memory`. Новая сессия должна помнить факты
 из прошлой.

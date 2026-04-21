@@ -26,7 +26,7 @@ Phase 2 **deletes `EchoHandler`**, introduces **`ClaudeHandler`**, wires Claude 
 
 ## Критерии готовности
 
-- Owner smoke: в Telegram `"use the ping skill"` → Claude вызывает `tools/ping/main.py` через Bash → ответ содержит `{"pong": true}`.
+- Owner smoke: в Telegram `"use the ping skill"` → Claude invokes Skill tool → SDK injects body → Claude responds with marker `PONG-FROM-SKILL-OK` + Russian confirmation sentence.
 - В логах SDK (SystemMessage `init`) видно, что `SKILL.md` подхватывается (поле `skills` содержит `ping`).
 - Миграция 0002 применена: `sqlite3 ~/.local/share/0xone-assistant/assistant.db 'PRAGMA user_version'` → `2`; `ls ~/.local/share/0xone-assistant/assistant.db` — файл существует.
 - Сообщения > 4096 символов корректно разбиваются.
@@ -41,3 +41,17 @@ Phase 1.
 **Средний** — ранее неопределённость контракта SDK (skills auto-discovery + permission callback). **Spike выполнен** (`spike-findings.md` R1–R5 на `claude-agent-sdk==0.1.59`): `setting_sources=["project"]` действительно подхватывает `.claude/skills/*/SKILL.md`, permission-слой — через `hooks={"PreToolUse":[...]}` (7 матчеров), не `can_use_tool`.
 
 **Остаточные неизвестные** (см. `unverified-assumptions.md`): U1 — реплей `tool_use`/`tool_result` из истории (митигация: synthetic system-note); U2 — cross-session `ThinkingBlock` реплей (митигация: фильтр `block_type='thinking'`); U3 — symlink path для `.claude/skills` (митигация: manual smoke); U5 — regex form `HookMatcher.matcher` (митигация: 7 explicit matchers вместо 2). Все четыре верифицируются owner'ом в live-QA; fallback'и заложены в `implementation.md`.
+
+## Known Limitations (Phase 2)
+
+**Bash-from-skill-body tool execution is NOT validated in phase 2 smoke.**
+
+Phase 2 ping skill uses text-generation pattern (marker response). It validates SDK skill discovery, `Skill` tool invocation, skill body delivery, and Claude's response-generation path — but NOT model compliance with imperative body instructions like "Run `python tools/X` via Bash".
+
+Opus 4.7 has known issues following imperative tool-invocation instructions from skill bodies (GitHub [#39851](https://github.com/anthropics/claude-code/issues/39851), [#41510](https://github.com/anthropics/claude-code/issues/41510)). Anthropic closes this as a "system_prompt / architecture question" ([SDK #544](https://github.com/anthropics/claude-agent-sdk-python/issues/544)) — no SDK fix forthcoming.
+
+**Impact on later phases:**
+- Phase 3 (skill-creator/installer) must deliver **PostToolUse tool-invocation enforcement** as a blocker for phase 4.
+- Phase 4 (memory skill) requires Bash-from-skill-body execution (FTS5 SQLite query). Either phase 3 enforcement ships first, OR phase 4 refactors memory to use `@tool`-decorator (in-process SDK custom tool) or MCP server pattern instead of SKILL.md + CLI.
+
+See `plan/phase2/known-debt.md` for full debt tracking.

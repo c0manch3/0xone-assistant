@@ -48,7 +48,7 @@ async def test_timeout_raises_bridge_error(tmp_path: Path) -> None:
     bridge = ClaudeBridge(_settings(tmp_path))
 
     with (
-        patch("assistant.bridge.claude.query", _never_yielding),
+        patch("assistant.bridge.claude._raw_query", _never_yielding),
         pytest.raises(ClaudeBridgeError, match="timeout"),
     ):
         async for _ in bridge.ask(1, "hello", history=[]):
@@ -58,7 +58,7 @@ async def test_timeout_raises_bridge_error(tmp_path: Path) -> None:
     # (If it did, this test would hang and pytest would kill it.)
     async with asyncio.timeout(5):
         with (
-            patch("assistant.bridge.claude.query", _never_yielding),
+            patch("assistant.bridge.claude._raw_query", _never_yielding),
             pytest.raises(ClaudeBridgeError, match="timeout"),
         ):
             async for _ in bridge.ask(1, "again", history=[]):

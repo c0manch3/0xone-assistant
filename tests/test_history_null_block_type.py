@@ -61,8 +61,14 @@ async def test_null_block_type_defaults_to_text(tmp_path: Path) -> None:
         }
     ]
     envs = list(history_to_sdk_envelopes(rows, chat_id=1))
+    # Post S13 fix: history collapses into a single context envelope; the
+    # defence is still that a NULL block_type is treated as 'text' and
+    # the row's text content appears in the rendered context (not dropped
+    # or crashed).
     assert len(envs) == 1
     assert envs[0]["type"] == "user"
-    assert envs[0]["message"] == {"role": "user", "content": "hello"}
+    content = envs[0]["message"]["content"]
+    assert isinstance(content, str)
+    assert "user: hello" in content
 
     await conn.close()

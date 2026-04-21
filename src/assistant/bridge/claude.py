@@ -10,8 +10,11 @@ from claude_agent_sdk import (
     HookMatcher,
     ResultMessage,
     SystemMessage,
-    query,
 )
+from claude_agent_sdk import (
+    query as _raw_query,
+)
+from claude_agent_sdk.types import SystemPromptPreset
 
 from assistant.bridge.history import history_to_sdk_envelopes
 from assistant.bridge.hooks import (
@@ -25,6 +28,29 @@ from assistant.config import Settings
 from assistant.logger import get_logger
 
 log = get_logger("bridge.claude")
+
+
+async def _safe_query(*args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+    """Wrapper around ``claude_agent_sdk.query`` that survives unknown message
+    types.
+
+    Fix D (incident S13): future SDK / CLI versions may emit new message
+    types (e.g. ``rate_limit_event`` in newer Claude Code CLI builds) that
+    our parser does not know. The raw SDK raises ``Unknown message type``
+    and aborts the generator. We log and gracefully end the stream —
+    future-proofing against SDK / CLI minor-version bumps.
+
+    Any other exception propagates normally so the bridge's existing
+    ``except Exception`` branch still converts it to ``ClaudeBridgeError``.
+    """
+    try:
+        async for message in _raw_query(*args, **kwargs):
+            yield message
+    except Exception as exc:
+        if "Unknown message type" in str(exc):
+            log.warning("sdk_unknown_message_type", error=str(exc))
+            return  # graceful end-of-stream, don't crash
+        raise
 
 # Keyed against the SDK's full hook-event Literal union so
 # ``ClaudeAgentOptions.hooks`` accepts our dict. We populate only the
@@ -73,6 +99,19 @@ class ClaudeBridge:
     # Options assembly
     # ------------------------------------------------------------------
     def _build_options(self, *, system_prompt: str) -> ClaudeAgentOptions:
+        """Assemble ``ClaudeAgentOptions`` for a single query.
+
+        The ``system_prompt`` argument is APPENDED to the ``claude_code``
+        preset rather than replacing it. Passing a raw string for
+        ``ClaudeAgentOptions.system_prompt`` would discard the default
+        preset — including the built-in directive that tells the model
+        to follow the body of an auto-injected ``Skill`` invocation —
+        which is why phase 2 skills failed to execute end-to-end.
+        Per the SDK docs for ``SystemPromptPreset``, using
+        ``{"type": "preset", "preset": "claude_code", "append": ...}``
+        keeps default tools + safety rules intact and layers our
+        project-specific instructions on top.
+        """
         pr = self._settings.project_root
         hooks: dict[HookEventName, list[HookMatcher]] = {
             "PreToolUse": [
@@ -85,6 +124,12 @@ class ClaudeBridge:
         if self._settings.claude.thinking_budget > 0:
             thinking_kwargs["max_thinking_tokens"] = self._settings.claude.thinking_budget
             thinking_kwargs["effort"] = self._settings.claude.effort
+        system_prompt_preset: SystemPromptPreset = {
+            "type": "preset",
+            "preset": "claude_code",
+            "append": system_prompt,
+            "exclude_dynamic_sections": True,  # stable system prompt → stable cache
+        }
         return ClaudeAgentOptions(
             cwd=str(pr),
             setting_sources=["project"],
@@ -97,9 +142,10 @@ class ClaudeBridge:
                 "Glob",
                 "Grep",
                 "WebFetch",
+                "Skill",
             ],
             hooks=hooks,
-            system_prompt=system_prompt,
+            system_prompt=system_prompt_preset,
             **thinking_kwargs,
         )
 
@@ -159,7 +205,7 @@ class ClaudeBridge:
         async with self._sem:
             try:
                 async with asyncio.timeout(self._settings.claude.timeout):
-                    async for message in query(prompt=prompt_stream(), options=opts):
+                    async for message in _safe_query(prompt=prompt_stream(), options=opts):
                         if isinstance(message, SystemMessage) and message.subtype == "init":
                             log.info(
                                 "sdk_init",
@@ -191,7 +237,16 @@ class ClaudeBridge:
                                 sdk_session_id=getattr(message, "session_id", None),
                             )
                             yield message
-                            return
+                            # Fix A (incident S13): do NOT return here.
+                            # SDK streaming-input with multi-envelope history
+                            # (or tool_use iterations) can run multiple API
+                            # iterations inside a single ``query()`` call. Each
+                            # iteration ends with its own ``ResultMessage``;
+                            # subsequent iterations' tool_use / text blocks
+                            # would be silently dropped if we returned. We
+                            # keep consuming until the SDK closes the stream
+                            # normally (``async for`` exits).
+                            continue
                         # Other message types (RateLimitEvent, UserMessage
                         # echoes, unknown SystemMessage subtypes) are skipped.
             except TimeoutError as exc:
