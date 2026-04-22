@@ -1,0 +1,25 @@
+RQ1 — @tool large-body JSON round-trip probe
+python: 3.12.13
+
+     size_in   envelope_req  envelope_resp    final_out  match     sec
+        1022           2488           2482         1022   True     0.0
+       10238          23992          23986        10238   True  0.0001
+      102398         239032         239026       102398   True  0.0011
+      524288        1223446        1223440       524288   True  0.0053
+     1000000        2333442        2333436      1000000   True  0.0098
+     1048576        2446786        2446780      1048576   True  0.0098
+     2000000        4666774        4666768      2000000   True  0.0187
+     4000000        9333442        9333436      4000000   True  0.0383
+
+Notes:
+- JSON stdlib has no size cap; anyio PIPE stream used by MCP SDK is byte-stream (no frame limit).
+- Envelope overhead vs input grows because Cyrillic + emoji are escaped in default dumps.
+- For 1 MB body input, request envelope is ~9,333,442 bytes.
+- Claude CLI subprocess stdio PIPE: macOS default PIPE_BUF is 512 bytes but this is only
+  for atomic writes; streaming writes chunk as needed.
+- VERDICT: PASS — byte-identical roundtrip up to 4 MB.
+
+Recommendation:
+  MEMORY_MAX_BODY_BYTES default = 1_048_576 (1 MiB) is safe from transport perspective.
+  The binding constraint is model context window + Telegram response size, NOT SDK frame.
+  Documentation: cap body at 1 MiB; warn if write body > 256 KiB (single-turn context cost).

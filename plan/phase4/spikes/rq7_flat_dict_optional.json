@@ -1,0 +1,237 @@
+{
+  "sdk_version": "0.1.63",
+  "python_version": "3.12.13",
+  "cwd_at_launch": "/Users/agent2/Documents/0xone-assistant",
+  "budget_usd_cap": 0.4,
+  "wall_budget_sec": 1800,
+  "oauth_check": {
+    "have": true,
+    "note": "no .credentials.json file (likely Keychain) \u2014 proceed and let SDK surface auth errors"
+  },
+  "init_meta": {
+    "tools_in_init_count": 57,
+    "probe_in_init": [
+      "mcp__probe__echo_extra",
+      "mcp__probe__echo_required"
+    ],
+    "init_data_keys": [
+      "agents",
+      "apiKeySource",
+      "claude_code_version",
+      "cwd",
+      "fast_mode_state",
+      "mcp_servers",
+      "memory_paths",
+      "model",
+      "output_style",
+      "permissionMode",
+      "plugins",
+      "session_id",
+      "skills",
+      "slash_commands",
+      "subtype",
+      "tools",
+      "type",
+      "uuid"
+    ],
+    "init_probe_schema": null
+  },
+  "forms": {
+    "form1_full": {
+      "prompt": "Call the mcp__probe__echo_required tool ONCE with these EXACT arguments and no others: query=\"foo\", area=\"inbox\", limit=5. After the tool returns, state the verbatim ECHO_REQ output.",
+      "elapsed_sec": 10.4,
+      "stop_reason": "end_turn",
+      "cost_usd": 0.231387,
+      "tool_uses": [
+        {
+          "name": "ToolSearch",
+          "input": {
+            "query": "select:mcp__probe__echo_required",
+            "max_results": 1
+          },
+          "id": "toolu_01X6bcUbivU2UZUN16STqm3k"
+        },
+        {
+          "name": "mcp__probe__echo_required",
+          "input": {
+            "query": "foo",
+            "area": "inbox",
+            "limit": 5
+          },
+          "id": "toolu_01977ZtbiRkkAYB1jnEDKHzx"
+        }
+      ],
+      "tool_results": [
+        {
+          "tool_use_id": "toolu_01X6bcUbivU2UZUN16STqm3k",
+          "is_error": null,
+          "content": [
+            {
+              "type": "tool_reference",
+              "text": null
+            }
+          ]
+        },
+        {
+          "tool_use_id": "toolu_01977ZtbiRkkAYB1jnEDKHzx",
+          "is_error": null,
+          "content": [
+            {
+              "type": "text",
+              "text": "ECHO_REQ: keys=['area', 'limit', 'query'] args={\"query\": \"foo\", \"area\": \"inbox\", \"limit\": 5}"
+            }
+          ]
+        }
+      ]
+    },
+    "form2_partial": {
+      "prompt": "Call the mcp__probe__echo_required tool ONCE with ONLY this argument: query=\"bar\". Do NOT supply area. Do NOT supply limit. After the tool returns, state the verbatim ECHO_REQ output.",
+      "elapsed_sec": 9.73,
+      "stop_reason": "end_turn",
+      "cost_usd": 0.0736675,
+      "tool_uses": [
+        {
+          "name": "ToolSearch",
+          "input": {
+            "query": "select:mcp__probe__echo_required",
+            "max_results": 1
+          },
+          "id": "toolu_01CnzhUkGGSL59CoZo3fqTuF"
+        },
+        {
+          "name": "mcp__probe__echo_required",
+          "input": {
+            "query": "bar"
+          },
+          "id": "toolu_01VbF9hFtEPGHqZrgrMrc51S"
+        }
+      ],
+      "tool_results": [
+        {
+          "tool_use_id": "toolu_01CnzhUkGGSL59CoZo3fqTuF",
+          "is_error": null,
+          "content": [
+            {
+              "type": "tool_reference",
+              "text": null
+            }
+          ]
+        },
+        {
+          "tool_use_id": "toolu_01VbF9hFtEPGHqZrgrMrc51S",
+          "is_error": true,
+          "content": "Input validation error: 'area' is a required property"
+        }
+      ]
+    },
+    "form3_extra_on_required": {
+      "prompt": "Call the mcp__probe__echo_required tool ONCE with these EXACT arguments: query=\"baz\", area=\"all\", limit=3, foo=\"bar\". Yes, include the foo argument even though it is not in the schema \u2014 this is a probe to see what happens. After the tool returns, state the verbatim ECHO_REQ output.",
+      "elapsed_sec": 11.92,
+      "stop_reason": "end_turn",
+      "cost_usd": 0.07745475,
+      "tool_uses": [
+        {
+          "name": "ToolSearch",
+          "input": {
+            "query": "select:mcp__probe__echo_required",
+            "max_results": 1
+          },
+          "id": "toolu_014UWqwmL827vpAwVoENNSZH"
+        },
+        {
+          "name": "mcp__probe__echo_required",
+          "input": {
+            "query": "baz",
+            "area": "all",
+            "limit": 3,
+            "foo": "bar"
+          },
+          "id": "toolu_01MbaUfb9z2T4gRdKHGmwt4g"
+        }
+      ],
+      "tool_results": [
+        {
+          "tool_use_id": "toolu_014UWqwmL827vpAwVoENNSZH",
+          "is_error": null,
+          "content": [
+            {
+              "type": "tool_reference",
+              "text": null
+            }
+          ]
+        },
+        {
+          "tool_use_id": "toolu_01MbaUfb9z2T4gRdKHGmwt4g",
+          "is_error": null,
+          "content": [
+            {
+              "type": "text",
+              "text": "ECHO_REQ: keys=['area', 'foo', 'limit', 'query'] args={\"query\": \"baz\", \"area\": \"all\", \"limit\": 3, \"foo\": \"bar\"}"
+            }
+          ]
+        }
+      ]
+    },
+    "form4_extra_on_echo_extra": {
+      "prompt": "Call the mcp__probe__echo_extra tool ONCE with these EXACT arguments: name=\"alice\", surplus=\"hello\". Yes, include the surplus argument even though it is not in the schema. After the tool returns, state the verbatim ECHO_EXTRA output.",
+      "elapsed_sec": 10.27,
+      "stop_reason": "end_turn",
+      "cost_usd": 0.07568549999999999,
+      "tool_uses": [
+        {
+          "name": "ToolSearch",
+          "input": {
+            "query": "select:mcp__probe__echo_extra",
+            "max_results": 1
+          },
+          "id": "toolu_01CGg66u3qezPh6Hnr1oUMDW"
+        },
+        {
+          "name": "mcp__probe__echo_extra",
+          "input": {
+            "name": "alice",
+            "surplus": "hello"
+          },
+          "id": "toolu_01E1U5EMuzc7XNR8aBd367pB"
+        }
+      ],
+      "tool_results": [
+        {
+          "tool_use_id": "toolu_01CGg66u3qezPh6Hnr1oUMDW",
+          "is_error": null,
+          "content": [
+            {
+              "type": "tool_reference",
+              "text": null
+            }
+          ]
+        },
+        {
+          "tool_use_id": "toolu_01E1U5EMuzc7XNR8aBd367pB",
+          "is_error": null,
+          "content": [
+            {
+              "type": "text",
+              "text": "ECHO_EXTRA: keys=['name', 'surplus'] args={\"name\": \"alice\", \"surplus\": \"hello\"}"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "totals": {
+    "cost_usd": 0.4582,
+    "elapsed_sec": 42.32
+  },
+  "verdict": {
+    "missing_required_fields": "strict",
+    "partial_handler_fired": false,
+    "partial_any_error": true,
+    "extra_key_on_required_handler_fired_with_foo": true,
+    "extra_key_on_required_any_error": false,
+    "extra_key_on_echo_extra_handler_fired_with_surplus": true,
+    "extra_key_on_echo_extra_any_error": false
+  },
+  "error": null,
+  "elapsed_sec_total": 42.32
+}

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import fcntl
 import logging
+import os
 import shutil as _shutil
 import signal
+import sqlite3
 import sys
+from pathlib import Path
 from typing import Any
 
 import aiosqlite
@@ -22,8 +27,54 @@ from assistant.state.conversations import ConversationStore
 from assistant.state.db import apply_schema, connect
 from assistant.tools_sdk import _installer_core as _core
 from assistant.tools_sdk import installer as _installer_mod
+from assistant.tools_sdk import memory as _memory_mod
 
 log = get_logger("main")
+
+
+def _acquire_singleton_lock(data_dir: Path) -> int:
+    """Acquire an exclusive, non-blocking ``fcntl.flock`` on
+    ``<data_dir>/.daemon.pid`` and return the open file descriptor.
+
+    Fix 6 / H6-W3: prevents two daemon processes from sharing the same
+    vault + index + ``assistant.db``. Advisory fcntl lock on a pidfile
+    is the idiomatic POSIX answer — kernel releases the lock on process
+    exit (even SIGKILL), so a stale pidfile from a crashed daemon never
+    blocks the next restart.
+
+    Raises :class:`SystemExit(3)` with a helpful hint on contention.
+    Caller is responsible for closing the returned fd on shutdown.
+    """
+    data_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = data_dir / ".daemon.pid"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        # Read the PID stored by the holder for the hint; best-effort.
+        try:
+            with open(lock_path, encoding="utf-8") as fh:
+                holder = fh.read().strip() or "unknown"
+        except OSError:
+            holder = "unknown"
+        os.close(fd)
+        log.error(
+            "daemon_singleton_lock_held",
+            hint=(
+                "another 0xone-assistant daemon is already running "
+                f"(pid={holder}). Stop it before starting a new instance."
+            ),
+        )
+        sys.exit(3)
+    # Write our PID so the next would-be starter can see who holds the
+    # lock. Truncate to avoid stale trailing bytes from a prior run.
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+        os.fsync(fd)
+    except OSError as exc:
+        log.warning("daemon_singleton_lock_pid_write_failed", error=repr(exc))
+    return fd
 
 
 class Daemon:
@@ -32,6 +83,7 @@ class Daemon:
         self._conn: aiosqlite.Connection | None = None
         self._adapter: TelegramAdapter | None = None
         self._bg_tasks: set[asyncio.Task[Any]] = set()
+        self._lock_fd: int | None = None
 
     async def _preflight_claude_auth(self) -> None:
         """Fail-fast if the ``claude`` CLI is missing or unauthenticated.
@@ -83,6 +135,11 @@ class Daemon:
         plog.info("auth_preflight_ok")
 
     async def start(self) -> None:
+        # Fix 6 / H6-W3: acquire singleton lock BEFORE any daemon-wide
+        # state is touched. Two daemons on the same data_dir would
+        # double-write the audit log and race on the vault flock's
+        # between-write windows.
+        self._lock_fd = _acquire_singleton_lock(self._settings.data_dir)
         await self._preflight_claude_auth()
         # S15: refuse to start if .claude/settings*.json carries hooks/permissions.
         # We pass a plain stdlib logger because the helper is typed against
@@ -101,6 +158,38 @@ class Daemon:
             project_root=self._settings.project_root,
             data_dir=self._settings.data_dir,
         )
+        # Phase 4: long-term memory subsystem. configure_memory is
+        # idempotent on re-boot; it creates the vault dir + .tmp/
+        # subdir, ensures the FTS5 index schema, runs Policy-B
+        # auto-reindex (count OR max_mtime_ns mismatch), and never
+        # blocks boot on a held lock (non-blocking acquisition, warn
+        # on contention).
+        #
+        # Fix 8 / H5-W3: wrap with a helpful exit. If the owner's
+        # vault dir is not writable (read-only FS, quota exceeded,
+        # cloud-sync volume rejecting flock) or the index DB is
+        # locked by another process that already leaked past the
+        # singleton check, we surface a human-readable hint instead
+        # of a raw traceback.
+        try:
+            _memory_mod.configure_memory(
+                vault_dir=self._settings.vault_dir,
+                index_db_path=self._settings.memory_index_path,
+                max_body_bytes=self._settings.memory.max_body_bytes,
+            )
+        except (OSError, sqlite3.OperationalError) as exc:
+            log.error(
+                "memory_configure_failed",
+                error=repr(exc),
+                vault_dir=str(self._settings.vault_dir),
+                index_db_path=str(self._settings.memory_index_path),
+                hint=(
+                    "vault_dir not writable or index_db_path locked? "
+                    "Check MEMORY_VAULT_DIR / MEMORY_INDEX_DB_PATH env "
+                    "overrides and filesystem permissions."
+                ),
+            )
+            sys.exit(4)
         # Sweep stale tmp / cache dirs + crashed-install staging dirs.
         self._spawn_bg(_core.sweep_run_dirs(self._settings.data_dir))
         self._spawn_bg(_core.sweep_legacy_stage_dirs(self._settings.project_root))
@@ -215,6 +304,15 @@ class Daemon:
         await _core.cancel_bg_tasks()
         if self._conn is not None:
             await self._conn.close()
+        # Fix 6 / H6-W3: release the singleton lock last so any
+        # concurrent restart attempt still sees us as the holder
+        # until our state is fully torn down.
+        if self._lock_fd is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                os.close(self._lock_fd)
+            self._lock_fd = None
         log.info("daemon_stopped")
 
     @property

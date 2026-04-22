@@ -1,0 +1,91 @@
+## Seed vault disk inventory
+  total_md files: 12
+  eligible for index: 8
+  skipped (_*.md): 4
+
+## Seed vault reindex measurement
+  indexed:  8
+  index_count: 8
+  duration: 0.0021 sec
+  skipped:  4
+    - _index.md (_*.md exclude)
+    - inbox/_index.md (_*.md exclude)
+    - projects/_index.md (_*.md exclude)
+    - blog/_index.md (_*.md exclude)
+
+## Extrapolation (0.3 ms/note measured)
+    100 notes: ~0.0 sec reindex
+    500 notes: ~0.1 sec reindex
+   1000 notes: ~0.3 sec reindex
+   2000 notes: ~0.5 sec reindex
+   5000 notes: ~1.3 sec reindex
+
+## Policy evaluation
+
+Policy A — unconditional reindex on every configure_memory boot.
+  Pros: simplest code; seed works; survives FS-edits-while-stopped.
+  Cons: 5000-note Obsidian vault blocks daemon startup for ~15 sec
+        (phase-1 owner smoke: "bot never came online"). Regressive on
+        the user's first bad experience.
+  Verdict: reject for default; ok as debug flag.
+
+Policy B — staleness-gated reindex: compare on-disk eligible_count to
+  index_count; reindex if mismatched.
+  Pros: seed vault case auto-works (0 vs 12 → reindex); normal restart
+        is zero-cost; survives DB deletion (0 vs 12 → reindex).
+  Cons: count comparison is cheap but imperfect — if exactly N files
+        were edited in place with identical count, skipped. Need a
+        mtime-based sanity check or explicit memory_reindex to force.
+  Verdict: default. Enough for phase-4 scope.
+
+Policy C — lazy, only on explicit memory_reindex.
+  Pros: minimal startup code; explicit user intent.
+  Cons: violates AC#1 out-of-box on seed vault (first memory_search
+        misses everything); model must be told to run memory_reindex
+        by system prompt, adding a turn to every first-boot interaction.
+  Verdict: reject — burden shifted to prompt + model discipline.
+
+## Recommended: Policy B with a safety cap.
+
+Stub code for _memory_core.py:
+
+```python
+_VAULT_SCAN_EXCLUDES = {'.obsidian', '.tmp', '.git', '.trash', '__pycache__', '.DS_Store'}
+
+def _count_eligible_on_disk(vault: Path) -> int:
+    n = 0
+    for md in vault.rglob('*.md'):
+        rel = md.relative_to(vault)
+        if any(p in _VAULT_SCAN_EXCLUDES for p in rel.parts):
+            continue
+        if md.name.startswith('_'):
+            continue
+        n += 1
+    return n
+
+def _maybe_auto_reindex(vault: Path, db: sqlite3.Connection, log) -> None:
+    '''Called at end of configure_memory. Reindex if on-disk count disagrees
+    with index count, up to a 2000-note cap (warn+skip above).
+    '''
+    disk = _count_eligible_on_disk(vault)
+    idx = db.execute('SELECT COUNT(*) FROM notes').fetchone()[0]
+    if disk == idx:
+        log.info('memory_index_fresh', disk_count=disk)
+        return
+    MAX_AUTO_REINDEX = 2000
+    if disk > MAX_AUTO_REINDEX:
+        log.warning(
+            'memory_vault_too_large_for_auto_reindex',
+            disk_count=disk, cap=MAX_AUTO_REINDEX,
+            note='call memory_reindex explicitly; or set MEMORY_ALLOW_LARGE_REINDEX=1'
+        )
+        return
+    t0 = time.perf_counter()
+    n = _reindex_vault(vault, db)  # existing fn
+    log.info('memory_auto_reindex_done', indexed=n,
+             duration_ms=int((time.perf_counter() - t0) * 1000))
+```
+
+Addresses both devil C6 (seed vault empty-index UX bug) and devil H8
+(large-vault blast radius cap).
+

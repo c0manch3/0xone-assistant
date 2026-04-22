@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+from collections.abc import Iterator
+from pathlib import Path
+
 import pytest
 
 
 @pytest.fixture(autouse=True)
-def _reset_installer_ctx() -> None:
+def _reset_installer_ctx() -> Iterator[None]:
     """Reset the module-level ``configure_installer`` one-shot guard
     between tests (S11 wave-3).
 
@@ -20,3 +25,57 @@ def _reset_installer_ctx() -> None:
     reset_installer_for_tests()
     yield
     reset_installer_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _reset_memory_ctx() -> Iterator[None]:
+    """Reset the memory module state so each test starts clean.
+
+    Mirrors the installer's autouse fixture — every test that builds a
+    tmp-path vault needs ``configure_memory`` to accept the new paths.
+    """
+    from assistant.tools_sdk.memory import reset_memory_for_tests
+
+    reset_memory_for_tests()
+    yield
+    reset_memory_for_tests()
+
+
+@pytest.fixture
+def memory_ctx(tmp_path: Path) -> Iterator[tuple[Path, Path]]:
+    """Configure the memory subsystem against a tmp-path vault.
+
+    Guards against accidentally touching the owner's real vault at
+    ``~/.local/share/0xone-assistant/vault`` (M2.5).
+    """
+    from assistant.tools_sdk import memory as mm
+
+    mm.reset_memory_for_tests()
+    vault = tmp_path / "vault"
+    idx = tmp_path / "memory-index.db"
+    # Safety rail — never let a test vault collide with the owner's
+    # real one.
+    assert not str(tmp_path).startswith(
+        os.path.expanduser("~/.local/share/0xone-assistant")
+    ), f"tmp_path {tmp_path} must not overlap the real data dir"
+    mm.configure_memory(
+        vault_dir=vault, index_db_path=idx, max_body_bytes=1_048_576
+    )
+    yield vault, idx
+    mm.reset_memory_for_tests()
+
+
+@pytest.fixture
+def seed_vault_copy(tmp_path: Path) -> Path:
+    """Copy the owner's real 12-note seed vault into ``tmp_path``.
+
+    Uses a distinct subdirectory (``seed_vault``) rather than ``vault``
+    so co-existing ``memory_ctx`` fixtures that also build ``vault``
+    don't collide.
+    """
+    src = Path.home() / ".local" / "share" / "0xone-assistant" / "vault"
+    if not src.exists():
+        pytest.skip(f"seed vault missing at {src}")
+    dst = tmp_path / "seed_vault"
+    shutil.copytree(src, dst)
+    return dst

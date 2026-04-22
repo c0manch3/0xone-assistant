@@ -1,0 +1,137 @@
+platform: darwin
+python: 3.14.3
+
+## 1. os.statvfs.f_fstypename — devil C4 reproduction
+  attrs: ['f_bavail', 'f_bfree', 'f_blocks', 'f_bsize', 'f_favail', 'f_ffree', 'f_files', 'f_flag', 'f_frsize', 'f_fsid', 'f_namemax']
+  has_f_fstypename: False
+  CONFIRMED: devil-wave-1 ID-C4 correct — attribute absent on Darwin.
+
+## 2. `stat -f "%T"` macOS trap
+  stat -f '%HT' / → 'Directory'  (this is FILE type, NOT FS type)
+  => on macOS do NOT use `stat -f %T` for FS type detection.
+
+## 3. Recommended approach — `mount` output parsing (macOS)
+  '/'                                                                      fs=apfs
+  '/tmp'                                                                   fs=apfs
+  '/Users/agent2'                                                          fs=apfs
+  '/Users/agent2/Documents'                                                fs=apfs
+  '/Users/agent2/Library/Mobile Documents'                                 fs=apfs
+  '/Users/agent2/Library/CloudStorage'                                     fs=apfs
+  '/Users/agent2/.local/share/0xone-assistant/vault'                       fs=apfs
+  '/dev'                                                                   fs=devfs
+
+## 4. Observed FS types on this machine: ['apfs', 'devfs']
+    (limited sample — owner workstation has no iCloud/SMB/Dropbox mounts attached)
+
+## 5. Proposed whitelist
+  SAFE_FS_TYPES   = ['apfs', 'btrfs', 'ext2', 'ext3', 'ext4', 'hfs', 'hfsplus', 'tmpfs', 'ufs', 'xfs', 'zfs']
+  UNSAFE_FS_TYPES = ['afpfs', 'cifs', 'exfat', 'fuse', 'msdos', 'nfs', 'nfs4', 'osxfuse', 'smbfs', 'vfat', 'webdav']
+    Not in either list → treat as 'unknown' and also warn.
+
+## 6. Path-prefix heuristics (macOS-specific)
+
+    Cloud-sync directories often report APFS but behave unsafely:
+      - ~/Library/Mobile Documents/...  → iCloud Drive (FileProvider on 10.15+)
+      - ~/Library/CloudStorage/...      → iCloud/OneDrive/GoogleDrive/Dropbox (modern)
+      - ~/Dropbox/...                   → Dropbox Smart Sync (may be FUSE or FileProvider)
+      - /Volumes/...                    → external volumes (often exFAT/msdos)
+    Combine FS-type check + path prefix for best warning coverage.
+    
+## Recommended function (drop into _memory_core.py)
+
+import os, re, subprocess, sys
+from pathlib import Path
+
+_SAFE_FS_TYPES = frozenset({'apfs', 'hfs', 'hfsplus', 'ufs', 'ext2', 'ext3',
+                            'ext4', 'btrfs', 'xfs', 'tmpfs', 'zfs'})
+_UNSAFE_FS_TYPES = frozenset({'smbfs', 'afpfs', 'nfs', 'nfs4', 'cifs',
+                              'fuse', 'osxfuse', 'webdav', 'msdos', 'exfat', 'vfat'})
+
+_UNSAFE_PATH_HINTS = (
+    ('~/Library/Mobile Documents', 'iCloud Drive'),
+    ('~/Library/CloudStorage',     'CloudStorage (iCloud/OneDrive/GoogleDrive/Dropbox)'),
+    ('~/Dropbox',                  'Dropbox'),
+)
+
+
+def _detect_fs_type_darwin(path: Path) -> str:
+    try:
+        target = path.resolve()
+    except OSError:
+        return 'unknown'
+    try:
+        r = subprocess.run(['mount'], capture_output=True, text=True, timeout=3)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return 'unknown'
+    if r.returncode != 0:
+        return 'unknown'
+    best_len = -1
+    best_fs = 'unknown'
+    for line in r.stdout.splitlines():
+        if ' on ' not in line:
+            continue
+        try:
+            _, rest = line.split(' on ', 1)
+            mp, tail = rest.split(' ', 1)
+        except ValueError:
+            continue
+        try:
+            target.relative_to(mp)
+        except ValueError:
+            if str(target) != mp:
+                continue
+        m = re.search(r'\(([a-z0-9]+)', tail)
+        if m and len(mp) > best_len:
+            best_len = len(mp)
+            best_fs = m.group(1)
+    return best_fs
+
+
+def _detect_fs_type_linux(path: Path) -> str:
+    try:
+        r = subprocess.run(
+            ['stat', '-f', '-c', '%T', str(path)],
+            capture_output=True, text=True, timeout=3,
+        )
+        if r.returncode == 0:
+            return (r.stdout.strip() or 'unknown').lower()
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return 'unknown'
+
+
+def detect_fs_type(path: Path) -> str:
+    '''Best-effort FS type detection. Returns 'unknown' on any failure.'''
+    if sys.platform == 'darwin':
+        return _detect_fs_type_darwin(path)
+    if sys.platform.startswith('linux'):
+        return _detect_fs_type_linux(path)
+    return 'unknown'
+
+
+def warn_if_vault_unsafe_for_flock(path: Path, log) -> None:
+    '''Log a loud warning if vault FS is likely to break fcntl.flock.
+
+    Called at end of configure_memory. Single source of truth for the
+    R8/D2 mitigation in phase-4 plan.
+    '''
+    fs = detect_fs_type(path)
+    p_str = str(path.resolve())
+    hint: str | None = None
+    for frag, label in _UNSAFE_PATH_HINTS:
+        if os.path.expanduser(frag) in p_str:
+            hint = label
+            break
+    if fs in _UNSAFE_FS_TYPES:
+        log.warning('memory_vault_fs_unsafe', vault=p_str, fs=fs,
+                    note='advisory flock may be a no-op; writes may race')
+    elif hint:
+        log.warning('memory_vault_cloudsync_detected', vault=p_str,
+                    fs=fs, hint=hint,
+                    note='cloud-sync directories may silently drop atomic renames or flock guarantees')
+    elif fs == 'unknown':
+        log.info('memory_vault_fs_unknown', vault=p_str,
+                 note='fs type detection failed; concurrent writes assumed OK')
+    elif fs not in _SAFE_FS_TYPES:
+        log.warning('memory_vault_fs_unrecognised', vault=p_str, fs=fs)
+

@@ -1,0 +1,74 @@
+## 1. Reproduce crash on seed note
+  reproduced: True
+  parsed: {'created': datetime.date(2026, 4, 16), 'tags': ['project', 'company', 'ai', 'branding'], 'source': 'telegram'}
+  error:  Object of type date is not JSON serializable
+
+## 2. Fix A (custom SafeLoader)
+  ok: True
+  parsed[0]=('created', '2026-04-16')
+  json_len: 97
+
+## 3. Fix B (post-parse dict walk)
+  ok: True
+  parsed[0]=('created', '2026-04-16')
+  json_len: 97
+
+## 4. Fix C (json.dumps default=str)
+  ok: True
+  json_preview: {"created": "2026-04-16", "tags": ["project", "company", "ai", "branding"], "source": "telegram"}
+
+## 5. Scan all seed notes
+  affected: 9 / 9
+    - inbox/2026-04-01-совещание-студия-44.md
+    - projects/studio44.md
+    - projects/flowgent.md
+    - projects/studio44-workload-platform.md
+    - projects/pasha-b-cadastre.md
+    - projects/midomis-bot.md
+    - blog/gonka-deficit-compute.md
+    - blog/gonka-ai-research.md
+    - blog/_index.md
+
+## Recommendation
+
+Preferred: Fix A (custom Loader).
+  - Single point of truth: every call site that parses frontmatter gets
+    ISO strings automatically.
+  - Preserves YAML semantics elsewhere; no post-walk cost.
+  - Code sketch:
+
+    class IsoDateLoader(yaml.SafeLoader):
+        pass
+
+    def _timestamp_as_iso(loader, node):
+        val = yaml.SafeLoader.construct_yaml_timestamp(loader, node)
+        return val.isoformat() if isinstance(val, (datetime.date, datetime.datetime)) else str(val)
+
+    IsoDateLoader.add_constructor('tag:yaml.org,2002:timestamp', _timestamp_as_iso)
+
+    def parse_frontmatter(text: str) -> dict:
+        m = re.match(r'^---\n(.*?)\n---', text, re.DOTALL)
+        if not m:
+            return {}
+        data = yaml.load(m.group(1), Loader=IsoDateLoader) or {}
+        if not isinstance(data, dict):
+            raise ValueError('frontmatter is not a mapping')
+        return data
+
+Acceptable: Fix B (defensive).  Use ONLY if a downstream consumer needs
+  native datetime objects somewhere — keep the Loader raw and coerce on
+  the path to JSON-RPC. Adds one O(n) walk per memory_read.
+
+Avoid: Fix C (json.dumps default=str).  Works but ``default=str`` hides
+  bugs — next schema evolution adds e.g. a custom type and silently
+  stringifies it.  Also: round-trip inconsistency (write stores string,
+  Obsidian may re-write as bare date).
+
+Additional concern: on WRITE, ``yaml.safe_dump(frontmatter)`` may re-emit
+  the value as a bare date if it's an ISO string that looks date-like? No —
+  safe_dump emits as quoted string unless the Python value is date/datetime.
+  But Obsidian users may re-edit the file and switch back to bare form.
+  The READ path handles both. The WRITE path should always emit quoted
+  strings for created/updated (use ``default_flow_style=False`` + put
+  value as string explicitly).
+

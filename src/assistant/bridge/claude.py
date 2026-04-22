@@ -36,6 +36,7 @@ from assistant.tools_sdk.installer import (
     INSTALLER_SERVER,
     INSTALLER_TOOL_NAMES,
 )
+from assistant.tools_sdk.memory import MEMORY_SERVER, MEMORY_TOOL_NAMES
 
 log = get_logger("bridge.claude")
 
@@ -160,8 +161,12 @@ class ClaudeBridge:
                 "WebFetch",
                 "Skill",
                 *INSTALLER_TOOL_NAMES,
+                *MEMORY_TOOL_NAMES,
             ],
-            mcp_servers={"installer": INSTALLER_SERVER},
+            mcp_servers={
+                "installer": INSTALLER_SERVER,
+                "memory": MEMORY_SERVER,
+            },
             hooks=hooks,
             system_prompt=system_prompt_preset,
             **thinking_kwargs,

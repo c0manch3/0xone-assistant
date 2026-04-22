@@ -28,6 +28,24 @@ def _user_env_file() -> Path:
     return _default_config_dir() / ".env"
 
 
+class MemorySettings(BaseSettings):
+    """Memory subsystem knobs (``MEMORY_*`` env prefix).
+
+    ``vault_dir`` / ``index_db_path`` default to ``None`` so the
+    parent ``Settings`` can derive them from ``data_dir`` at access
+    time — owner can still override via env vars.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="MEMORY_",
+        env_file=[_user_env_file(), Path(".env")],
+        extra="ignore",
+    )
+    vault_dir: Path | None = None
+    index_db_path: Path | None = None
+    max_body_bytes: int = 1_048_576
+
+
 class ClaudeSettings(BaseSettings):
     """Claude-bridge knobs (``CLAUDE_*`` env prefix).
 
@@ -68,6 +86,7 @@ class Settings(BaseSettings):
     project_root: Path = Field(default_factory=_default_project_root)
     data_dir: Path = Field(default_factory=_default_data_dir)
     claude: ClaudeSettings = Field(default_factory=ClaudeSettings)
+    memory: MemorySettings = Field(default_factory=MemorySettings)
 
     @field_validator("project_root", "data_dir", mode="after")
     @classmethod
@@ -78,6 +97,26 @@ class Settings(BaseSettings):
     @property
     def db_path(self) -> Path:
         return self.data_dir / "assistant.db"
+
+    @property
+    def vault_dir(self) -> Path:
+        """Resolve the long-term-memory vault directory.
+
+        Falls back to ``<data_dir>/vault`` when ``MEMORY_VAULT_DIR`` is
+        unset; always returns an absolute, user-expanded path.
+        """
+        base = self.memory.vault_dir or (self.data_dir / "vault")
+        return base.expanduser().resolve()
+
+    @property
+    def memory_index_path(self) -> Path:
+        """Resolve the long-term-memory FTS5 index DB path.
+
+        Falls back to ``<data_dir>/memory-index.db`` when
+        ``MEMORY_INDEX_DB_PATH`` is unset.
+        """
+        base = self.memory.index_db_path or (self.data_dir / "memory-index.db")
+        return base.expanduser().resolve()
 
 
 @lru_cache(maxsize=1)

@@ -29,9 +29,18 @@ skills/*
 !skills/ping/**
 !skills/skill-installer/
 !skills/skill-installer/**
+!skills/memory/
+!skills/memory/**
 
 # Tools installed with skills (only ping is repo-shipped).
 tools/*
 !tools/.gitkeep
 !tools/ping/
 !tools/ping/**
+
+# Phase 4 memory subsystem runtime artefacts.
+memory-index.db
+memory-index.db-wal
+memory-index.db-shm
+memory-index.db.lock
+memory-audit.log

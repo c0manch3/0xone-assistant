@@ -1,0 +1,7 @@
+approach                                recall  precision     hits/pos   false_hits
+-------------------------------------------------------------------------------------
+1_plan_default                          13.64%    100.00%      3/22               0
+2_plan_fallback                         13.64%    100.00%      3/22               0
+3_pystem_index_and_query                90.91%    100.00%     20/22               0
+4_pystem_query_wildcard                100.00%    100.00%     22/22               0
+5_naive_prefix_wildcard                 81.82%    100.00%     18/22               0

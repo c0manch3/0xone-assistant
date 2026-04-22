@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import ipaddress
+import json
+import os
 import re
 import socket
 from pathlib import Path
@@ -142,6 +145,28 @@ def _deny(reason: str) -> HookJSONOutput:
             }
         },
     )
+
+
+def _truncate_strings(obj: Any, *, max_len: int = 2048) -> Any:
+    """Recursively truncate every ``str`` leaf in ``obj`` to ``max_len`` chars.
+
+    Used by the memory PostToolUse audit hook (Fix 1 / C4-W3) to cap
+    the size of each ``tool_input`` field written to ``memory-audit.log``.
+    Keeps dict/list structure intact; non-container non-string values
+    pass through unchanged.
+
+    Truncated strings get a ``...<truncated>`` suffix so operators can
+    tell at-a-glance that the entry was abridged.
+    """
+    if isinstance(obj, str):
+        if len(obj) <= max_len:
+            return obj
+        return obj[:max_len] + "...<truncated>"
+    if isinstance(obj, dict):
+        return {k: _truncate_strings(v, max_len=max_len) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_truncate_strings(v, max_len=max_len) for v in obj]
+    return obj
 
 
 def _allow() -> HookJSONOutput:
@@ -658,7 +683,68 @@ def make_posttool_hooks(project_root: Path, data_dir: Path) -> list[HookMatcher]
                 )
         return cast(HookJSONOutput, {})
 
+    # Phase 4: audit every ``mcp__memory__*`` tool invocation as a JSONL
+    # line so owner has a tamper-evident trail of what the model
+    # read/wrote/deleted in the vault. No rotation (Q-R4 deferred to
+    # phase 9); single-user traffic keeps disk pressure negligible.
+    audit_path = data_dir / "memory-audit.log"
+
+    async def on_memory_tool(
+        input_data: HookInput,
+        tool_use_id: str | None,
+        ctx: HookContext,
+    ) -> HookJSONOutput:
+        del ctx
+        raw = cast(dict[str, Any], input_data)
+        tool_name = raw.get("tool_name") or ""
+        tool_input = raw.get("tool_input") or {}
+        tool_response = raw.get("tool_response") or {}
+        # Fix 1 / C4-W3: truncate every string value in ``tool_input``
+        # to 2048 chars BEFORE ``json.dumps``. The model-controlled
+        # ``body`` of ``memory_write`` can be up to ``max_body_bytes``
+        # (1 MiB default); ``query`` / ``path`` / etc. are not
+        # size-capped until downstream validators reject them, which
+        # is after the audit hook has already persisted the raw bytes.
+        # Without this cap the audit log is the biggest file on disk.
+        tool_input_compact = _truncate_strings(tool_input, max_len=2048)
+        # Compact the response so audit log stays small — only keep
+        # is_error flag and a body-length signal rather than full
+        # snippet text (which can be multi-KB and contain attacker-
+        # controlled bytes).
+        resp_meta: dict[str, Any] = {}
+        if isinstance(tool_response, dict):
+            resp_meta["is_error"] = bool(tool_response.get("is_error"))
+            content = tool_response.get("content") or []
+            if isinstance(content, list) and content:
+                first = content[0] if isinstance(content[0], dict) else {}
+                text = first.get("text") if isinstance(first, dict) else None
+                resp_meta["content_len"] = len(text) if isinstance(text, str) else 0
+        entry = {
+            "ts": dt.datetime.now(dt.UTC).isoformat(),
+            "tool_name": tool_name,
+            "tool_use_id": tool_use_id,
+            "tool_input": tool_input_compact,
+            "response": resp_meta,
+        }
+        try:
+            audit_path.parent.mkdir(parents=True, exist_ok=True)
+            # Fix 2 / H2: create the file restricted to owner only.
+            # ``os.chmod`` is a no-op if the file already exists with
+            # 0o600; calling it unconditionally is safe and cheap.
+            new_file = not audit_path.exists()
+            with audit_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            if new_file:
+                try:
+                    os.chmod(audit_path, 0o600)
+                except OSError as exc:
+                    log.warning("memory_audit_chmod_failed", error=repr(exc))
+        except OSError as exc:
+            log.warning("memory_audit_write_failed", error=repr(exc))
+        return cast(HookJSONOutput, {})
+
     return [
         HookMatcher(matcher="Write", hooks=[on_write_edit]),
         HookMatcher(matcher="Edit", hooks=[on_write_edit]),
+        HookMatcher(matcher=r"mcp__memory__.*", hooks=[on_memory_tool]),
     ]
