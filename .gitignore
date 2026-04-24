@@ -31,6 +31,8 @@ skills/*
 !skills/skill-installer/**
 !skills/memory/
 !skills/memory/**
+!skills/scheduler/
+!skills/scheduler/**
 
 # Tools installed with skills (only ping is repo-shipped).
 tools/*
@@ -44,3 +46,8 @@ memory-index.db-wal
 memory-index.db-shm
 memory-index.db.lock
 memory-audit.log
+
+# Phase 5 scheduler runtime artefacts.
+scheduler-audit.log
+.last_clean_exit
+.daemon.pid

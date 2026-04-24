@@ -4,7 +4,7 @@ from pathlib import Path
 
 import aiosqlite
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_0001 = """
 CREATE TABLE IF NOT EXISTS conversations (
@@ -138,9 +138,72 @@ async def _apply_0002(conn: aiosqlite.Connection) -> None:
         await conn.execute("PRAGMA foreign_keys=ON")
 
 
+async def _apply_0003(conn: aiosqlite.Connection) -> None:
+    """Phase 5: scheduler tables.
+
+    Two tables share ``assistant.db`` with ``conversations`` / ``turns``
+    (plan §C). Low write rate (1-2 rows/minute at most) doesn't justify a
+    separate DB; fewer files to back up.
+
+    ``UNIQUE(schedule_id, scheduled_for)`` on ``triggers`` is the
+    at-least-once contract's core invariant — materialisation is a no-op
+    on re-entry in the same minute, which keeps ``SchedulerLoop`` safe to
+    retry without risk of double-delivery.
+
+    Idempotent: runs under ``BEGIN EXCLUSIVE`` and bumps ``user_version``
+    inside the same transaction so a crash rolls us back to v=2 cleanly.
+    """
+    if await _current_version(conn) >= 3:
+        return
+    try:
+        await conn.execute("BEGIN EXCLUSIVE")
+        await conn.execute(
+            "CREATE TABLE IF NOT EXISTS schedules ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "cron TEXT NOT NULL, "
+            "prompt TEXT NOT NULL, "
+            "tz TEXT NOT NULL DEFAULT 'UTC', "
+            "enabled INTEGER NOT NULL DEFAULT 1, "
+            "created_at TEXT NOT NULL DEFAULT "
+            "(strftime('%Y-%m-%dT%H:%M:%SZ','now')), "
+            "last_fire_at TEXT)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_schedules_enabled "
+            "ON schedules(enabled)"
+        )
+        await conn.execute(
+            "CREATE TABLE IF NOT EXISTS triggers ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "schedule_id INTEGER NOT NULL REFERENCES schedules(id) "
+            "ON DELETE CASCADE, "
+            "prompt TEXT NOT NULL, "
+            "scheduled_for TEXT NOT NULL, "
+            "status TEXT NOT NULL DEFAULT 'pending', "
+            "attempts INTEGER NOT NULL DEFAULT 0, "
+            "last_error TEXT, "
+            "created_at TEXT NOT NULL DEFAULT "
+            "(strftime('%Y-%m-%dT%H:%M:%SZ','now')), "
+            "sent_at TEXT, "
+            "acked_at TEXT, "
+            "UNIQUE(schedule_id, scheduled_for))"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_triggers_status_time "
+            "ON triggers(status, scheduled_for)"
+        )
+        await conn.execute("PRAGMA user_version=3")
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+
+
 async def apply_schema(conn: aiosqlite.Connection) -> None:
     current = await _current_version(conn)
     if current < 1:
         await _apply_0001(conn)
     if current < 2:
         await _apply_0002(conn)
+    if current < 3:
+        await _apply_0003(conn)

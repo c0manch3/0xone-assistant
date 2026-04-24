@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import datetime as dt
 import os
 import shutil
 from collections.abc import Iterator
@@ -39,6 +41,53 @@ def _reset_memory_ctx() -> Iterator[None]:
     reset_memory_for_tests()
     yield
     reset_memory_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _reset_scheduler_ctx() -> Iterator[None]:
+    """Reset the scheduler module state so each test starts clean.
+
+    Parallel to ``_reset_memory_ctx`` — every scheduler-tool test
+    configures a fresh store against ``tmp_path``.
+    """
+    from assistant.tools_sdk.scheduler import reset_scheduler_for_tests
+
+    reset_scheduler_for_tests()
+    yield
+    reset_scheduler_for_tests()
+
+
+class FakeClock:
+    """Deterministic clock for async tick-loop tests (RQ4).
+
+    ``now()`` returns the current virtual time; ``sleep(s)`` advances
+    the virtual clock by ``s`` seconds AND yields to the event loop
+    so pending coroutines run. The ``slept`` list records every
+    ``sleep`` call — useful for asserting cadence in tests.
+
+    Default start is ``2026-01-01 00:00 UTC`` — well-defined, not a
+    DST transition, not a leap day, easy to reason about.
+    """
+
+    def __init__(self, start: dt.datetime | None = None) -> None:
+        self._now = start or dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+        self.slept: list[float] = []
+
+    def now(self) -> dt.datetime:
+        return self._now
+
+    async def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self._now += dt.timedelta(seconds=seconds)
+        await asyncio.sleep(0)
+
+    def advance(self, seconds: float) -> None:
+        self._now += dt.timedelta(seconds=seconds)
+
+
+@pytest.fixture
+def fake_clock() -> FakeClock:
+    return FakeClock()
 
 
 @pytest.fixture

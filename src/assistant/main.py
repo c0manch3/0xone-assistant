@@ -9,6 +9,7 @@ import shutil as _shutil
 import signal
 import sqlite3
 import sys
+from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
 
@@ -23,11 +24,23 @@ from assistant.bridge.claude import ClaudeBridge
 from assistant.config import Settings, get_settings
 from assistant.handlers.message import ClaudeHandler
 from assistant.logger import get_logger, setup_logging
+from assistant.scheduler.dispatcher import SchedulerDispatcher
+from assistant.scheduler.loop import (
+    RealClock,
+    ScheduledTrigger,
+    SchedulerLoop,
+)
+from assistant.scheduler.store import (
+    SchedulerStore,
+    unlink_clean_exit_marker,
+    write_clean_exit_marker,
+)
 from assistant.state.conversations import ConversationStore
 from assistant.state.db import apply_schema, connect
 from assistant.tools_sdk import _installer_core as _core
 from assistant.tools_sdk import installer as _installer_mod
 from assistant.tools_sdk import memory as _memory_mod
+from assistant.tools_sdk import scheduler as _scheduler_mod
 
 log = get_logger("main")
 
@@ -84,6 +97,12 @@ class Daemon:
         self._adapter: TelegramAdapter | None = None
         self._bg_tasks: set[asyncio.Task[Any]] = set()
         self._lock_fd: int | None = None
+        # Phase 5: scheduler wiring. Instantiated in ``start()``; kept
+        # as attributes so ``stop()`` can signal + join gracefully.
+        self._sched_store: SchedulerStore | None = None
+        self._sched_loop: SchedulerLoop | None = None
+        self._sched_dispatcher: SchedulerDispatcher | None = None
+        self._sched_queue: asyncio.Queue[ScheduledTrigger] | None = None
 
     async def _preflight_claude_auth(self) -> None:
         """Fail-fast if the ``claude`` CLI is missing or unauthenticated.
@@ -211,8 +230,101 @@ class Daemon:
         handler = ClaudeHandler(self._settings, store, bridge)
         self._adapter = TelegramAdapter(self._settings)
         self._adapter.set_handler(handler)
+
+        # --------------------------------------------------------------
+        # Phase 5: scheduler subsystem
+        #
+        # Order matters: we need to classify the boot BEFORE the loop
+        # starts producing triggers, clean-slate any orphan ``sent``
+        # rows, and decide whether the catchup recap should fire. The
+        # supervised spawn runs after ``adapter.start()`` so the adapter
+        # is ready when the very first scheduled trigger lands.
+        # --------------------------------------------------------------
+        sched_enabled = self._settings.scheduler.enabled
+        catchup_missed = 0
+        boot_class: str = "unknown"
+        if sched_enabled:
+            self._sched_store = SchedulerStore(self._conn)
+            _scheduler_mod.configure_scheduler(
+                data_dir=self._settings.data_dir,
+                owner_chat_id=self._settings.owner_chat_id,
+                settings=self._settings.scheduler,
+                store=self._sched_store,
+            )
+            marker_path = self._settings.data_dir / ".last_clean_exit"
+            boot_class = await self._sched_store.classify_boot(
+                marker_path=marker_path,
+                max_age_s=self._settings.scheduler.clean_exit_window_s,
+            )
+            # M2.7: remove the marker AFTER classification so a restart
+            # 10 minutes later is still classified as suspend-or-crash
+            # rather than spuriously-clean.
+            unlink_clean_exit_marker(marker_path)
+            log.info(
+                "boot_classified",
+                cls=boot_class,
+                marker=str(marker_path),
+            )
+            reverted = await self._sched_store.clean_slate_sent()
+            if reverted:
+                log.info("orphan_sent_reverted", count=reverted)
+            if boot_class != "clean-deploy":
+                catchup_missed = (
+                    await self._sched_store.count_catchup_misses(
+                        catchup_window_s=(
+                            self._settings.scheduler.catchup_window_s
+                        ),
+                    )
+                )
+
         await self._adapter.start()
         log.info("daemon_started", owner=self._settings.owner_chat_id)
+
+        if sched_enabled:
+            assert self._sched_store is not None
+            self._sched_queue = asyncio.Queue(
+                maxsize=self._settings.scheduler.dispatcher_queue_size
+            )
+            self._sched_dispatcher = SchedulerDispatcher(
+                queue=self._sched_queue,
+                store=self._sched_store,
+                handler=handler,
+                adapter=self._adapter,
+                owner_chat_id=self._settings.owner_chat_id,
+                settings=self._settings,
+            )
+            self._sched_loop = SchedulerLoop(
+                queue=self._sched_queue,
+                store=self._sched_store,
+                inflight_ref=self._sched_dispatcher.inflight,
+                settings=self._settings,
+                clock=RealClock(),
+            )
+            self._spawn_bg_supervised(
+                self._sched_dispatcher.run,
+                name="scheduler_dispatcher",
+            )
+            self._spawn_bg_supervised(
+                self._sched_loop.run, name="scheduler_loop"
+            )
+            # Catchup recap: only if we decidedly missed work (H-2).
+            if (
+                catchup_missed
+                >= self._settings.scheduler.min_recap_threshold
+                and boot_class != "clean-deploy"
+            ):
+                top3 = await self._sched_store.top_missed_schedules(
+                    limit=3
+                )
+                recap = (
+                    f"пока я спал, пропущено {catchup_missed} "
+                    f"напоминаний (top-3: {', '.join(top3) or '-'})."
+                )
+                self._spawn_bg(
+                    self._adapter.send_text(
+                        self._settings.owner_chat_id, recap
+                    )
+                )
 
     def _spawn_bg(self, coro: Any) -> None:
         """Anchor a background coroutine so it is not GC'd mid-flight
@@ -220,6 +332,77 @@ class Daemon:
         task = asyncio.create_task(coro)
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
+
+    def _spawn_bg_supervised(
+        self,
+        factory: Callable[[], Coroutine[Any, Any, None]],
+        *,
+        name: str,
+        max_respawn_per_hour: int = 3,
+        backoff_s: float = 5.0,
+    ) -> None:
+        """Spawn a supervised background task (H-1).
+
+        On non-cancellation exceptions the supervisor respawns after
+        ``backoff_s`` seconds. After ``max_respawn_per_hour`` crashes
+        within a rolling hour it gives up and (best-effort) sends a
+        one-shot Telegram notify to the owner. The daemon as a whole
+        continues running — a dead scheduler shouldn't kill Telegram
+        echo.
+
+        ``factory`` is a zero-arg callable returning a fresh
+        coroutine. Callers MUST pass a factory (e.g. ``loop.run``) and
+        NOT a pre-instantiated coroutine — a coroutine can only be
+        awaited once, so respawning needs a fresh one each time.
+        """
+
+        async def _supervisor() -> None:
+            crashes: list[float] = []
+            while True:
+                task: asyncio.Task[None] = asyncio.create_task(factory())
+                try:
+                    await task
+                    return  # clean exit
+                except asyncio.CancelledError:
+                    # Fix 4 / devil C2: cancelling the supervisor task
+                    # does NOT cascade to the child ``task`` created
+                    # with ``asyncio.create_task``. Without this, the
+                    # child outlives the supervisor, and when
+                    # :meth:`Daemon.stop` closes the sqlite connection
+                    # the child's next DB call raises
+                    # ``sqlite3.ProgrammingError``. Bound the wait to
+                    # keep shutdown predictable; :class:`shield` keeps
+                    # the inner await from being cancelled twice.
+                    task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await asyncio.shield(
+                            asyncio.wait({task}, timeout=5.0)
+                        )
+                    raise
+                except Exception as exc:  # supervise all non-cancel
+                    now_s = asyncio.get_running_loop().time()
+                    crashes = [
+                        t for t in crashes if now_s - t < 3600
+                    ] + [now_s]
+                    log.warning(
+                        "bg_task_crashed",
+                        name=name,
+                        count=len(crashes),
+                        error=repr(exc),
+                    )
+                    if len(crashes) > max_respawn_per_hour:
+                        log.error("bg_task_giving_up", name=name)
+                        if self._adapter is not None:
+                            with contextlib.suppress(Exception):
+                                await self._adapter.send_text(
+                                    self._settings.owner_chat_id,
+                                    f"{name} crashed "
+                                    f"{len(crashes)}x in 1h; stopped",
+                                )
+                        return
+                    await asyncio.sleep(backoff_s)
+
+        self._spawn_bg(_supervisor())
 
     async def _bootstrap_skill_creator_bg(self) -> None:
         """Best-effort first-boot install of Anthropic's ``skill-creator``.
@@ -288,6 +471,22 @@ class Daemon:
 
     async def stop(self) -> None:
         log.info("daemon_stopping")
+        # H-2: write clean-exit marker BEFORE cancelling bg tasks or
+        # closing the DB. If we crashed after writing but before full
+        # teardown, the next boot still correctly classifies us as a
+        # clean-deploy (the marker content + mtime are what matter).
+        # Best-effort — a filesystem that rejects the write is non-fatal.
+        with contextlib.suppress(OSError):
+            write_clean_exit_marker(
+                self._settings.data_dir / ".last_clean_exit"
+            )
+        # Stop scheduler tasks gracefully so their in-flight trigger
+        # processing can mark_acked / revert_to_pending before the
+        # DB closes.
+        if self._sched_loop is not None:
+            self._sched_loop.stop()
+        if self._sched_dispatcher is not None:
+            self._sched_dispatcher.stop()
         if self._adapter is not None:
             await self._adapter.stop()
         # S8 (wave-3): cancel tracked bg coroutines (skill_creator bootstrap,

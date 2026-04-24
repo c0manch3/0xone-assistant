@@ -14,8 +14,8 @@ async def test_sentinel_touched_on_skill_write(tmp_path: Path) -> None:
     dd = tmp_path / "data"
     dd.mkdir()
     matchers = make_posttool_hooks(pr, dd)
-    # Phase 4: Write + Edit + mcp__memory__.* audit.
-    assert len(matchers) == 3
+    # Phase 5: Write + Edit + mcp__memory__.* + mcp__scheduler__.* audit.
+    assert len(matchers) == 4
 
     write_hook = matchers[0].hooks[0]
     await write_hook(

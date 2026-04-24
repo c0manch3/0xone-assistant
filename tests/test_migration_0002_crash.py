@@ -7,7 +7,7 @@ from unittest.mock import patch
 import aiosqlite
 import pytest
 
-from assistant.state.db import apply_schema, connect
+from assistant.state.db import SCHEMA_VERSION, apply_schema, connect
 
 
 async def _user_version(conn: aiosqlite.Connection) -> int:
@@ -75,9 +75,9 @@ async def test_crash_during_migration_rolls_back(tmp_path: Path) -> None:
         (count,) = await cur.fetchone()  # type: ignore[misc]
     assert count == 3
 
-    # Re-run — should converge to v=2.
+    # Re-run — should converge to the latest schema version.
     await apply_schema(conn)
-    assert await _user_version(conn) == 2
+    assert await _user_version(conn) == SCHEMA_VERSION
 
     async with conn.execute("SELECT COUNT(*) FROM turns") as cur:
         (turns_count,) = await cur.fetchone()  # type: ignore[misc]

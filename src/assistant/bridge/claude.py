@@ -37,6 +37,10 @@ from assistant.tools_sdk.installer import (
     INSTALLER_TOOL_NAMES,
 )
 from assistant.tools_sdk.memory import MEMORY_SERVER, MEMORY_TOOL_NAMES
+from assistant.tools_sdk.scheduler import (
+    SCHEDULER_SERVER,
+    SCHEDULER_TOOL_NAMES,
+)
 
 log = get_logger("bridge.claude")
 
@@ -162,10 +166,12 @@ class ClaudeBridge:
                 "Skill",
                 *INSTALLER_TOOL_NAMES,
                 *MEMORY_TOOL_NAMES,
+                *SCHEDULER_TOOL_NAMES,
             ],
             mcp_servers={
                 "installer": INSTALLER_SERVER,
                 "memory": MEMORY_SERVER,
+                "scheduler": SCHEDULER_SERVER,
             },
             hooks=hooks,
             system_prompt=system_prompt_preset,
@@ -210,6 +216,8 @@ class ClaudeBridge:
         chat_id: int,
         user_text: str,
         history: list[dict[str, Any]],
+        *,
+        system_notes: list[str] | None = None,
     ) -> AsyncIterator[Any]:
         """Stream blocks + the terminal ``ResultMessage`` for one turn.
 
@@ -224,13 +232,27 @@ class ClaudeBridge:
         S2 note: ``model`` is captured from ``AssistantMessage.model`` — it
         does NOT exist on ``ResultMessage`` in SDK 0.1.59's types.py. We log
         the last seen model alongside the ResultMessage line.
+
+        Phase 5 / H-7: ``system_notes`` are ephemeral directives the caller
+        (ClaudeHandler) wants the model to see alongside the user turn
+        without persisting them into ``conversations``. We concatenate them
+        as ``[system-note: ...]`` text blocks appended to ``user_text`` in
+        the live envelope — SDK streaming-input mode accepts a plain-string
+        ``content`` reliably, while the ``list[dict]`` form is unverified.
         """
         opts = self._build_options(system_prompt=self._render_system_prompt())
+        if system_notes:
+            joined = "\n\n".join(f"[system-note: {n}]" for n in system_notes)
+            user_text_for_envelope = f"{user_text}\n\n{joined}"
+        else:
+            user_text_for_envelope = user_text
         log.info(
             "query_start",
             chat_id=chat_id,
             prompt_len=len(user_text),
+            envelope_len=len(user_text_for_envelope),
             history_rows=len(history),
+            system_notes=len(system_notes or []),
         )
 
         async def prompt_stream() -> AsyncIterable[dict[str, Any]]:
@@ -238,7 +260,7 @@ class ClaudeBridge:
                 yield envelope
             yield {
                 "type": "user",
-                "message": {"role": "user", "content": user_text},
+                "message": {"role": "user", "content": user_text_for_envelope},
                 "parent_tool_use_id": None,
                 # R10: cosmetic — SDK assigns its own UUID.
                 "session_id": f"chat-{chat_id}",

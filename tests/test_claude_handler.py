@@ -43,7 +43,10 @@ class _FakeBridge(ClaudeBridge):
         chat_id: int,
         user_text: str,
         history: list[dict[str, Any]],
+        *,
+        system_notes: list[str] | None = None,
     ) -> AsyncIterator[Any]:
+        del system_notes  # phase 5: accepted but not asserted here
         if isinstance(self._script, Exception):
             raise self._script
         for item in self._script:
@@ -196,7 +199,10 @@ async def test_handler_interrupt_during_stream(tmp_path: Path) -> None:
             chat_id: int,
             user_text: str,
             history: list[dict[str, Any]],
+            *,
+            system_notes: list[str] | None = None,
         ) -> AsyncIterator[Any]:
+            del system_notes
             yield partial
             raise BaseException("simulated cancellation")
 

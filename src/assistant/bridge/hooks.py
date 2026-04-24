@@ -743,8 +743,62 @@ def make_posttool_hooks(project_root: Path, data_dir: Path) -> list[HookMatcher]
             log.warning("memory_audit_write_failed", error=repr(exc))
         return cast(HookJSONOutput, {})
 
+    # Phase 5: parallel audit hook for scheduler tools. Same JSONL
+    # shape as memory audit (content length only — we don't want
+    # 2-KB prompts clogging the audit log on every tick). Distinct
+    # file lets the owner keep operational events separate from
+    # memory reads.
+    scheduler_audit_path = data_dir / "scheduler-audit.log"
+
+    async def on_scheduler_tool(
+        input_data: HookInput,
+        tool_use_id: str | None,
+        ctx: HookContext,
+    ) -> HookJSONOutput:
+        del ctx
+        raw = cast(dict[str, Any], input_data)
+        tool_name = raw.get("tool_name") or ""
+        tool_input = raw.get("tool_input") or {}
+        tool_response = raw.get("tool_response") or {}
+        tool_input_compact = _truncate_strings(tool_input, max_len=2048)
+        resp_meta: dict[str, Any] = {}
+        if isinstance(tool_response, dict):
+            resp_meta["is_error"] = bool(tool_response.get("is_error"))
+            content = tool_response.get("content") or []
+            if isinstance(content, list) and content:
+                first = content[0] if isinstance(content[0], dict) else {}
+                text = first.get("text") if isinstance(first, dict) else None
+                resp_meta["content_len"] = (
+                    len(text) if isinstance(text, str) else 0
+                )
+        entry = {
+            "ts": dt.datetime.now(dt.UTC).isoformat(),
+            "tool_name": tool_name,
+            "tool_use_id": tool_use_id,
+            "tool_input": tool_input_compact,
+            "response": resp_meta,
+        }
+        try:
+            scheduler_audit_path.parent.mkdir(parents=True, exist_ok=True)
+            new_file = not scheduler_audit_path.exists()
+            with scheduler_audit_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            if new_file:
+                try:
+                    os.chmod(scheduler_audit_path, 0o600)
+                except OSError as exc:
+                    log.warning(
+                        "scheduler_audit_chmod_failed", error=repr(exc)
+                    )
+        except OSError as exc:
+            log.warning("scheduler_audit_write_failed", error=repr(exc))
+        return cast(HookJSONOutput, {})
+
     return [
         HookMatcher(matcher="Write", hooks=[on_write_edit]),
         HookMatcher(matcher="Edit", hooks=[on_write_edit]),
         HookMatcher(matcher=r"mcp__memory__.*", hooks=[on_memory_tool]),
+        HookMatcher(
+            matcher=r"mcp__scheduler__.*", hooks=[on_scheduler_tool]
+        ),
     ]

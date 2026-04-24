@@ -66,7 +66,10 @@ class _FakeBridge(ClaudeBridge):
         chat_id: int,
         user_text: str,
         history: list[dict[str, Any]],
+        *,
+        system_notes: list[str] | None = None,
     ) -> AsyncIterator[Any]:
+        del system_notes  # phase-5 signature; test ignores
         yield TextBlock(text="let me check the ping")
         yield ToolUseBlock(id="tu_1", name="Skill", input={"skill": "ping"})
         yield ToolResultBlock(

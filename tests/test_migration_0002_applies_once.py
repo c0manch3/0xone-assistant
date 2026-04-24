@@ -28,12 +28,19 @@ async def _columns(conn: aiosqlite.Connection, table: str) -> list[str]:
 
 
 async def test_happy_path_fresh_db(tmp_path: Path) -> None:
-    """Fresh DB → apply_schema bumps user_version straight from 0 to 2."""
+    """Fresh DB → apply_schema bumps user_version straight to SCHEMA_VERSION.
+
+    Phase 5 (2026-04-21): SCHEMA_VERSION is now 3 after the scheduler
+    migration (0003). The original phase-2 test asserted ``== 2`` to
+    guard the B1 "no stomp" invariant; we keep that intent alive by
+    asserting a monotonically-increasing version + that the phase-2
+    invariants still hold.
+    """
     db = tmp_path / "happy.db"
     conn = await connect(db)
     assert await _user_version(conn) == 0
     await apply_schema(conn)
-    assert await _user_version(conn) == SCHEMA_VERSION == 2
+    assert await _user_version(conn) == SCHEMA_VERSION >= 2
     assert await _table_exists(conn, "conversations")
     assert await _table_exists(conn, "turns")
     cols = await _columns(conn, "conversations")
@@ -42,7 +49,7 @@ async def test_happy_path_fresh_db(tmp_path: Path) -> None:
 
 
 async def test_re_run_is_noop(tmp_path: Path) -> None:
-    """Second apply_schema call on a v=2 DB is a no-op."""
+    """Second apply_schema call on a fully-migrated DB is a no-op."""
     db = tmp_path / "rerun.db"
     conn = await connect(db)
     await apply_schema(conn)
@@ -55,7 +62,7 @@ async def test_re_run_is_noop(tmp_path: Path) -> None:
     await conn.commit()
 
     await apply_schema(conn)
-    assert await _user_version(conn) == 2
+    assert await _user_version(conn) == SCHEMA_VERSION
 
     async with conn.execute("SELECT block_type FROM conversations WHERE turn_id='t1'") as cur:
         row = await cur.fetchone()
@@ -93,7 +100,7 @@ async def test_v1_to_v2_backfills_block_type_and_turns(tmp_path: Path) -> None:
     await conn.commit()
 
     await apply_schema(conn)
-    assert await _user_version(conn) == 2
+    assert await _user_version(conn) == SCHEMA_VERSION
 
     cols = await _columns(conn, "conversations")
     assert "block_type" in cols

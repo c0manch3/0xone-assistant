@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re as _re
 from typing import Any
 
@@ -136,14 +137,47 @@ class ClaudeHandler:
         self._settings = settings
         self._conv = conv
         self._bridge = bridge
+        # CR-1 (phase 5, NEW): serialise concurrent turns on the same
+        # chat_id. Without this, an owner turn and a scheduler-injected
+        # turn both targeting ``OWNER_CHAT_ID`` would interleave block
+        # writes into ``conversations`` and double-bill Claude for
+        # overlapping history reads.
+        #
+        # RQ0 confirmed absent in phase-4 source. Single-owner deployment
+        # bounds the dict to one entry; if multi-chat support is added
+        # later, switch to a ``weakref.WeakValueDictionary`` or TTL.
+        self._chat_locks: dict[int, asyncio.Lock] = {}
+        self._locks_mutex = asyncio.Lock()
+
+    async def _lock_for(self, chat_id: int) -> asyncio.Lock:
+        """Return the lock for ``chat_id``, allocating lazily on cold path.
+
+        Double-checked lookup so the hot path never acquires
+        ``_locks_mutex``.
+        """
+        lk = self._chat_locks.get(chat_id)
+        if lk is not None:
+            return lk
+        async with self._locks_mutex:
+            lk = self._chat_locks.get(chat_id)
+            if lk is None:
+                lk = asyncio.Lock()
+                self._chat_locks[chat_id] = lk
+        return lk
 
     async def handle(self, msg: IncomingMessage, emit: Emit) -> None:
+        lock = await self._lock_for(msg.chat_id)
+        async with lock:
+            await self._handle_locked(msg, emit)
+
+    async def _handle_locked(self, msg: IncomingMessage, emit: Emit) -> None:
         turn_id = await self._conv.start_turn(msg.chat_id)
         log.info(
             "turn_started",
             turn_id=turn_id,
             chat_id=msg.chat_id,
             message_id=msg.message_id,
+            origin=msg.origin,
         )
         # User row written with the ORIGINAL text (no system-note leak
         # into persisted history).
@@ -163,22 +197,46 @@ class ClaudeHandler:
         # URL we tell the model that the installer @tool is a reasonable
         # first call; otherwise the envelope is unchanged.
         urls = _detect_urls(msg.text)
-        if urls:
-            hint = (
-                "\n\n[system-note: the user's message contains URL(s) "
+        url_hint = (
+            (
+                "the user's message contains URL(s) "
                 f"{urls[:3]!r}. If one looks like a GitHub skill bundle, "
                 "consider calling `mcp__installer__skill_preview(url=...)` to "
                 "fetch a preview before asking the user to confirm install. "
-                "Otherwise treat the URL as reference content.]"
+                "Otherwise treat the URL as reference content."
             )
-            user_text_for_sdk = msg.text + hint
-        else:
-            user_text_for_sdk = msg.text
+            if urls
+            else None
+        )
+
+        # Phase 5: scheduler-origin turns get a directive note so the
+        # model answers proactively without waiting on the owner.
+        scheduler_note: str | None = None
+        if msg.origin == "scheduler":
+            trig_id = (msg.meta or {}).get("trigger_id")
+            scheduler_note = (
+                f"autonomous turn from scheduler id={trig_id}; "
+                "owner is not active right now; answer proactively and "
+                "concisely, do not ask clarifying questions"
+            )
+
+        notes: list[str] = []
+        if scheduler_note is not None:
+            notes.append(scheduler_note)
+        if url_hint is not None:
+            notes.append(url_hint)
+        system_notes: list[str] | None = notes or None
+        user_text_for_sdk = msg.text
 
         completed = False
         last_meta: dict[str, Any] | None = None
         try:
-            async for item in self._bridge.ask(msg.chat_id, user_text_for_sdk, history):
+            async for item in self._bridge.ask(
+                msg.chat_id,
+                user_text_for_sdk,
+                history,
+                system_notes=system_notes,
+            ):
                 role, payload, text_out, block_type = _classify_block(item)
                 if role == "result":
                     # Fix C (incident S13): accumulate last meta; complete
@@ -213,6 +271,17 @@ class ClaudeHandler:
                 )
         except ClaudeBridgeError as exc:
             log.warning("bridge_error", turn_id=turn_id, error=str(exc))
+            # Fix 3 / devil C1: on scheduler-origin turns we must
+            # propagate the error so the dispatcher can
+            # ``revert_to_pending`` and eventually dead-letter.
+            # Swallowing the error inline makes attempts=0 forever — the
+            # dead-letter threshold is unreachable for every Claude-API
+            # failure on the scheduler path. User-origin turns keep the
+            # legacy apology-chunk behaviour: the owner expects an
+            # inline error reply, not silence or a retry. The ``finally``
+            # block below interrupts the pending turn in either branch.
+            if msg.origin == "scheduler":
+                raise
             await emit(f"\n\n(ошибка: {exc})")
         finally:
             if not completed:

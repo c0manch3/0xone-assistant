@@ -70,6 +70,45 @@ class ClaudeSettings(BaseSettings):
     effort: str = "medium"
 
 
+class SchedulerSettings(BaseSettings):
+    """Scheduler knobs (``SCHEDULER_*`` env prefix).
+
+    All defaults chosen per plan §G.3. Notable:
+      - ``sent_revert_timeout_s`` MUST exceed ``claude.timeout`` — a
+        running handler that hasn't yet ack'd a trigger shouldn't be
+        declared "expired" and reverted by the CR2.1 sweep. The parent
+        ``Settings.__init__`` logs a warning if the invariant is
+        violated (see below).
+      - ``enabled=False`` disables the background loop + dispatcher
+        only; the ``@tool`` handlers stay accessible so the model can
+        inspect what was scheduled. Fires during the window are LOST
+        (devil M-5 — documented trade-off).
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="SCHEDULER_",
+        env_file=[_user_env_file(), Path(".env")],
+        extra="ignore",
+    )
+    enabled: bool = True
+    tick_interval_s: int = 15
+    tz_default: str = "UTC"
+    catchup_window_s: int = 3600
+    dead_attempts_threshold: int = 5
+    sent_revert_timeout_s: int = 360  # claude.timeout (300) + 60s margin
+    dispatcher_queue_size: int = 64
+    max_schedules: int = 64
+    missed_notify_cooldown_s: int = 86400
+    min_recap_threshold: int = 2
+    clean_exit_window_s: int = 120
+    # Fix 2 / CR-2: threshold in seconds for the orphan-reclaim filter
+    # (``reclaim_pending_not_queued``). Only queue-saturated rows whose
+    # ``scheduled_for`` is more than this many seconds behind wall-clock
+    # are eligible. Must be > ``tick_interval_s`` so a row does not
+    # oscillate between materialisation and reclaim inside one tick.
+    reclaim_older_than_s: int = 30
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=[_user_env_file(), Path(".env")],
@@ -87,12 +126,37 @@ class Settings(BaseSettings):
     data_dir: Path = Field(default_factory=_default_data_dir)
     claude: ClaudeSettings = Field(default_factory=ClaudeSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
+    scheduler: SchedulerSettings = Field(default_factory=SchedulerSettings)
 
     @field_validator("project_root", "data_dir", mode="after")
     @classmethod
     def _resolve_absolute(cls, v: Path) -> Path:
         """N2: resolve to absolute so downstream code never sees '.'-relative paths."""
         return v.expanduser().resolve()
+
+    def model_post_init(self, __context: object) -> None:
+        """Warn (not fail) if ``scheduler.sent_revert_timeout_s`` is
+        tight vs ``claude.timeout``.
+
+        Risk #13 (description §J): a too-low sent-revert timeout
+        reverts a still-running handler before it finishes, causing a
+        double-fire on the next tick. The margin is a SOFT requirement
+        — owner may deliberately reduce it for test runs — so we log
+        rather than refuse to boot.
+        """
+        if self.scheduler.sent_revert_timeout_s < self.claude.timeout:
+            import structlog
+
+            structlog.get_logger("config").warning(
+                "sent_revert_timeout_too_low",
+                sent_revert_timeout_s=self.scheduler.sent_revert_timeout_s,
+                claude_timeout=self.claude.timeout,
+                hint=(
+                    "SCHEDULER_SENT_REVERT_TIMEOUT_S < CLAUDE_TIMEOUT: "
+                    "an in-flight handler may be reverted prematurely, "
+                    "causing double-fires on the next tick."
+                ),
+            )
 
     @property
     def db_path(self) -> Path:

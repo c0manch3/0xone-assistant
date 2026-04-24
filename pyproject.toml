@@ -46,6 +46,11 @@ select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF", "ASYNC"]
 # inside strings (they exercise the ё-fold, Russian stemmer, etc.).
 "tests/test_memory_*.py" = ["RUF001", "RUF002", "RUF003"]
 "src/assistant/tools_sdk/_memory_core.py" = ["RUF001", "RUF002", "RUF003"]
+# Scheduler core carries a Cyrillic/Greek homoglyph map + test cases
+# that deliberately use the ambiguous characters.
+"src/assistant/tools_sdk/_scheduler_core.py" = ["RUF001", "RUF002", "RUF003"]
+"tests/test_scheduler_prompt_rejects_cyrillic_lookalike.py" = ["RUF001", "RUF002", "RUF003"]
+"tests/test_scheduler_prompt_rejects_system_note.py" = ["RUF001", "RUF002", "RUF003"]
 
 [tool.mypy]
 strict = true
