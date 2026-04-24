@@ -13,6 +13,12 @@ StandardOutput=journal
 StandardError=journal
 Environment=PATH=/home/0xone/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
+# Phase 5b owner smoke surfaced: installer's marketplace_list shells out
+# to ``gh api`` which requires auth (no anonymous fallback). Store a
+# fine-grained PAT in the referenced file (mode 0600) — see
+# deploy/systemd/README.md for the transfer recipe.
+EnvironmentFile=-%h/.config/0xone-assistant/secrets.env
+
 # Fix 14 / DevOps §4: cap graceful-stop at 30s. The scheduler writes a
 # ``.last_clean_exit`` marker at the top of ``Daemon.stop``; if systemd
 # SIGKILLs us before ``stop()`` finishes, the next boot may be

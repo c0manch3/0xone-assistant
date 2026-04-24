@@ -13,6 +13,19 @@ package upgrades and never needs root.
   `TELEGRAM_BOT_TOKEN` + `OWNER_CHAT_ID` (phase 1 invariant).
 - `claude` CLI installed + logged in as the same user (OAuth session
   lives under `~/.claude/`).
+- `gh` CLI installed + authenticated (for the installer's
+  `marketplace_list` tool). If `gh auth login` via SSH is awkward,
+  mirror the auth from a dev host via:
+  ```bash
+  # on dev host where gh is already logged in:
+  gh auth token | ssh <user>@<vps> \
+    "mkdir -p ~/.config/0xone-assistant && \
+     echo \"GH_TOKEN=\$(cat)\" > ~/.config/0xone-assistant/secrets.env && \
+     chmod 600 ~/.config/0xone-assistant/secrets.env"
+  ```
+  The unit picks up `GH_TOKEN` via `EnvironmentFile=-%h/.config/0xone-assistant/secrets.env`
+  (leading `-` makes it optional — missing file is fine for local dev
+  where `gh` is already logged in at the shell level).
 
 ## Install
 
