@@ -1,0 +1,26 @@
+[Unit]
+Description=0xone-assistant Telegram bot daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/0xone-assistant
+ExecStart=/home/0xone/.local/bin/uv run python -m assistant
+Restart=on-failure
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
+Environment=PATH=/home/0xone/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Fix 14 / DevOps §4: cap graceful-stop at 30s. The scheduler writes a
+# ``.last_clean_exit`` marker at the top of ``Daemon.stop``; if systemd
+# SIGKILLs us before ``stop()`` finishes, the next boot may be
+# mis-classified as ``suspend-or-crash`` (triggering an unwanted
+# catchup recap). Default ``TimeoutStopSec=90s`` is also survivable;
+# 30s is preferred on workstation + low-traffic VPS deploys where we
+# don't expect in-flight scheduler fires to exceed 30s.
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=default.target
