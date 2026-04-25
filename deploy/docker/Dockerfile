@@ -219,10 +219,11 @@ RUN uv sync --frozen --no-editable \
 
 USER bot
 ENTRYPOINT []
-# Wrap pytest in `sh -c '... ; exec /bin/true'` so that after pytest
-# returns 0, the shell IMMEDIATELY exec's /bin/true (replacing self).
-# Any background Python threads/tasks left dangling are abandoned —
-# the shell process is gone before they can keep PID 1 alive. Without
-# this, asyncio leftovers + slim-bookworm libc reaping quirks made
-# `docker run --rm` hang 60+ s past pytest exit (CI run 24927433979).
-CMD ["sh", "-c", "/opt/venv/bin/pytest -q tests/ && exec /bin/true"]
+ENV PYTEST_FORCE_EXIT=1
+# `PYTEST_FORCE_EXIT=1` triggers conftest's `pytest_sessionfinish` to
+# call `os._exit(rc)` skipping Python's atexit + thread-join phase.
+# Required because async fixtures (scheduler/dispatcher) leave child
+# subprocess PIDs that pin the interpreter during normal teardown,
+# making `docker run --rm` hang 36+ s past pytest's "514 passed"
+# announcement (CI runs 24927433979, 24927674841).
+CMD ["/opt/venv/bin/pytest", "-q", "tests/"]

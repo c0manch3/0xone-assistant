@@ -12,6 +12,19 @@ from pathlib import Path
 import pytest
 
 
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Force-exit at the end of the pytest session.
+
+    Phase 5d Docker test stage hung 36+ s past pytest's normal exit:
+    async subprocess fixtures (scheduler dispatcher, etc.) leave
+    non-reaped child PIDs that prevent the interpreter from exiting
+    cleanly. ``os._exit`` skips Python's atexit + thread-join
+    teardown — fine for CI where the container is destroyed anyway.
+    """
+    if os.environ.get("PYTEST_FORCE_EXIT") == "1":
+        os._exit(int(exitstatus))
+
+
 @pytest.fixture(autouse=True)
 def _reset_installer_ctx() -> Iterator[None]:
     """Reset the module-level ``configure_installer`` one-shot guard
