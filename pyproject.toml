@@ -20,6 +20,7 @@ dev = [
   "ruff>=0.8",
   "mypy>=1.13",
   "types-pyyaml>=6.0",
+  "pytest-timeout>=2.4.0",
 ]
 
 [build-system]
@@ -58,3 +59,8 @@ python_version = "3.12"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Phase 5d: hard 30s per-test timeout. Prevents network/event-loop hangs
+# from blocking CI (was hanging the Docker test stage forever). Tests
+# that legitimately need longer pass `@pytest.mark.timeout(N)`.
+timeout = 30
+timeout_method = "thread"

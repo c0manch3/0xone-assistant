@@ -176,6 +176,12 @@ RUN ln -sf /opt/venv/lib/python3.12/site-packages/claude_agent_sdk/_bundled/clau
 # (manylinux_2_17 floor; bookworm ships glibc 2.36 — well above).
 RUN /usr/local/bin/claude --version
 
+# COPY the shipped skills + claude-agent-sdk skill assets. The daemon
+# reads `skills/` at startup (phase-2 skill plumbing) and several
+# tests assert SKILL.md presence at /app/skills/ping/SKILL.md.
+COPY skills/ /app/skills/
+RUN chown -R 1000:1000 /app/skills
+
 USER bot
 WORKDIR /app
 
