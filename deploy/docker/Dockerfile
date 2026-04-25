@@ -38,6 +38,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gnupg \
         git \
         sudo \
+        passwd \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user matching VPS uid/gid (RQ7 verified: VPS user `0xone`
