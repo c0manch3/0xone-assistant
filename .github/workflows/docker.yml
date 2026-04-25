@@ -114,7 +114,7 @@ jobs:
     env:
       # Resolved via job outputs (controlled, not user-supplied) but
       # routed through env for explicit shell quoting (defense in depth).
-      IMAGE_REF: ${{ env.IMAGE }}@${{ needs.build-and-push.outputs.digest }}
+      IMAGE_REF: ghcr.io/c0manch3/0xone-assistant@${{ needs.build-and-push.outputs.digest }}
     steps:
       - uses: docker/login-action@v3
         with:
@@ -160,7 +160,7 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     env:
-      IMAGE_REF: ${{ env.IMAGE }}@${{ needs.build-and-push.outputs.digest }}
+      IMAGE_REF: ghcr.io/c0manch3/0xone-assistant@${{ needs.build-and-push.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/login-action@v3
