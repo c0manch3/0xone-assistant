@@ -149,10 +149,27 @@ running against the same `data_dir`. Find it via:
 
 ```bash
 cat ~/.local/share/0xone-assistant/.daemon.pid    # prints the holder pid
-ps -p $(cat ~/.local/share/0xone-assistant/.daemon.pid)
+ps -p $(cat ~/.local/share/0xone-assistant/.daemon.pid)   # systemd-era / native run
 ```
 
 Stop that one before starting a new instance.
+
+**Docker-era log tailing (phase 5d+):** the bot now runs as a
+container; `.daemon.pid` is the container-namespace pid (typically
+7 because tini is pid 1). Reading it on the host is meaningless.
+Use compose tooling instead:
+
+```bash
+cd /opt/0xone-assistant/deploy/docker
+docker compose logs -f 0xone-assistant | jq -R 'fromjson?'
+docker compose ps
+docker compose top
+```
+
+The structlog JSON events that previously went to journald now flow
+through `docker compose logs`. For systemd-fallback hosts (the unit
+in `deploy/systemd/` is retained), the `journalctl --user -u
+0xone-assistant -f` recipe still applies.
 
 ## 9. Known limitations
 

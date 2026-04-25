@@ -1,0 +1,194 @@
+name: docker
+
+# Triggers:
+#   - push to main           -> latest + sha-<short>
+#   - tag push v* / phase*   -> :<ref> (+ latest if from main)
+#   - PR against main        -> build only (no push)
+#
+# Single platform: linux/amd64 (arm64 deferred to phase 9 — RQ3:
+# no PyStemmer arm64 wheel; RQ5: qemu compile too slow).
+on:
+  push:
+    branches: [main]
+    tags:
+      - "v*"
+      - "phase*"
+  pull_request:
+    branches: [main]
+
+# H4: enumerate every needed scope explicitly. Defaults are read-only.
+permissions:
+  contents: read
+  packages: write   # GHCR push.
+  actions: write    # buildx GHA cache write (type=gha).
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/c0manch3/0xone-assistant
+
+jobs:
+  test:
+    # Re-run pytest inside the test target. Same pyproject.toml +
+    # uv.lock as runtime, plus dev deps. Catches container-runtime
+    # regressions that native pytest misses (e.g., a bundled binary
+    # path bug on Linux that's masked on Mac).
+    #
+    # Listed first + gates `build-and-push` (needs: [test]) so a failed
+    # test never lands an image in GHCR (spec §H).
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build test target
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: test
+          platforms: linux/amd64
+          load: true
+          tags: 0xone-test:ci
+          cache-from: |
+            type=gha,scope=${{ github.ref_name }}-amd64
+            type=gha,scope=main-amd64
+      - name: Run pytest
+        run: docker run --rm 0xone-test:ci
+
+  build-and-push:
+    # Block image push on test failure (QA HIGH-2). The test job builds
+    # the test target which shares its earlier stages with runtime, so
+    # a `target: runtime` build failure also fails earlier in test.
+    needs: [test]
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: runtime
+          # amd64 only for phase 5d (RQ3: no PyStemmer arm64 wheel;
+          # RQ5: qemu compile too slow). arm64 reopens in phase 9.
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # H5: scope cache per branch + a shared `main-amd64` fallback
+          # so PR builds reuse main's layers without polluting them.
+          cache-from: |
+            type=gha,scope=${{ github.ref_name }}-amd64
+            type=gha,scope=main-amd64
+          cache-to: type=gha,mode=max,scope=${{ github.ref_name }}-amd64
+
+  smoke:
+    needs: build-and-push
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    env:
+      # Resolved via job outputs (controlled, not user-supplied) but
+      # routed through env for explicit shell quoting (defense in depth).
+      IMAGE_REF: ${{ env.IMAGE }}@${{ needs.build-and-push.outputs.digest }}
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Pull by digest — robust against tag-format drift in
+      # docker/metadata-action's `version` output (W2-H2 Option B).
+      - name: Pull image by digest
+        run: docker pull "$IMAGE_REF"
+
+      # Imports-only smoke. Real preflight would 401 against the
+      # Anthropic API with a fake CI OAuth token (wave-1 C3) — instead
+      # we verify the venv is usable + the assistant package imports
+      # cleanly + key submodules load.
+      - name: Imports-only smoke
+        run: |
+          docker run --rm \
+            --entrypoint /opt/venv/bin/python \
+            "$IMAGE_REF" \
+            -c '
+          import assistant
+          from assistant import config
+          from assistant.tools_sdk import installer  # noqa: F401
+          from assistant.scheduler import store  # noqa: F401
+          print("imports_ok")
+          '
+
+      # Verify the RQ13 symlink resolves and the bundled claude ELF
+      # actually runs. Catches a future SDK release that drops the
+      # bundled binary (the symlink line in the Dockerfile would still
+      # build, but `claude --version` would fail at runtime).
+      - name: Bundled claude binary smoke
+        run: |
+          docker run --rm \
+            --entrypoint /usr/local/bin/claude \
+            "$IMAGE_REF" \
+            --version
+
+  scan:
+    needs: build-and-push
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    env:
+      IMAGE_REF: ${{ env.IMAGE }}@${{ needs.build-and-push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Trivy CVE scan. Fails on HIGH/CRITICAL OS pkgs (the runtime
+      # base image's apt surface) AND CRITICAL python pkgs (the venv).
+      # SARIF upload to GitHub Security tab is deferred to phase 9 to
+      # avoid declaring `security-events: write` permission today.
+      - name: Trivy vulnerability scan (OS pkgs HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE_REF }}
+          format: table
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          vuln-type: os
+
+      - name: Trivy vulnerability scan (language pkgs CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE_REF }}
+          format: table
+          exit-code: "1"
+          severity: CRITICAL
+          ignore-unfixed: true
+          vuln-type: library

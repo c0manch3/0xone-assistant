@@ -1,0 +1,62 @@
+# 0xone-assistant — build context exclusions. Phase 5d.
+#
+# The build context is the repo root (`docker build -f deploy/docker/Dockerfile .`).
+# Anything not on this list ships to the daemon. The runtime stages COPY
+# only `pyproject.toml`, `uv.lock`, and `src/` — but a fat context still
+# wastes bandwidth + slows BuildKit cache hashing.
+
+# VCS / virtualenv / Python build artifacts
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+*.egg-info
+build/
+dist/
+
+# Editor / OS
+.idea
+.vscode
+.DS_Store
+
+# Runtime data — must NEVER bake into image
+*.db
+*.db-wal
+*.db-shm
+*.log
+scheduler-audit.log
+memory-audit.log
+.last_clean_exit
+.daemon.pid
+.coverage
+htmlcov/
+
+# Local state dirs (host XDG mirrors). Bind-mounts replace these at runtime.
+.claude/
+.local/
+.config/
+
+# Secrets — defense in depth (.gitignore should already exclude these,
+# but a misconfigured local checkout could re-introduce them).
+.env
+.env.*
+secrets.env
+**/secrets.env
+**/.env
+
+# Plan / docs / scratch — large research artifacts; not needed in image.
+plan/
+docs/
+scratch/
+
+# Phase-irrelevant
+node_modules/
+
+# NOTE: tests/ intentionally NOT excluded. The Dockerfile's `test`
+# target does `COPY tests/ ./tests/` — without it in the build context,
+# the CI test job would either fail or silently produce an empty dir.
+# tests/ is not COPY'd by the runtime stage, so it does not bloat the
+# final image; only the test target re-uses it.

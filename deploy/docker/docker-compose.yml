@@ -1,0 +1,126 @@
+# 0xone-assistant — production compose file. Phase 5d.
+#
+# Compose v2 (>= 2.20). No `version:` key — deprecated in 2.x.
+#
+# Two services:
+#   - 0xone-assistant: the bot daemon. Bind-mounts host ~/.claude,
+#     ~/.local/share/0xone-assistant for OAuth + state. env_file
+#     supplies tokens. Healthcheck via pid+/proc/$$pid/exe readlink.
+#   - autoheal: willfarrell/autoheal sidecar. Compose's
+#     `restart: unless-stopped` does NOT restart on `unhealthy` — the
+#     sidecar fills that gap (W2-H3).
+
+services:
+  0xone-assistant:
+    # TAG MUST be set in deploy/docker/.env (e.g. TAG=phase5d-rc1 or
+    # TAG=sha-abc1234). The :? form fails compose loudly if unset
+    # (M5 — no `:-latest` footgun in production).
+    image: ghcr.io/c0manch3/0xone-assistant:${TAG:?set TAG in deploy/docker/.env, e.g. TAG=phase5d or TAG=sha-abc1234}
+    container_name: 0xone-assistant
+    restart: unless-stopped
+
+    # env_file object form (W2-C2). Compose v2.20+ supports per-entry
+    # `required: false`. Simple-list form errors fast on missing file
+    # — undesirable for the optional GH_TOKEN bag.
+    env_file:
+      - path: ${HOME}/.config/0xone-assistant/.env
+        required: true
+      - path: ${HOME}/.config/0xone-assistant/secrets.env
+        required: false
+
+    # Bind mounts — single source of truth for stateful data. No
+    # named/anonymous volumes; standard tools (rsync, sqlite3, tar)
+    # need direct file access for backup + phase-7 vault git ops.
+    volumes:
+      # Full ~/.claude tree (W2-C4 reversal of wave-1 C6). Selective
+      # mount of just .credentials.json breaks claude session/memory
+      # features. Phase 9 hardens with read_only/cap_drop instead.
+      - ${HOME}/.claude:/home/bot/.claude:rw
+      - ${HOME}/.local/share/0xone-assistant:/home/bot/.local/share/0xone-assistant:rw
+
+    # Match VPS user `0xone` (uid=1000 gid=1000, RQ7 verified).
+    user: "1000:1000"
+
+    # Phase 5b daemon writes .last_clean_exit at the top of stop();
+    # cap shutdown at 35s = systemd 30s + 5s margin so SIGKILL never
+    # pre-empts the marker write.
+    stop_grace_period: 35s
+
+    labels:
+      # Required for the autoheal sidecar to monitor this container.
+      - "autoheal=true"
+      # Autoheal default stop timeout is 10s — too short for the daemon's
+      # 35s shutdown path (`.last_clean_exit` marker write at top of
+      # stop()). Per willfarrell/autoheal docs, the per-container override
+      # is read from this label. Without it, an autoheal-driven restart
+      # would SIGKILL the daemon mid-shutdown (devil W3-C3).
+      - "autoheal.stop.timeout=35"
+
+    # Phase 6 will add ffmpeg + transcription deps that may OOM the
+    # 4 GB VPS without caps. Compose v2 standalone (no swarm) reads
+    # top-level `mem_limit` / `cpus`, NOT `deploy.resources.*`.
+    mem_limit: 1500m
+    cpus: 2.0
+
+    # 250 MB rotation ceiling per container (M4 — bumped from 30 MB).
+    # Comfortable for DEBUG-level structlog at single-user traffic.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+    # Healthcheck (W2-C3): pid-file freshness + /proc/<pid>/exe.
+    # The readlink step proves the pid resolves to a python process,
+    # eliminating both the pid-recycle false-positive (e.g., pid 7
+    # being the recycled tini wrapper) AND the empty-pid-file race
+    # (W2-M5: daemon mid-write between truncate and write).
+    #
+    # start_period: 60s covers worst-case claude preflight ping
+    # (45s timeout + 15s slack — RQ12 + spike Patch 4). Bump to 90s
+    # if owner observes flapping in production.
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >-
+          test -f /home/bot/.local/share/0xone-assistant/.daemon.pid &&
+          pid=$$(cat /home/bot/.local/share/0xone-assistant/.daemon.pid) &&
+          [ -n "$$pid" ] &&
+          [ -L /proc/$$pid/exe ] &&
+          readlink /proc/$$pid/exe | grep -q python
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+  # Watchdog sidecar — restarts containers reporting `unhealthy`.
+  # `restart: unless-stopped` on the bot container only restarts on
+  # process EXIT, not on unhealthy status. autoheal fills that gap
+  # using the bot's `autoheal=true` label.
+  autoheal:
+    # Pinned to last stable tag (devil W3-H1, devops top-2). `:latest`
+    # is supply-chain hostile and breaks reproducibility. TODO phase 9:
+    # repin to a fully-resolved sha256 digest after running
+    # `docker pull && docker inspect ... | jq -r '.[].RepoDigests[0]'`
+    # on the build host.
+    image: willfarrell/autoheal:1.2.0
+    container_name: 0xone-autoheal
+    restart: unless-stopped
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      AUTOHEAL_INTERVAL: "30"
+      AUTOHEAL_START_PERIOD: "60"
+    # Read-only socket: autoheal only needs to send `restart` commands.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    # Watchdog-of-watchdog: if autoheal zombies (stuck on docker.sock
+    # poll), the bot can stay unhealthy forever with nobody to restart
+    # it. pgrep on the autoheal.sh entrypoint catches that case; if
+    # absent, docker's `restart: unless-stopped` brings autoheal back.
+    # NOTE: if a future autoheal image strips pgrep, replace with a
+    # marker-file check or document this as known debt.
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f autoheal.sh > /dev/null || exit 1"]
+      interval: 60s
+      timeout: 5s
+      retries: 3

@@ -49,20 +49,49 @@ commented list.
 
 ---
 
-## 3. systemd unit additions (Linux / VPS)
+## 3. Process manager (Linux / VPS)
 
-Production unit lives at `deploy/systemd/0xone-assistant.service`
-(committed; install recipe in `deploy/systemd/README.md`). Key
-scheduler-sensitive settings:
+### Docker compose (phase 5d, primary)
+
+Production stack lives at `deploy/docker/docker-compose.yml`. Two
+services: `0xone-assistant` (the bot daemon, image
+`ghcr.io/c0manch3/0xone-assistant:<TAG>`) and `autoheal` (sidecar
+that restarts the bot on `unhealthy` status). Install/update/
+rollback recipes: `deploy/docker/README.md`. Key scheduler-sensitive
+settings:
+
+- `stop_grace_period: 35s` — Docker SIGTERM grace before SIGKILL.
+  Matches systemd `TimeoutStopSec=30s` + 5s docker margin so the
+  `.last_clean_exit` marker write completes.
+- `restart: unless-stopped` — daemon-exit recovery + host-reboot
+  recovery. Does NOT restart on `unhealthy`; the autoheal sidecar
+  watches the `autoheal=true` label for that.
+- Healthcheck: pid + `/proc/$pid/exe` readlink (W2-C3) — eliminates
+  pid-recycle false positives. `start_period: 60s` covers worst-case
+  claude preflight (45s + slack).
+
+Reload / restart recipe:
+
+```bash
+cd /opt/0xone-assistant/deploy/docker
+docker compose pull        # if TAG changed in .env
+docker compose up -d       # idempotent; recreates only on diff
+docker compose logs -f 0xone-assistant | jq -R 'fromjson?'
+```
+
+### systemd unit (phase 5a fallback, retained)
+
+The unit at `deploy/systemd/0xone-assistant.service` is kept disabled
+on the VPS as a documented fallback. Restore via
+`systemctl --user enable --now 0xone-assistant.service` after a
+`docker compose stop`. Key scheduler-sensitive settings:
 
 - `TimeoutStopSec=30s` — grants `Daemon.stop` a predictable shutdown
   window so the `.last_clean_exit` marker write completes before SIGKILL.
-  Default 90s is also survivable, but reducing to 30s keeps restarts
-  snappy on a workstation.
 - `Restart=on-failure` + `RestartSec=10s` — rolling backoff for a
   supervisor-exhausted daemon.
 
-Reload / restart recipe:
+Reload / restart recipe (systemd path):
 
 ```bash
 systemctl --user daemon-reload
@@ -93,10 +122,22 @@ live WAL-mode DB (briefly blocks writer; no torn pages).
 
 ### DB integrity check
 
+Docker compose path (phase 5d+ default):
+
+```bash
+cd /opt/0xone-assistant/deploy/docker
+docker compose stop 0xone-assistant
+sqlite3 ~/.local/share/0xone-assistant/assistant.db "PRAGMA integrity_check"
+# if "ok" → issue is elsewhere; if not, proceed to restore
+cp ~/Backups/0xone-db/assistant-$(date +%F).db ~/.local/share/0xone-assistant/assistant.db
+docker compose start 0xone-assistant
+```
+
+Systemd fallback path (if the unit was re-enabled):
+
 ```bash
 systemctl --user stop 0xone-assistant
 sqlite3 ~/.local/share/0xone-assistant/assistant.db "PRAGMA integrity_check"
-# if "ok" → issue is elsewhere; if not, proceed to restore
 cp ~/Backups/0xone-db/assistant-$(date +%F).db ~/.local/share/0xone-assistant/assistant.db
 systemctl --user start 0xone-assistant
 ```
@@ -112,20 +153,36 @@ sqlite3 assistant.db ".recover" | sqlite3 assistant-recovered.db
 
 If the state machine is wedged (e.g., every fire dead-letters):
 
-1. `systemctl --user stop 0xone-assistant`
+Docker compose path (phase 5d+ default):
+
+1. `cd /opt/0xone-assistant/deploy/docker && docker compose stop 0xone-assistant`
 2. Take a fresh snapshot (belt-and-braces).
 3. `sqlite3 assistant.db "UPDATE triggers SET status='pending', attempts=0 WHERE status IN ('sent','dead')"`
    — resets orphans without losing schedule config.
-4. `systemctl --user start 0xone-assistant`; tail journald and
+4. `docker compose start 0xone-assistant`; tail
+   `docker compose logs -f 0xone-assistant | jq -R 'fromjson?'` and
    `scheduler-audit.log` to verify the next tick processes cleanly.
+
+Systemd fallback path:
+
+1. `systemctl --user stop 0xone-assistant`
+2. Take a fresh snapshot.
+3. Same SQL UPDATE as above.
+4. `systemctl --user start 0xone-assistant`; tail journald.
 
 ---
 
 ## 5. Diagnostics ("why didn't X fire?")
 
-### journald structured query
+### Log structured query (Docker-era)
 
 ```bash
+# Docker compose path (phase 5d+ default).
+cd /opt/0xone-assistant/deploy/docker
+docker compose logs --since '1h' 0xone-assistant | jq -R 'fromjson?' \
+  | jq -c 'select(.event | startswith("scheduler_"))'
+
+# systemd fallback path (if the unit was re-enabled).
 journalctl --user -u 0xone-assistant -S '9:00' -U '9:30' --no-pager \
   | jq -c 'select(.event | startswith("scheduler_"))'
 ```
@@ -221,25 +278,44 @@ the model asked the scheduler to do and when.
    schedule_id=? AND scheduled_for LIKE '2026-04-21T09:%';`.
 5. If status='dead' or attempts>=5, inspect `last_error`. Dead-letter
    + owner Telegram notify should already have fired; verify adapter
-   isn't down (`systemctl --user status 0xone-assistant`).
+   isn't down. Docker: `docker compose ps` (Up + healthy expected).
+   Systemd fallback: `systemctl --user status 0xone-assistant`.
 
 ### "Scheduler completely silent after restart"
 
-1. `systemctl --user status 0xone-assistant` — is it running?
-2. `journalctl --user -u 0xone-assistant | grep bg_task_giving_up` —
-   supervisor exhausted? Expect a Telegram notify; absent = adapter
+Docker compose path (phase 5d+ default):
+
+1. `cd /opt/0xone-assistant/deploy/docker && docker compose ps` — Up?
+   Healthy? Restarting in a hot loop?
+2. `docker compose logs --since 10m 0xone-assistant | jq -R 'fromjson?' | grep bg_task_giving_up`
+   — supervisor exhausted? Expect a Telegram notify; absent = adapter
    also dead.
 3. `sqlite3 assistant.db "PRAGMA integrity_check"` — DB corrupt?
 4. Restore latest snapshot (see §4) if integrity fails.
 
+Systemd fallback path:
+
+1. `systemctl --user status 0xone-assistant` — is it running?
+2. `journalctl --user -u 0xone-assistant | grep bg_task_giving_up` —
+   supervisor exhausted?
+3. Same DB integrity check + restore steps as above.
+
 ### "Boot emitted a spurious catchup recap"
 
-1. Check marker classification: `journalctl --user -u 0xone-assistant
-   --since '1 min ago' | grep boot_classified`. If
-   `cls=suspend-or-crash` but you restarted cleanly, the marker write
-   was pre-empted.
-2. Verify `TimeoutStopSec=30s` is active: `systemctl --user show
-   0xone-assistant | grep TimeoutStopUSec`.
+1. Check marker classification:
+   - Docker: `docker compose logs --since '1 min ago' 0xone-assistant
+     | jq -R 'fromjson?' | grep boot_classified`.
+   - Systemd: `journalctl --user -u 0xone-assistant --since '1 min ago'
+     | grep boot_classified`.
+   If `cls=suspend-or-crash` but you restarted cleanly, the marker
+   write was pre-empted.
+2. Verify shutdown grace is active:
+   - Docker: `grep stop_grace_period
+     /opt/0xone-assistant/deploy/docker/docker-compose.yml` (must show
+     `35s`); also `cat /etc/docker/daemon.json` (host-reboot path —
+     `shutdown-timeout` >= 40, see Docker README).
+   - Systemd: `systemctl --user show 0xone-assistant | grep
+     TimeoutStopUSec` (must show `30s`).
 3. Check `.last_clean_exit` mtime vs wall clock on the PRIOR stop —
    was shutdown graceful?
 
@@ -257,8 +333,11 @@ the model asked the scheduler to do and when.
 
 - Log rotation for `scheduler-audit.log` (currently unbounded; ~10 MB/yr
   on owner-disclosed volume).
-- Systemd `OnFailure=` hook for daemon-level crashes where the
-  supervisor gave up (today: the owner must manually `status`).
+- Crash-notify hook for daemon-level failures where the supervisor
+  gave up. Docker (default): no equivalent today — owner must manually
+  `docker compose ps`. Systemd fallback: `OnFailure=` hook unwired.
 - `missed_notify_cooldown_s` wiring (crash-loop recap spam guard).
-- Hardening directives in the systemd unit (`NoNewPrivileges`,
-  `PrivateTmp`, `ProtectSystem=strict`) — orthogonal to phase 5b.
+- Container hardening (phase 9): `read_only: true`, `cap_drop: [ALL]`,
+  `no-new-privileges: true`, tmpfs for `/tmp`. Systemd unit equivalents
+  (`NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`) live in the
+  fallback unit at `deploy/systemd/`.

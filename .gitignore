@@ -2,6 +2,14 @@
 __pycache__/
 *.pyc
 .env
+.env.*
+# Whitelist .env.example template files — they MUST be tracked so new
+# checkouts can `cp .env.example .env`. The `.env.*` glob above would
+# otherwise match `.env.example` (verified via `git check-ignore -v`).
+!**/.env.example
+!.env.example
+secrets.env
+**/secrets.env
 data/
 *.db
 *.db-wal
@@ -11,6 +19,9 @@ data/
 .pytest_cache/
 dist/
 *.egg-info/
+
+# Phase 5d Docker compose owner-local override (TAG pin lives here).
+deploy/docker/.env
 
 # Phase 2: .claude/ is the per-project CLI dir. `skills` is a generated
 # symlink (bootstrap rewrites it on every start); settings files may be
