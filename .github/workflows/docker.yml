@@ -52,7 +52,12 @@ jobs:
             --tag 0xone-test:ci \
             .
       - name: Run pytest
-        run: docker run --rm 0xone-test:ci
+        # `docker run --rm` waits for full process tree to exit. Some
+        # async tests leave background tasks that don't reap cleanly
+        # in slim-bookworm (pytest exit 0, but `os.waitpid` hangs the
+        # parent). `--init` injects a zombie-reaper PID 1, and we cap
+        # via `timeout 90s` as a backstop.
+        run: timeout 90s docker run --rm --init 0xone-test:ci || (rc=$?; if [ $rc -eq 124 ]; then echo "test stage hung past pytest exit; treating as fail"; exit 1; fi; exit $rc)
 
   build-and-push:
     # Block image push on test failure (QA HIGH-2). The test job builds
