@@ -134,6 +134,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         git \
         tini \
+        passwd \
     && rm -rf /var/lib/apt/lists/*
 
 # Mirror non-root user from base stage.
