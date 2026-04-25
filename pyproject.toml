@@ -59,8 +59,8 @@ python_version = "3.12"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-# Phase 5d: hard 30s per-test timeout. Prevents network/event-loop hangs
-# from blocking CI (was hanging the Docker test stage forever). Tests
-# that legitimately need longer pass `@pytest.mark.timeout(N)`.
-timeout = 30
-timeout_method = "thread"
+# Phase 5d: pytest-timeout dep retained for ad-hoc per-test marks but
+# default global timeout REMOVED — empirically conflicts with
+# pytest-asyncio auto mode in Docker contexts (test job hung 19 min
+# while pytest itself printed nothing). Real hang fix was switching
+# from buildx to plain docker build (commit 5b33891).
