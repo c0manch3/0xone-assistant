@@ -219,4 +219,10 @@ RUN uv sync --frozen --no-editable \
 
 USER bot
 ENTRYPOINT []
-CMD ["/opt/venv/bin/pytest", "-q", "tests/"]
+# Wrap pytest in `sh -c '... ; exec /bin/true'` so that after pytest
+# returns 0, the shell IMMEDIATELY exec's /bin/true (replacing self).
+# Any background Python threads/tasks left dangling are abandoned —
+# the shell process is gone before they can keep PID 1 alive. Without
+# this, asyncio leftovers + slim-bookworm libc reaping quirks made
+# `docker run --rm` hang 60+ s past pytest exit (CI run 24927433979).
+CMD ["sh", "-c", "/opt/venv/bin/pytest -q tests/ && exec /bin/true"]
