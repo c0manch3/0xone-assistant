@@ -44,8 +44,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Non-root user matching VPS uid/gid (RQ7 verified: VPS user `0xone`
 # is uid=1000 gid=1000). Container `user: "1000:1000"` aligns bind-
 # mount writes 1:1 with host filesystem ownership.
-RUN groupadd --gid 1000 bot \
-    && useradd --uid 1000 --gid bot --create-home --shell /bin/bash bot
+RUN /usr/sbin/groupadd --gid 1000 bot \
+    && /usr/sbin/useradd --uid 1000 --gid bot --create-home --shell /bin/bash bot
 
 WORKDIR /app
 
@@ -137,9 +137,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         passwd \
     && rm -rf /var/lib/apt/lists/*
 
-# Mirror non-root user from base stage.
-RUN groupadd --gid 1000 bot \
-    && useradd --uid 1000 --gid bot --create-home --shell /bin/bash bot
+# Mirror non-root user from base stage. Use absolute paths because
+# slim-bookworm puts useradd/groupadd in /usr/sbin which is NOT on the
+# default $PATH for non-login shells (RUN uses sh -c without /usr/sbin).
+RUN /usr/sbin/groupadd --gid 1000 bot \
+    && /usr/sbin/useradd --uid 1000 --gid bot --create-home --shell /bin/bash bot
 
 # COPY gh from the ghcli stage. gh on slim-bookworm is dynamically
 # linked against libc + libcurl-gnutls + libexpat which already exist
