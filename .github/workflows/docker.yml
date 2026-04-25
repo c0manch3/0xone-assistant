@@ -36,21 +36,21 @@ jobs:
     # Listed first + gates `build-and-push` (needs: [test]) so a failed
     # test never lands an image in GHCR (spec §H).
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
+      # Phase 5d hotfix: use plain `docker build` (not buildx) — the
+      # buildx Post-step has a known hang when target=test + load=true
+      # without cache-to. We don't need GHA cache here; build-and-push
+      # job uses buildx and primes the cache. ~30-60s slower per run,
+      # zero hang risk.
       - name: Build test target
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: deploy/docker/Dockerfile
-          target: test
-          platforms: linux/amd64
-          load: true
-          tags: 0xone-test:ci
-          cache-from: |
-            type=gha,scope=${{ github.ref_name }}-amd64
-            type=gha,scope=main-amd64
+        run: |
+          docker build \
+            --file deploy/docker/Dockerfile \
+            --target test \
+            --tag 0xone-test:ci \
+            .
       - name: Run pytest
         run: docker run --rm 0xone-test:ci
 
