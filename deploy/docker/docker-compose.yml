@@ -28,6 +28,14 @@ services:
       - path: ${HOME}/.config/0xone-assistant/secrets.env
         required: false
 
+    # In the runtime container, the assistant package is installed
+    # non-editable into /opt/venv (read-only for uid 1000), so the
+    # default `parents[2]` resolution of project_root lands on
+    # /opt/venv/lib/python3.12 — read-only. Override to /app so
+    # ensure_skills_symlink() can mkdir /app/.claude/skills.
+    environment:
+      PROJECT_ROOT: /app
+
     # Bind mounts — single source of truth for stateful data. No
     # named/anonymous volumes; standard tools (rsync, sqlite3, tar)
     # need direct file access for backup + phase-7 vault git ops.
