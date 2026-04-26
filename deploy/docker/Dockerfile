@@ -180,7 +180,11 @@ RUN /usr/local/bin/claude --version
 # reads `skills/` at startup (phase-2 skill plumbing) and several
 # tests assert SKILL.md presence at /app/skills/ping/SKILL.md.
 COPY skills/ /app/skills/
-RUN chown -R 1000:1000 /app/skills
+# Make /app writable by the `bot` user so ensure_skills_symlink can
+# mkdir /app/.claude/skills at runtime (bootstrap path; PROJECT_ROOT=/app
+# in compose). Without this chown, /app is owned by root from the COPY
+# layer and uid 1000 cannot mkdir there.
+RUN chown -R 1000:1000 /app
 
 USER bot
 WORKDIR /app
