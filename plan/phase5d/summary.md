@@ -1,9 +1,37 @@
 ---
 phase: 5d
 title: Docker migration — reproducible image + bind-mounted state via GHCR
-date: 2026-04-25
-status: shipped (commit pending; CI build + GHCR push + owner smoke pending)
+date: 2026-04-25 (initial commits) / 2026-04-26 (cutover + hotfix train)
+status: shipped (CI green, image on GHCR private, VPS cutover GREEN, owner smoke ALL ACs PASS — ping/memory/installer/scheduler all live in container)
 ---
+
+# Cutover hotfix train (2026-04-26)
+
+Initial commit `a7cd79d` (2026-04-25) shipped the Dockerfile + compose + CI workflow but failed CI on first push. Below is the full hotfix sequence that ultimately produced a green CI + working VPS deploy. Documenting because each fix surfaced a real edge case worth memorising.
+
+| commit | issue | fix |
+|---|---|---|
+| `31735cb` | Workflow refused (0s fail). | `${{ env.IMAGE }}` not allowed inside `env:` — replace with literal `ghcr.io/c0manch3/0xone-assistant`. |
+| `8462ecb` | Build fail: `groupadd: not found`. | Add `passwd` package to base stage apt install. |
+| `b5dd592` | Same fail in runtime stage. | Runtime FROM `${PYTHON_BASE}` directly, not from base — needs own `passwd` install too. |
+| `7df1aef` | Still `groupadd: not found` after passwd installed. | Real cause: `/usr/sbin` not on default `sh -c` PATH; use absolute `/usr/sbin/groupadd` + `/usr/sbin/useradd`. |
+| `91f64f8` | pytest 21s GREEN (514 passed) but `docker run --rm` hung 19 min. | (a) `tests/` re-included in `.dockerignore` so test target's COPY works. (b) Added `pytest-timeout` (later removed — see below). |
+| `5b33891` | buildx Post-step hangs after pytest. | Switch test job from `docker/build-push-action@v6` to plain `docker build` (no Post step). |
+| `453b07b` | Same hang post-pytest. | Drop `timeout=30` global from pytest config — pytest-asyncio + thread timeout deadlock. |
+| `b979010` | Same hang. | Remove pytest-timeout dep entirely. |
+| `1fb15b0` | Hang persists 36s past pytest exit. | `docker run --init` + 90s wrapper timeout. |
+| `1833cd8` | Still hangs. | Wrap CMD in `sh -c '...&&exec /bin/true'` — doesn't help (interpreter pinned). |
+| `dafafb4` | **REAL FIX**. | `PYTEST_FORCE_EXIT=1` env + `pytest_sessionfinish` hook calling `os._exit(rc)` — bypasses Python interpreter teardown that hung on async background tasks. Test job 50s, build-and-push 21s, smoke 16s. |
+| `abaec9f` | Trivy scan job: `aquasecurity/trivy-action@0.28.0` doesn't exist. | Bump to `@0.35.0`. **CI ALL GREEN.** |
+| `6835251` | Owner reversed Q-R2: keep GHCR Private. | Update README with `docker login ghcr.io` recipe + classic PAT note. |
+| `10b9249` | Fine-grained PATs don't work for GHCR auth. | Document classic PAT requirement explicitly. |
+| `3549900` | Container crash on cutover: `PermissionError: '/opt/venv/lib/python3.12/.claude'`. | Override `PROJECT_ROOT=/app` in compose env. |
+| `e561346` | New error: `PermissionError: '/app/.claude'`. | `chown -R 1000:1000 /app` in Dockerfile (was only `/app/skills`). |
+| `0aa55e4` | Bot polls but crashes on first message: `FileNotFoundError: '/app/src/assistant/bridge/system_prompt.md'`. | COPY `src/` into runtime image alongside skills. |
+
+**Final state 2026-04-26 ~10:46 UTC:** owner Telegram smoke verified all phase 1-5b features work in container — ping, memory write/recall, installer marketplace_list (with private PAT auth), scheduler proactive fires every 2 min.
+
+# Phase 5d — Docker migration summary
 
 # Phase 5d — Docker migration summary
 
