@@ -44,12 +44,17 @@ GHCR creates new packages **PRIVATE** by default. We keep them private
 
 **One-shot setup on VPS (after first CI green):**
 
-1. Owner creates a fine-grained PAT in GitHub UI:
-   - https://github.com/settings/tokens?type=beta
-   - Repository access: `Only select repositories` -> `c0manch3/0xone-assistant`
-   - Permissions: **Account permissions -> Packages: Read** (only).
+1. Owner creates a **classic** PAT (fine-grained PATs do NOT reliably
+   support GHCR auth as of 2026 — GitHub's two PAT systems share the
+   `packages` namespace but only classic propagates to ghcr.io login):
+   - https://github.com/settings/tokens
+   - Click **Generate new token (classic)** in the dropdown.
+   - Note: `0xone-assistant-vps-pull`.
    - Expiration: 90 days or 1 year (re-run login after rotation).
-   - Copy the `github_pat_*` token immediately — it's shown once.
+   - Scopes: tick **only** `read:packages` under the
+     `write:packages` group (Download packages from GitHub Package
+     Registry). Everything else unchecked.
+   - Copy the `ghp_*` token immediately — it's shown once.
 
 2. SSH to VPS, log into GHCR (token via stdin — never on argv):
    ```bash
@@ -69,9 +74,12 @@ GHCR creates new packages **PRIVATE** by default. We keep them private
 token. `docker logout ghcr.io` first if you want to fully revoke
 (daemon doesn't restart; new pulls just need fresh auth).
 
-**Why fine-grained over classic PAT:** classic PATs grant `read:packages`
-across ALL of GitHub's package registry; fine-grained is repo-scoped.
-Private bot deserves repo-scoped read.
+**Note on PAT type:** GitHub has two PAT systems. Classic PATs work
+with `docker login ghcr.io`; fine-grained PATs have a `Packages`
+permission in their UI but it doesn't propagate to GHCR auth as of
+2026 (separate auth path under the hood). Stuck with classic PAT —
+the `read:packages` scope is global across the user's packages but
+that's fine for a single-user account that owns one container.
 
 ## Initial install (fresh VPS)
 
