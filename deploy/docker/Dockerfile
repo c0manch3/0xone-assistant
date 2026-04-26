@@ -180,6 +180,13 @@ RUN /usr/local/bin/claude --version
 # reads `skills/` at startup (phase-2 skill plumbing) and several
 # tests assert SKILL.md presence at /app/skills/ping/SKILL.md.
 COPY skills/ /app/skills/
+# Also COPY `src/` because `bridge.claude._render_system_prompt`
+# reads `<project_root>/src/assistant/bridge/system_prompt.md` (and
+# similar relative paths) — historical convention from pre-Docker
+# layout. Without src/, daemon crashes at first `bridge.ask`. The
+# venv site-packages copy is also installed (--no-editable) but the
+# code reads via project_root-relative path, not via importlib.
+COPY src/ /app/src/
 # Make /app writable by the `bot` user so ensure_skills_symlink can
 # mkdir /app/.claude/skills at runtime (bootstrap path; PROJECT_ROOT=/app
 # in compose). Without this chown, /app is owned by root from the COPY
