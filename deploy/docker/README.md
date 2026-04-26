@@ -32,25 +32,46 @@ State paths inside the container (all bind-mounted from host):
   for marketplace discovery) in `~/.config/0xone-assistant/secrets.env`.
 - Outbound HTTPS to `api.anthropic.com`, `api.telegram.org`, and
   `ghcr.io`. No inbound ports needed (Telegram long polling).
-- GHCR package visibility is **Public** (see "First-time GHCR
-  visibility flip" below).
+- GHCR package visibility is **Private** (single-user bot; image
+  contains personal-vault paths and skill manifests). VPS authenticates
+  pulls via `docker login ghcr.io` with a fine-grained PAT scoped to
+  `read:packages` only — see "First-time GHCR docker login" below.
 
-## First-time GHCR visibility flip
+## First-time GHCR docker login
 
-GHCR creates new packages **PRIVATE** by default. After the first CI
-push, the VPS's anonymous `docker compose pull` will fail with HTTP
-401. The owner must one-shot flip visibility via the GitHub UI:
+GHCR creates new packages **PRIVATE** by default. We keep them private
+(owner Q-R2 reversed 2026-04-26) — VPS authenticates pulls via PAT.
 
-1. Wait for the first CI run with a `docker.yml` workflow to push a
-   tag. Confirm via
-   `https://github.com/c0manch3?tab=packages` — package
-   `0xone-assistant` should appear.
-2. Browse to
-   `https://github.com/users/c0manch3/packages/container/0xone-assistant/settings`.
-3. Scroll to **Danger Zone** -> **Change package visibility**.
-4. Select **Public**, type the package name to confirm.
+**One-shot setup on VPS (after first CI green):**
 
-After this one-shot flip, all subsequent VPS pulls work anonymously.
+1. Owner creates a fine-grained PAT in GitHub UI:
+   - https://github.com/settings/tokens?type=beta
+   - Repository access: `Only select repositories` -> `c0manch3/0xone-assistant`
+   - Permissions: **Account permissions -> Packages: Read** (only).
+   - Expiration: 90 days or 1 year (re-run login after rotation).
+   - Copy the `github_pat_*` token immediately — it's shown once.
+
+2. SSH to VPS, log into GHCR (token via stdin — never on argv):
+   ```bash
+   ssh -i ~/.ssh/bot 0xone@193.233.87.118
+   read -rs GHCR_PAT          # paste token, press Enter (silent input)
+   echo "$GHCR_PAT" | docker login ghcr.io -u c0manch3 --password-stdin
+   unset GHCR_PAT             # clear from shell history/env
+   # Verify:
+   docker pull ghcr.io/c0manch3/0xone-assistant:phase5d
+   ```
+
+   Credentials are stored in `~/.docker/config.json` (mode 0o600,
+   default). All future `docker compose pull` reuse them — no re-login
+   per deploy.
+
+**Token rotation:** every PAT-expiry cycle, repeat step 2 with a new
+token. `docker logout ghcr.io` first if you want to fully revoke
+(daemon doesn't restart; new pulls just need fresh auth).
+
+**Why fine-grained over classic PAT:** classic PATs grant `read:packages`
+across ALL of GitHub's package registry; fine-grained is repo-scoped.
+Private bot deserves repo-scoped read.
 
 ## Initial install (fresh VPS)
 
@@ -285,7 +306,7 @@ beyond the current rw bind mount.
 
 | Symptom | Likely cause / fix |
 |---------|--------------------|
-| `compose pull` returns `unauthorized: authentication required` | GHCR visibility not flipped to Public. Owner: `https://github.com/users/c0manch3/packages/container/0xone-assistant/settings`. |
+| `compose pull` returns `unauthorized: authentication required` | GHCR PAT expired or never installed. SSH VPS, run the one-shot login from "First-time GHCR docker login" section above with a fresh fine-grained PAT scoped `read:packages`. |
 | Container stuck `starting` past 90s | Check `docker compose logs` for `auth_preflight_ok` event. Missing -> OAuth bind-mount wrong or token expired. |
 | `BlockingIOError` log spam right after `compose up` | systemd unit still active. `systemctl --user disable --now 0xone-assistant.service`, then `docker compose up -d`. |
 | `Permission denied` writing inside `~/.claude/` | Some subdir owned by root from prior `sudo claude`. `sudo chown -R 0xone:0xone ~/.claude`. |
@@ -299,8 +320,8 @@ beyond the current rw bind mount.
 
 See full 11-step playbook in `plan/phase5d/description.md §F`. TL;DR:
 
-1. CI image pushed; GHCR visibility flipped Public (one-shot UI).
-2. `docker pull` works on VPS (test before destructive steps).
+1. CI image pushed; VPS `docker login ghcr.io` with read:packages PAT (one-shot).
+2. `docker pull ghcr.io/c0manch3/0xone-assistant:<tag>` works on VPS (test before destructive steps).
 3. (Only if docker missing) install docker.
 4. Backup state to `~/.backup-<timestamp>`.
 5. `chown -R 0xone:0xone ~/.claude` (one-off, safe-wrapped).
