@@ -176,6 +176,11 @@ RUN ln -sf /opt/venv/lib/python3.12/site-packages/claude_agent_sdk/_bundled/clau
 # (manylinux_2_17 floor; bookworm ships glibc 2.36 — well above).
 RUN /usr/local/bin/claude --version
 
+# Phase 6b (F17): verify pillow-heif HEIF plugin registers in Pillow
+# at build time. Catches a future SDK / wheel drop that breaks Pillow
+# plugin registration BEFORE the owner sends the first photo.
+RUN /opt/venv/bin/python -c "import pillow_heif; pillow_heif.register_heif_opener(); from PIL import Image; assert '.heic' in Image.registered_extensions(), 'HEIF plugin missing'"
+
 # COPY the shipped skills + claude-agent-sdk skill assets. The daemon
 # reads `skills/` at startup (phase-2 skill plumbing) and several
 # tests assert SKILL.md presence at /app/skills/ping/SKILL.md.

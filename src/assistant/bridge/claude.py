@@ -218,6 +218,7 @@ class ClaudeBridge:
         history: list[dict[str, Any]],
         *,
         system_notes: list[str] | None = None,
+        image_blocks: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[Any]:
         """Stream blocks + the terminal ``ResultMessage`` for one turn.
 
@@ -237,8 +238,16 @@ class ClaudeBridge:
         (ClaudeHandler) wants the model to see alongside the user turn
         without persisting them into ``conversations``. We concatenate them
         as ``[system-note: ...]`` text blocks appended to ``user_text`` in
-        the live envelope — SDK streaming-input mode accepts a plain-string
-        ``content`` reliably, while the ``list[dict]`` form is unverified.
+        the live envelope.
+
+        Phase 6b: when ``image_blocks`` is non-None, the live envelope
+        switches to the streaming-input ``list[dict]`` content shape —
+        image blocks first (per Anthropic perf guidance "images come
+        before text"), followed by a single text block carrying
+        ``user_text`` + system-note suffix. The ``list[dict]`` form is
+        VERIFIED for image content via the RQ0 spike at
+        ``plan/phase6b/spikes/rq0_multimodal/probe.py`` (PASS
+        2026-04-27). Non-vision callers retain the plain-string path.
         """
         opts = self._build_options(system_prompt=self._render_system_prompt())
         if system_notes:
@@ -253,14 +262,25 @@ class ClaudeBridge:
             envelope_len=len(user_text_for_envelope),
             history_rows=len(history),
             system_notes=len(system_notes or []),
+            image_blocks=len(image_blocks or []),
         )
 
         async def prompt_stream() -> AsyncIterable[dict[str, Any]]:
             for envelope in history_to_sdk_envelopes(history, chat_id):
                 yield envelope
+            content: str | list[dict[str, Any]]
+            if image_blocks:
+                # Image blocks BEFORE text per Anthropic perf guidance;
+                # verified by RQ0 spike (PASS 2026-04-27).
+                content = [
+                    *image_blocks,
+                    {"type": "text", "text": user_text_for_envelope},
+                ]
+            else:
+                content = user_text_for_envelope
             yield {
                 "type": "user",
-                "message": {"role": "user", "content": user_text_for_envelope},
+                "message": {"role": "user", "content": content},
                 "parent_tool_use_id": None,
                 # R10: cosmetic — SDK assigns its own UUID.
                 "session_id": f"chat-{chat_id}",

@@ -19,6 +19,7 @@ from assistant.adapters.base import (
     IncomingMessage,
     MessengerAdapter,
 )
+from assistant.adapters.media_group import MediaGroupAggregator
 from assistant.config import Settings
 from assistant.logger import get_logger
 
@@ -40,12 +41,31 @@ TELEGRAM_DOC_MAX_BYTES = 20 * 1024 * 1024
 # Whitelisted attachment suffixes (lower-case, no leading dot). Anything
 # outside this set is rejected with a Russian "формат не поддерживается"
 # reply. Aligned with the ``AttachmentKind`` Literal in adapters/base.
-_SUFFIX_WHITELIST: frozenset[str] = frozenset({"pdf", "docx", "txt", "md", "xlsx"})
+#
+# Phase 6b: image suffixes added (``jpg/jpeg/png/webp/heic``). The
+# adapter does NOT pre-validate magic bytes — that lives in
+# ``assistant.files.vision`` and runs INSIDE the handler so a bad
+# magic surfaces as a ``VisionError`` and routes through the same
+# ``_handle_vision_failure`` quarantine path as a corrupt decode.
+_DOC_SUFFIX_WHITELIST: frozenset[str] = frozenset(
+    {"pdf", "docx", "txt", "md", "xlsx"}
+)
+_IMAGE_SUFFIX_WHITELIST: frozenset[str] = frozenset(
+    {"jpg", "jpeg", "png", "webp", "heic", "heif"}
+)
+_SUFFIX_WHITELIST: frozenset[str] = (
+    _DOC_SUFFIX_WHITELIST | _IMAGE_SUFFIX_WHITELIST
+)
 
 # Default caption when the owner sends a document with no caption
 # (devil L6 — applies to ALL whitelisted formats including TXT/MD for
 # UX consistency).
 _DEFAULT_FILE_CAPTION = "опиши содержимое файла"
+
+# Phase 6b: default caption for image-source uploads (photo or
+# image-as-document). Q4 v0 — applies to BOTH inline ``F.photo`` and
+# ``_on_document`` image kinds.
+_DEFAULT_PHOTO_CAPTION = "что на фото?"
 
 # Sanitisation cap on the original filename portion of the tmp path.
 # 64 chars is enough for a useful post-mortem in ``.failed/`` without
@@ -89,6 +109,18 @@ class TelegramAdapter(MessengerAdapter):
         self._handler: Handler | None = None
         self._polling_task: asyncio.Task[None] | None = None
 
+        # Phase 6b: media-group aggregator for ``F.photo`` albums. The
+        # aggregator's flush + overflow callbacks are bound to ``self``
+        # so they have access to ``_bot``, ``_handler``, etc. F4: an
+        # ``error_reply_cb`` is wired so flush-callback exceptions
+        # (bridge / scheduler errors) reach the owner as a sanitised
+        # Russian "internal error" reply rather than silent log-only.
+        self._media_group = MediaGroupAggregator(
+            flush_cb=self._flush_media_group,
+            overflow_cb=self._reply_media_group_overflow,
+            error_reply_cb=self._reply_media_group_error,
+        )
+
         # Router-level owner filter: messages from non-owners don't reach
         # any handler.
         self._dp.message.filter(F.chat.id == settings.owner_chat_id)
@@ -97,8 +129,19 @@ class TelegramAdapter(MessengerAdapter):
         # Phase 6a (RQ3 verified): text → document → catch-all. Inserting
         # ``F.document`` after the catch-all would silently route every
         # upload to the "медиа пока не поддерживаю" reply.
+        #
+        # Phase 6b: text → photo → animation → document & ~F.animation
+        # → catch-all. The dedicated ``F.animation`` handler emits the
+        # spec'd Russian "анимации не поддерживаю" reply (AC#5) BEFORE
+        # the document filter; without it, animations would land on the
+        # generic catch-all. The ``~F.animation`` guard on the document
+        # branch is retained so an animated GIF that bypasses the
+        # ``F.animation`` aiogram class (rare encoding) still routes
+        # away from the suffix whitelist.
         self._dp.message.register(self._on_text, F.text)
-        self._dp.message.register(self._on_document, F.document)
+        self._dp.message.register(self._on_photo, F.photo)
+        self._dp.message.register(self._on_animation, F.animation)
+        self._dp.message.register(self._on_document, F.document & ~F.animation)
         self._dp.message.register(self._on_non_text)
 
         self._dp.shutdown.register(self._on_shutdown)
@@ -119,6 +162,18 @@ class TelegramAdapter(MessengerAdapter):
             log.warning("text_received_without_handler")
             return
         assert message.text is not None  # guaranteed by F.text filter.
+
+        # Phase 6b (F6): pre-empt any pending photo media-group debounce
+        # timer for this chat — the photo turn flushes immediately and
+        # runs to completion BEFORE this text turn enters the per-chat
+        # lock. This preserves owner-visible order (photos answered
+        # before subsequent text), at the cost of text waiting
+        # ~ photo-turn duration. Without this, an owner who fires off a
+        # photo album then immediately types a follow-up question would
+        # have the text turn run while the photos are still in the
+        # debounce window — the model would answer the text without
+        # seeing the photos.
+        await self._media_group.flush_for_chat(message.chat.id)
 
         chunks: list[str] = []
 
@@ -187,11 +242,15 @@ class TelegramAdapter(MessengerAdapter):
             return
 
         # 2. Suffix whitelist (devil M1: file_name may be None).
+        # F14: list image kinds too — phase 6b expanded the whitelist
+        # to JPG/PNG/WEBP/HEIC/HEIF, so the prior reply was wrong on
+        # supported formats.
         file_name = doc.file_name or ""
         suffix = Path(file_name).suffix.lower().lstrip(".")
         if not suffix or suffix not in _SUFFIX_WHITELIST:
             await message.reply(
-                "формат не поддерживается; список: PDF, DOCX, TXT, MD, XLSX"
+                "формат не поддерживается; список: "
+                "PDF, DOCX, TXT, MD, XLSX, JPG, PNG, WEBP, HEIC"
             )
             return
 
@@ -276,10 +335,14 @@ class TelegramAdapter(MessengerAdapter):
                 tmp_path.unlink(missing_ok=True)
             return
 
-        # 4. Build IncomingMessage. Caption fallback: empty caption →
-        # default Russian prompt for ALL whitelisted formats including
-        # TXT/MD (devil L6).
-        caption = (message.caption or "").strip() or _DEFAULT_FILE_CAPTION
+        # 4. Build IncomingMessage. Caption fallback (devil L6 + Q4 v0):
+        # image kinds default to ``"что на фото?"``; document kinds
+        # default to ``"опиши содержимое файла"``.
+        is_image = suffix in _IMAGE_SUFFIX_WHITELIST
+        default_caption = (
+            _DEFAULT_PHOTO_CAPTION if is_image else _DEFAULT_FILE_CAPTION
+        )
+        caption = (message.caption or "").strip() or default_caption
         # Suffix is narrowed to AttachmentKind by the whitelist check
         # above; mypy can't infer Literal narrowing from frozenset
         # membership so we cast explicitly.
@@ -305,9 +368,291 @@ class TelegramAdapter(MessengerAdapter):
         for part in _split_for_telegram(full, limit=TELEGRAM_MSG_LIMIT):
             await self._bot.send_message(message.chat.id, part)
 
+    async def _on_photo(self, message: Message) -> None:
+        """Phase 6b: ``F.photo`` ingestion (Telegram inline preview).
+
+        Telegram delivers photo messages with a list of ``PhotoSize``
+        variants (different resolutions); we pick the largest by area.
+        ``message.media_group_id`` distinguishes single photos from
+        album sends — albums are aggregated by
+        :class:`MediaGroupAggregator`, single photos bypass aggregation
+        and fire the handler directly.
+
+        Validation order:
+
+        1. Pre-download size guard (largest variant ≤ 20 MB).
+        2. Filename synthesis: ``<uuid>__photo_<msg_id>.jpg``. The
+           Telegram inline preview is always JPEG-compressed by the
+           client, so suffix ``jpg`` is correct without a magic check.
+        3. ``bot.download(timeout=90)`` mirroring 6a's envelope.
+        4. Single photo → ``_dispatch_image_turn`` immediately.
+           Album photo → ``_media_group.add(...)`` for debounce.
+        """
+        if self._handler is None:
+            log.warning("photo_received_without_handler")
+            return
+
+        if not message.photo:  # pragma: no cover — F.photo guarantees set
+            return
+
+        # PhotoSize area selector (research.md RQ3 + extra notes D).
+        # Pure-area max beats ``message.photo[-1]``: Telegram's
+        # documented ordering is by ascending size, but bot-API
+        # versions have shipped reversed lists in the past.
+        photo = max(message.photo, key=lambda p: (p.width * p.height, p.file_size or 0))
+        photo_size = photo.file_size or 0
+        if photo_size > TELEGRAM_DOC_MAX_BYTES:
+            await message.reply(
+                "фото больше 20 МБ — это лимит Telegram bot API; пришли поменьше"
+            )
+            return
+
+        uploads_dir = self._settings.uploads_dir
+        try:
+            uploads_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log.error("uploads_mkdir_failed", path=str(uploads_dir), error=repr(exc))
+            await message.reply("не смог подготовить папку для файлов")
+            return
+
+        # Filename: <uuid4>__photo_<msg_id>.jpg. The msg_id shard helps
+        # post-mortem (matches the Telegram update sequence). We do NOT
+        # use ``photo.file_unique_id`` because it is ID-only metadata
+        # exposed in logs; uuid4 is sufficient + neutral.
+        tmp_name = f"{uuid4().hex}__photo_{message.message_id}.jpg"
+        tmp_path = uploads_dir / tmp_name
+
+        try:
+            await self._bot.download(photo, destination=tmp_path, timeout=90)
+        except TelegramBadRequest as exc:
+            log.warning(
+                "telegram_photo_download_failed",
+                path=str(tmp_path),
+                error=str(exc),
+            )
+            msg_lower = str(exc).lower()
+            if "too big" in msg_lower or "too large" in msg_lower:
+                await message.reply(
+                    "фото больше 20 МБ — это лимит Telegram bot API"
+                )
+            else:
+                await message.reply("не смог скачать фото — проверь логи")
+            with contextlib.suppress(OSError):
+                tmp_path.unlink(missing_ok=True)
+            return
+        except TimeoutError:
+            log.warning(
+                "telegram_photo_download_timeout",
+                path=str(tmp_path),
+                timeout_s=90,
+            )
+            await message.reply(
+                "Telegram не успел отдать фото за 90 секунд — попробуй ещё раз"
+            )
+            with contextlib.suppress(OSError):
+                tmp_path.unlink(missing_ok=True)
+            return
+        except Exception as exc:
+            log.exception(
+                "telegram_photo_unexpected_error",
+                path=str(tmp_path),
+                error_type=type(exc).__name__,
+            )
+            await message.reply("произошла внутренняя ошибка обработки фото")
+            with contextlib.suppress(OSError):
+                tmp_path.unlink(missing_ok=True)
+            return
+
+        caption = (message.caption or "").strip()
+
+        if message.media_group_id:
+            await self._media_group.add(
+                message.chat.id,
+                message.media_group_id,
+                tmp_path,
+                caption,
+                message.message_id,
+            )
+            return
+
+        # Single photo (no media_group) → direct dispatch with default
+        # Russian caption fallback.
+        await self._dispatch_image_turn(
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            paths=[tmp_path],
+            caption=caption or _DEFAULT_PHOTO_CAPTION,
+            original_filename=None,
+        )
+
+    async def _flush_media_group(
+        self,
+        chat_id: int,
+        group_id: str,
+        paths: list[Path],
+        caption: str,
+        first_message_id: int,
+    ) -> None:
+        """Aggregator flush callback — called per-bucket after debounce.
+
+        Synthesises one :class:`IncomingMessage` carrying every photo
+        path and dispatches the vision turn through the handler.
+        ``group_id`` is logged but not propagated downstream (single-
+        user model — no need to surface it to the SDK).
+
+        F13: ``first_message_id`` is the Telegram ``message_id`` of the
+        first photo to arrive in the bucket — propagated into
+        ``IncomingMessage.message_id`` so handler logs / DB rows can
+        correlate with the chat thread.
+        """
+        if self._handler is None:
+            log.warning("media_group_flush_without_handler")
+            for p in paths:
+                with contextlib.suppress(OSError):
+                    p.unlink(missing_ok=True)
+            return
+
+        log.info(
+            "media_group_flush",
+            chat_id=chat_id,
+            group_id=group_id,
+            photos=len(paths),
+            first_message_id=first_message_id,
+        )
+        # Use the first photo's message-id-derived synthetic name as
+        # the IncomingMessage.attachment_filename so handler logs +
+        # forensics are consistent with the single-photo path.
+        await self._dispatch_image_turn(
+            chat_id=chat_id,
+            message_id=first_message_id,
+            paths=paths,
+            caption=caption or _DEFAULT_PHOTO_CAPTION,
+            original_filename=None,
+        )
+
+    async def _reply_media_group_overflow(self, chat_id: int) -> None:
+        """One-shot Russian reply for a media_group that exceeded the
+        per-turn cap (5 photos).
+
+        ``message.reply`` is unavailable here (we don't have the
+        Message object), so we send a plain message to the chat. The
+        Telegram bot will send it asynchronously; the aggregator does
+        not wait for completion.
+        """
+        try:
+            await self._bot.send_message(
+                chat_id,
+                "пришлю в этот раз только первые 5 фото — лишние не уместились в одно окно",
+            )
+        except Exception as exc:  # surface in logs, never crash the aggregator
+            log.warning(
+                "media_group_overflow_reply_failed",
+                chat_id=chat_id,
+                error=repr(exc),
+            )
+
+    async def _reply_media_group_error(
+        self, chat_id: int, text: str
+    ) -> None:
+        """F4: Russian reply when the flush callback raises.
+
+        Invoked by :class:`MediaGroupAggregator` when ``_flush_cb``
+        raises (bridge error, scheduler exception, etc.). Without
+        this, the owner sees no Telegram reply for a failed photo
+        turn — only the structured log line surfaces.
+        """
+        try:
+            await self._bot.send_message(chat_id, text)
+        except Exception as exc:  # never crash the aggregator
+            log.warning(
+                "media_group_error_reply_failed",
+                chat_id=chat_id,
+                error=repr(exc),
+            )
+
+    async def _dispatch_image_turn(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        paths: list[Path],
+        caption: str,
+        original_filename: str | None,
+        kind: AttachmentKind = "jpg",
+    ) -> None:
+        """Common path for single-photo + media-group flush.
+
+        Builds an :class:`IncomingMessage` with the vision-style
+        attachment fields populated and runs it through the handler.
+        Reply is split + sent.
+
+        F12: ``original_filename`` carries the user-supplied filename
+        for image-as-document uploads (e.g. ``IMG_1234.heic``). For
+        ``F.photo`` inline + media-group paths, no original filename
+        exists — the synthetic ``<uuid>__photo_<msg_id>.jpg`` from
+        ``paths[0]`` is used.
+        """
+        if self._handler is None:
+            for p in paths:
+                with contextlib.suppress(OSError):
+                    p.unlink(missing_ok=True)
+            return
+
+        first_path = paths[0]
+        # IncomingMessage invariant: ``attachment`` reflects the first
+        # path even when ``attachment_paths`` carries the full list,
+        # so 6a-style guards on ``attachment`` still cover photo[0].
+        # F12: prefer the user-supplied original filename for the
+        # forensic marker so post-mortem rows show ``IMG_1234.heic``
+        # rather than the uuid-prefixed tmp synthetic.
+        attachment_filename = (
+            original_filename
+            if original_filename and len(paths) == 1
+            else first_path.name
+        )
+        incoming = IncomingMessage(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=caption,
+            attachment=first_path,
+            attachment_kind=kind,
+            attachment_filename=attachment_filename,
+            attachment_paths=list(paths) if len(paths) > 1 else None,
+        )
+
+        chunks: list[str] = []
+
+        async def emit(text: str) -> None:
+            chunks.append(text)
+
+        async with ChatActionSender.typing(bot=self._bot, chat_id=chat_id):
+            await self._handler.handle(incoming, emit)
+
+        full = "".join(chunks).strip() or "(пустой ответ)"
+        for part in _split_for_telegram(full, limit=TELEGRAM_MSG_LIMIT):
+            await self._bot.send_message(chat_id, part)
+
+    async def _on_animation(self, message: Message) -> None:
+        """Phase 6b (F2 / AC#5): dedicated handler for animated GIFs and
+        other ``F.animation`` updates.
+
+        Animations route here BEFORE ``_on_document`` so the spec'd
+        Russian "анимации не поддерживаю" reply lands instead of the
+        generic catch-all (which would otherwise advertise the wrong
+        capability).
+        """
+        log.info("animation_rejected")
+        await message.reply("анимации не поддерживаю — пришли картинку")
+
     async def _on_non_text(self, message: Message) -> None:
         log.info("non_text_rejected", content_type=message.content_type)
-        await message.answer("Медиа пока не поддерживаю — это будет в phase 6.")
+        # F2: prior copy claimed "это будет в phase 6" — phase 6 has
+        # shipped, so the stale message is replaced with a sanitised
+        # capability list. Keeps owner expectations aligned with the
+        # registered handlers.
+        await message.answer(
+            "этот тип медиа пока не поддерживаю — пришли текст, фото или файл"
+        )
 
     async def _on_shutdown(self) -> None:
         log.info("telegram_shutdown")
@@ -330,6 +675,11 @@ class TelegramAdapter(MessengerAdapter):
         )
 
     async def stop(self) -> None:
+        # Phase 6b: cancel pending media-group buckets first so the
+        # aggregator doesn't try to flush + dispatch a turn while the
+        # daemon tears down.
+        with contextlib.suppress(Exception):
+            await self._media_group.cancel_all()
         # If SIGTERM arrives before polling task enters Dispatcher's
         # internal ``_running_lock``, ``stop_polling()`` raises
         # RuntimeError ("Polling is not started"). Suppress — the task

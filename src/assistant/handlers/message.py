@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import re as _re
 import shutil
+from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import (
@@ -14,13 +15,19 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
-from assistant.adapters.base import Emit, IncomingMessage
+from assistant.adapters.base import IMAGE_KINDS, Emit, IncomingMessage
 from assistant.bridge.claude import ClaudeBridge, ClaudeBridgeError
 from assistant.config import Settings
 from assistant.files.extract import (
     EXTRACTORS,
     POST_EXTRACT_CHAR_CAP,
     ExtractionError,
+)
+from assistant.files.vision import (
+    VisionError,
+    build_image_content_block,
+    load_and_normalize,
+    validate_magic_bytes,
 )
 from assistant.logger import get_logger
 from assistant.state.conversations import ConversationStore
@@ -52,6 +59,35 @@ def _detect_urls(text: str) -> list[str]:
         if u:
             urls.append(u)
     return urls
+
+
+# Phase 6b: max chars of the assistant's first text reply that get
+# embedded into the persisted user-row marker as the ``seen:`` segment
+# (Q8 v1 — auto-summary).
+_VISION_SUMMARY_MAX_CHARS = 200
+
+
+def _build_vision_summary_segment(first_text_chunk: str | None) -> str:
+    """Trim the first 200 chars of the model's reply on a word boundary.
+
+    Returns the placeholder ``"(no response)"`` when the bridge produced
+    no text blocks (rare, but possible if the model only emitted
+    tool_use). Trimming at a word boundary + ``"…"`` avoids cutting
+    Cyrillic / multi-byte sequences mid-codepoint and keeps the marker
+    human-readable on post-mortem.
+    """
+    if not first_text_chunk:
+        return "(no response)"
+    cleaned = first_text_chunk.strip().replace("\n", " ")
+    if len(cleaned) <= _VISION_SUMMARY_MAX_CHARS:
+        return cleaned
+    truncated = cleaned[:_VISION_SUMMARY_MAX_CHARS]
+    last_space = truncated.rfind(" ")
+    # Only break at the last space if it's reasonably late in the
+    # window (avoids "X… …" being chopped to a single character).
+    if last_space > _VISION_SUMMARY_MAX_CHARS // 2:
+        truncated = truncated[:last_space]
+    return f"{truncated}…"
 
 
 # Phase 6a discriminator: PDF goes through the SDK Read tool's
@@ -208,11 +244,31 @@ class ClaudeHandler:
             message_id=msg.message_id,
             origin=msg.origin,
             has_attachment=msg.attachment is not None,
+            attachment_count=(
+                len(msg.attachment_paths) if msg.attachment_paths else 0
+            ),
         )
 
         # Phase 6a invariant: the three attachment fields move together.
-        # Either all three are populated (Telegram doc upload) or all
-        # three are None (text-only / scheduler-origin turn).
+        # Either all three are populated (Telegram doc/photo upload) or
+        # all three are None (text-only / scheduler-origin turn).
+        # Phase 6b: when ``attachment_paths`` is set, every path it
+        # carries must additionally pass the path-containment guard.
+        #
+        # F9 (fix-pack): document promised three multi-photo invariants
+        # — make them explicit asserts so any future
+        # ``IncomingMessage`` constructor that violates the contract
+        # fails fast rather than producing a silently-wrong DB row.
+        if msg.attachment_paths is not None:
+            assert len(msg.attachment_paths) > 0, (
+                "attachment_paths must be non-empty when set"
+            )
+            assert msg.attachment_paths[0] is msg.attachment, (
+                "attachment_paths[0] must be the same Path object as attachment"
+            )
+            assert msg.attachment_kind in IMAGE_KINDS, (
+                "attachment_paths is image-only; attachment_kind must be in IMAGE_KINDS"
+            )
         if msg.attachment is not None:
             assert msg.attachment_kind is not None, (
                 "attachment_kind must be set when attachment is set"
@@ -229,32 +285,46 @@ class ClaudeHandler:
             # controlled path) is caught here, before the file is read,
             # extracted, or handed to the SDK.
             uploads_root = self._settings.uploads_dir.resolve()
-            try:
-                tmp_resolved = msg.attachment.resolve()
-            except OSError as resolve_exc:
-                log.warning(
-                    "attachment_path_resolve_failed",
-                    path=str(msg.attachment),
-                    error=repr(resolve_exc),
-                )
-                await emit("(внутренняя ошибка: не удалось проверить путь файла)")
-                await self._conv.complete_turn(
-                    turn_id,
-                    meta={"stop_reason": "attachment_path_invalid", "usage": {}},
-                )
-                return
-            if not tmp_resolved.is_relative_to(uploads_root):
-                log.error(
-                    "attachment_path_escape_rejected",
-                    path=str(msg.attachment),
-                    uploads_root=str(uploads_root),
-                )
-                await emit("(внутренняя ошибка: путь файла вне uploads dir)")
-                await self._conv.complete_turn(
-                    turn_id,
-                    meta={"stop_reason": "attachment_path_invalid", "usage": {}},
-                )
-                return
+            paths_to_check: list[Path] = (
+                list(msg.attachment_paths)
+                if msg.attachment_paths
+                else [msg.attachment]
+            )
+            for path_to_check in paths_to_check:
+                try:
+                    tmp_resolved = path_to_check.resolve()
+                except OSError as resolve_exc:
+                    log.warning(
+                        "attachment_path_resolve_failed",
+                        path=str(path_to_check),
+                        error=repr(resolve_exc),
+                    )
+                    await emit(
+                        "(внутренняя ошибка: не удалось проверить путь файла)"
+                    )
+                    await self._conv.complete_turn(
+                        turn_id,
+                        meta={
+                            "stop_reason": "attachment_path_invalid",
+                            "usage": {},
+                        },
+                    )
+                    return
+                if not tmp_resolved.is_relative_to(uploads_root):
+                    log.error(
+                        "attachment_path_escape_rejected",
+                        path=str(path_to_check),
+                        uploads_root=str(uploads_root),
+                    )
+                    await emit("(внутренняя ошибка: путь файла вне uploads dir)")
+                    await self._conv.complete_turn(
+                        turn_id,
+                        meta={
+                            "stop_reason": "attachment_path_invalid",
+                            "usage": {},
+                        },
+                    )
+                    return
 
         # User row: ORIGINAL caption (no extracted bytes leak into
         # persisted history; long-term replay sees a small marker only).
@@ -263,31 +333,69 @@ class ClaudeHandler:
         # tmp file is gone after this turn — devil M3: the marker is
         # inert at SDK replay (model sees plain text in history; no Read
         # call attempted because the path is invalid).
-        persist_text = msg.text
-        if msg.attachment is not None:
-            persist_text = f"{msg.text}\n[file: {msg.attachment_filename}]"
-        await self._conv.append(
-            msg.chat_id,
-            turn_id,
-            "user",
-            [{"type": "text", "text": persist_text}],
-            block_type="text",
+        #
+        # Phase 6b: image attachments persist a richer marker — for the
+        # vision path we want the post-mortem row to recall what the
+        # model SAW (Q8 v1 "auto-summary"). The summary is filled in
+        # AFTER the first assistant TextBlock arrives, so for now we
+        # persist a placeholder and rewrite it once we have the summary.
+        kind = msg.attachment_kind
+        is_vision = (
+            msg.attachment is not None
+            and kind is not None
+            and kind in IMAGE_KINDS
         )
-        history = await self._conv.load_recent(msg.chat_id, self._settings.claude.history_limit)
+        attachment_image_paths: list[Path] = []
+        if is_vision:
+            attachment_image_paths = (
+                list(msg.attachment_paths)
+                if msg.attachment_paths
+                else ([msg.attachment] if msg.attachment is not None else [])
+            )
+
+        persist_text = msg.text
+        if msg.attachment is not None and not is_vision:
+            persist_text = f"{msg.text}\n[file: {msg.attachment_filename}]"
+        # For vision turns we defer the user-row append until AFTER the
+        # vision summary is captured, so the persisted marker carries
+        # the ``seen:`` segment. Other paths persist immediately.
+        if not is_vision:
+            await self._conv.append(
+                msg.chat_id,
+                turn_id,
+                "user",
+                [{"type": "text", "text": persist_text}],
+                block_type="text",
+            )
+        history = await self._conv.load_recent(
+            msg.chat_id, self._settings.claude.history_limit
+        )
         # The current turn is still 'pending' so load_recent's 'complete'
         # filter excludes it — we won't replay our own user row to the model.
 
-        # Phase 6a attachment branch:
-        # - PDF (Option C): system-note appended; model uses Read tool
-        #   directly. No pre-extract.
-        # - DOCX/XLSX/TXT/MD (Option B): pre-extract via assistant.files
-        #   .extract; injected into the SDK envelope. Failure → quarantine
-        #   + Russian reply, turn marked complete with synthetic meta.
+        # Phase 6a/6b attachment branch:
+        # - IMAGE (vision): magic check + load + resize + EXIF strip,
+        #   build content blocks, route through bridge.ask(image_blocks=).
+        #   Failure → quarantine via ``_handle_vision_failure``.
+        # - PDF (Option C): system-note appended; model uses Read tool.
+        # - DOCX/XLSX/TXT/MD (Option B): pre-extract; inject into envelope.
         user_text_for_sdk = msg.text
         attachment_notes: list[str] = []
         extraction_error: ExtractionError | None = None
-        if msg.attachment is not None:
-            kind = msg.attachment_kind
+        vision_error: VisionError | None = None
+        image_blocks: list[dict[str, Any]] | None = None
+        if is_vision:
+            assert kind is not None
+            try:
+                blocks: list[dict[str, Any]] = []
+                for image_path in attachment_image_paths:
+                    validate_magic_bytes(image_path, kind)
+                    jpeg_bytes = load_and_normalize(image_path)
+                    blocks.append(build_image_content_block(jpeg_bytes))
+                image_blocks = blocks
+            except VisionError as exc:
+                vision_error = exc
+        elif msg.attachment is not None:
             assert kind is not None
             if _is_pdf_native_read(kind):
                 # Option C: tell the model the file is on disk; the
@@ -375,14 +483,65 @@ class ClaudeHandler:
                         msg.attachment.unlink(missing_ok=True)
             return
 
+        # Phase 6b: vision pre-process failure short-circuits the
+        # bridge call symmetrically. Persist a forensics marker into
+        # the user row (no ``seen:`` segment — bridge never ran), then
+        # quarantine + Russian reply.
+        if vision_error is not None:
+            # F5: persist ONE marker line per attachment image — mirror
+            # the success-path so a media_group of N photos produces N
+            # marker lines on failure too. Prior single-line drift made
+            # the forensic record inconsistent across success/failure
+            # branches.
+            marker_lines = [
+                f"[photo: {p.name} | seen: (vision pre-process failed)]"
+                for p in attachment_image_paths
+            ]
+            joined_markers = "\n".join(marker_lines) if marker_lines else (
+                f"[photo: {msg.attachment_filename} "
+                "| seen: (vision pre-process failed)]"
+            )
+            await self._conv.append(
+                msg.chat_id,
+                turn_id,
+                "user",
+                [
+                    {
+                        "type": "text",
+                        "text": f"{msg.text}\n{joined_markers}",
+                    }
+                ],
+                block_type="text",
+            )
+            try:
+                await self._handle_vision_failure(
+                    msg,
+                    turn_id,
+                    vision_error,
+                    emit,
+                    image_paths=attachment_image_paths,
+                )
+            finally:
+                for image_path in attachment_image_paths:
+                    with contextlib.suppress(OSError):
+                        image_path.unlink(missing_ok=True)
+            return
+
         completed = False
         last_meta: dict[str, Any] | None = None
+        # Vision auto-summary capture: F11 — accumulate ALL assistant
+        # TextBlocks into a list and join with a space; the model often
+        # emits a brief preamble + substantive description, so capturing
+        # the first block alone yields the preamble. The trim-to-200
+        # word-boundary still applies (see ``_build_vision_summary_segment``).
+        text_chunks: list[str] = []
         try:
             async for item in self._bridge.ask(
                 msg.chat_id,
                 user_text_for_sdk,
                 history,
                 system_notes=system_notes,
+                image_blocks=image_blocks,
             ):
                 role, payload, text_out, block_type = _classify_block(item)
                 if role == "result":
@@ -406,7 +565,49 @@ class ClaudeHandler:
                     block_type=block_type,
                 )
                 if text_out:
+                    if is_vision:
+                        text_chunks.append(text_out)
                     await emit(text_out)
+            # Phase 6b: persist the user-row marker with the captured
+            # vision summary. Done BEFORE complete_turn so the row
+            # ordering is stable even if a later append races on the
+            # same turn.
+            if is_vision:
+                summary_segment = _build_vision_summary_segment(
+                    " ".join(text_chunks) if text_chunks else None
+                )
+                # F12: prefer the original Telegram filename for the
+                # single-image-as-document path so post-mortem rows show
+                # ``IMG_1234.heic`` rather than the uuid-prefixed tmp
+                # synthetic. Multi-photo (media_group / inline) keeps
+                # ``p.name`` because no original filename is available
+                # for synthesised paths.
+                if (
+                    len(attachment_image_paths) == 1
+                    and msg.attachment_filename
+                ):
+                    marker_lines = [
+                        f"[photo: {msg.attachment_filename} "
+                        f"| seen: {summary_segment}]"
+                    ]
+                else:
+                    marker_lines = [
+                        f"[photo: {p.name} | seen: {summary_segment}]"
+                        for p in attachment_image_paths
+                    ]
+                joined_markers = "\n".join(marker_lines)
+                await self._conv.append(
+                    msg.chat_id,
+                    turn_id,
+                    "user",
+                    [
+                        {
+                            "type": "text",
+                            "text": f"{msg.text}\n{joined_markers}",
+                        }
+                    ],
+                    block_type="text",
+                )
             # After async-for exits cleanly, mark complete once.
             if last_meta is not None:
                 await self._conv.complete_turn(turn_id, meta=last_meta)
@@ -418,6 +619,32 @@ class ClaudeHandler:
                 )
         except ClaudeBridgeError as exc:
             log.warning("bridge_error", turn_id=turn_id, error=str(exc))
+            # Phase 6b: persist deferred vision user-row even on bridge
+            # error — without this, the conversations table loses the
+            # forensic record of what the owner sent.
+            #
+            # F5: mirror the success path — one marker line per photo
+            # (media_groups) instead of a single line covering N photos.
+            if is_vision:
+                marker_lines_err = [
+                    f"[photo: {p.name} | seen: (bridge error)]"
+                    for p in attachment_image_paths
+                ]
+                joined_err = "\n".join(marker_lines_err) if marker_lines_err else (
+                    f"[photo: {msg.attachment_filename} | seen: (bridge error)]"
+                )
+                await self._conv.append(
+                    msg.chat_id,
+                    turn_id,
+                    "user",
+                    [
+                        {
+                            "type": "text",
+                            "text": f"{msg.text}\n{joined_err}",
+                        }
+                    ],
+                    block_type="text",
+                )
             # Fix 3 / devil C1: on scheduler-origin turns we must
             # propagate the error so the dispatcher can
             # ``revert_to_pending`` and eventually dead-letter.
@@ -434,17 +661,25 @@ class ClaudeHandler:
             if not completed:
                 await self._conv.interrupt_turn(turn_id)
                 log.warning("turn_interrupted", turn_id=turn_id)
-            # Phase 6a: tmp cleanup ALWAYS — bridge success, bridge
+            # Phase 6a/6b: tmp cleanup ALWAYS — bridge success, bridge
             # error, OR mid-stream cancellation. The ``contextlib
             # .suppress`` keeps a flaky unlink from masking a more
-            # interesting exception in the same finally.
-            if msg.attachment is not None:
+            # interesting exception in the same finally. For
+            # media_group photos every path in ``attachment_paths`` is
+            # cleaned; for single-attachment turns the legacy
+            # ``msg.attachment`` path is cleaned.
+            cleanup_paths: list[Path] = []
+            if msg.attachment_paths:
+                cleanup_paths.extend(msg.attachment_paths)
+            elif msg.attachment is not None:
+                cleanup_paths.append(msg.attachment)
+            for cleanup_path in cleanup_paths:
                 try:
-                    msg.attachment.unlink(missing_ok=True)
+                    cleanup_path.unlink(missing_ok=True)
                 except OSError as unlink_exc:
                     log.warning(
                         "attachment_unlink_failed",
-                        path=str(msg.attachment),
+                        path=str(cleanup_path),
                         error=repr(unlink_exc),
                     )
 
@@ -527,4 +762,85 @@ class ClaudeHandler:
         await self._conv.complete_turn(
             turn_id,
             meta={"stop_reason": "extraction_error", "usage": {}},
+        )
+
+    async def _handle_vision_failure(
+        self,
+        msg: IncomingMessage,
+        turn_id: str,
+        exc: VisionError,
+        emit: Emit,
+        *,
+        image_paths: list[Path],
+    ) -> None:
+        """Phase 6b symmetric counterpart to ``_handle_extraction_failure``.
+
+        Quarantine every image in ``image_paths`` to
+        ``<uploads_dir>/.failed/`` (per-path rename + copy2 fallback),
+        emit a sanitised Russian reply, mark the turn complete with a
+        synthetic ``stop_reason="vision_error"`` meta.
+
+        Reply variants:
+
+        * ``"magic mismatch …"`` reasons → "файл не похож на …"
+          (caller-friendly description of the suffix-vs-magic gap).
+        * ``"image too large"`` → "слишком большое изображение".
+        * Anything else (corrupt / decode failure) → generic
+          "не смог обработать изображение".
+        """
+        quarantine_dir = self._settings.uploads_dir / ".failed"
+        try:
+            quarantine_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as mkdir_exc:
+            log.warning(
+                "vision_quarantine_mkdir_failed",
+                turn_id=turn_id,
+                quarantine_dir=str(quarantine_dir),
+                error=repr(mkdir_exc),
+            )
+
+        for image_path in image_paths:
+            target = quarantine_dir / image_path.name
+            try:
+                image_path.rename(target)
+                log.info(
+                    "vision_failed_quarantined",
+                    turn_id=turn_id,
+                    path=str(target),
+                    reason=str(exc),
+                )
+            except OSError as rename_exc:
+                log.exception(
+                    "vision_quarantine_rename_failed",
+                    turn_id=turn_id,
+                    tmp_path=str(image_path),
+                    quarantine_target=str(target),
+                    error=str(rename_exc),
+                )
+                with contextlib.suppress(OSError):
+                    shutil.copy2(image_path, target)
+
+        # F3: format-specific Russian replies (spec AC#6 — ``"файл не
+        # похож на JPEG"`` for a declared-but-mismatched JPG, not the
+        # generic ``"не похож на изображение"``).
+        if exc.kind == "magic_mismatch" and exc.declared:
+            declared_label = exc.declared.upper()
+            # JPEG label both for ``jpg`` and ``jpeg`` aliases.
+            if exc.declared.lower() in {"jpg", "jpeg"}:
+                declared_label = "JPEG"
+            elif exc.declared.lower() in {"heic", "heif"}:
+                declared_label = "HEIC"
+            reply = (
+                f"расширение .{exc.declared}, но файл не похож на "
+                f"{declared_label} — проверь как сохраняешь"
+            )
+        elif exc.kind == "image_too_large":
+            reply = "слишком большое изображение — пришли меньше 25 мегапикселей"
+        else:
+            reply = "не смог обработать изображение"
+        await emit(reply)
+
+        await self._conv.complete_turn(
+            turn_id,
+            meta={"stop_reason": "vision_error", "usage": {}},
         )

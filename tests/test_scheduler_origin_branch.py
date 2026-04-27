@@ -30,6 +30,7 @@ class _RecordingBridge(ClaudeBridge):
         history: list[dict[str, Any]],
         *,
         system_notes: list[str] | None = None,
+        image_blocks: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[Any]:
         del chat_id, user_text, history
         self.last_notes = list(system_notes) if system_notes else None

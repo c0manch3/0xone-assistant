@@ -47,6 +47,7 @@ class _NoopBridge(ClaudeBridge):
         history: list[dict[str, Any]],
         *,
         system_notes: list[str] | None = None,
+        image_blocks: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[Any]:
         self.calls.append({"chat_id": chat_id})
         if False:  # pragma: no cover — generator type contract

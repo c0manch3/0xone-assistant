@@ -9,7 +9,25 @@ from typing import Any, Literal, Protocol
 # Phase 6a: whitelisted attachment kinds. Mirrors the suffix whitelist
 # enforced by the Telegram adapter; adding a new kind requires a matching
 # extractor in ``assistant.files.extract`` and adapter-side acceptance.
-AttachmentKind = Literal["pdf", "docx", "txt", "md", "xlsx"]
+#
+# Phase 6b: image kinds added (``jpg``/``jpeg``/``png``/``webp``/``heic``).
+# F10 fix-pack: ``heif`` alias added — Apple iOS sometimes writes the
+# ``.heif`` suffix instead of ``.heic`` while the underlying byte stream
+# is identical (HEIF is the format, HEIC is just one of its profile
+# brands).
+# Image kinds bypass ``EXTRACTORS`` and route through the new
+# ``assistant.files.vision`` pipeline (multimodal envelope) — they do
+# NOT have entries in the ``EXTRACTORS`` dispatch table.
+AttachmentKind = Literal[
+    "pdf", "docx", "txt", "md", "xlsx",
+    "jpg", "jpeg", "png", "webp", "heic", "heif",
+]
+
+# Phase 6b: image-only subset, used by the handler to branch into the
+# vision pipeline before the extract dispatch.
+IMAGE_KINDS: frozenset[str] = frozenset(
+    {"jpg", "jpeg", "png", "webp", "heic", "heif"}
+)
 
 # ---------------------------------------------------------------------------
 # Emit callback signature used by phase-2 ``ClaudeHandler``. The adapter
@@ -53,6 +71,19 @@ class IncomingMessage:
     attachment: Path | None = None
     attachment_kind: AttachmentKind | None = None
     attachment_filename: str | None = None
+    # Phase 6b: media-group multi-photo path. When the owner sends an
+    # album, the adapter aggregates 1..MAX_PHOTOS_PER_TURN paths in a
+    # single ``IncomingMessage``. The handler reads ``attachment_paths``
+    # if it is non-None (vision branch) and falls back to ``attachment``
+    # otherwise (single-photo or 6a document path).
+    #
+    # Invariant when ``attachment_paths`` is set: ``attachment`` points
+    # to ``attachment_paths[0]`` (so 6a-style guards on ``attachment``
+    # still cover the first path), ``attachment_kind`` ∈ ``IMAGE_KINDS``,
+    # and ``attachment_filename`` is the synthesised name of the first
+    # photo. Single-photo + non-image-document construction stays
+    # unchanged from 6a.
+    attachment_paths: list[Path] | None = None
 
 
 class MessengerAdapter(ABC):

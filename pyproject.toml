@@ -21,6 +21,14 @@ dependencies = [
   # depth (see ``files/extract.py``).
   "openpyxl>=3.1.5,<4",
   "pypdf>=5.0,<6",
+  # Phase 6b: image vision pipeline (JPEG/PNG/WEBP/HEIC).
+  # pillow-heif manylinux_2_28 wheels statically bundle libheif (no
+  # apt deps); >=1.3.0 is the floor that bundles libheif 1.21.2
+  # (CVE-2025-68431 patched). Pillow constraint follows pillow-heif's
+  # plugin API floor; <13 caps against an upcoming Pillow major break.
+  # See plan/phase6b/research.md RQ1 for the wheel-vs-apt analysis.
+  "Pillow>=10,<13",
+  "pillow-heif>=1.3.0,<2",
 ]
 
 [dependency-groups]
@@ -78,6 +86,16 @@ select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF", "ASYNC"]
 # real ``timeout`` kwarg signature (devil M-W2-6); using
 # ``asyncio.timeout`` would not match the contract under test.
 "tests/test_telegram_document_handler.py" = ["ASYNC240", "ASYNC109"]
+# Phase 6b telegram-photo + media-group tests follow the same fixture
+# convention as the 6a document-handler tests.
+"tests/test_telegram_photo_handler.py" = ["ASYNC240", "ASYNC109"]
+"tests/test_media_group_aggregator.py" = ["ASYNC240"]
+"tests/test_handler_image_branch.py" = ["ASYNC240"]
+# Phase 6b: media-group aggregator does best-effort sync ``Path.unlink``
+# on rejected overflow tmp files inside an async method — there is no
+# anyio path to swap in (the suppress block guards OSError), and the
+# I/O here is bounded to one stat+unlink per overflow photo.
+"src/assistant/adapters/media_group.py" = ["ASYNC240"]
 
 [tool.mypy]
 strict = true

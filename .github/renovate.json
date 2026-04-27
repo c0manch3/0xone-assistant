@@ -1,0 +1,20 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "schedule": ["before 4am on monday"],
+  "packageRules": [
+    {
+      "matchPackageNames": ["pillow-heif", "Pillow"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "automerge": true,
+      "platformAutomerge": true
+    },
+    {
+      "matchPackageNames": ["pillow-heif", "Pillow"],
+      "matchUpdateTypes": ["major"],
+      "automerge": false,
+      "labels": ["needs-review", "security-relevant"]
+    }
+  ],
+  "vulnerabilityAlerts": { "labels": ["security"], "automerge": true }
+}

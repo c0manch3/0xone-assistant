@@ -37,6 +37,7 @@ class _NoopBridge(ClaudeBridge):
         history: list[dict[str, Any]],
         *,
         system_notes: list[str] | None = None,
+        image_blocks: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[Any]:
         self.calls.append(
             {
@@ -120,6 +121,56 @@ async def test_attachment_outside_uploads_dir_is_rejected_before_extract(
     await store._conn.close()
 
 
+async def test_attachment_paths_with_one_outside_rejects_entire_turn(
+    tmp_path: Path,
+) -> None:
+    """F8: ``attachment_paths`` with [valid, valid, /etc/passwd] →
+    entire turn rejected (bridge not called, emit surfaces internal
+    error). Without per-path verification, an attacker that bypasses
+    the adapter's UUID-prefix synthesis and slips a single escape path
+    into a media_group bucket would route ``/etc/passwd`` into the
+    vision pipeline.
+    """
+    store = await _make_store(tmp_path)
+    settings = _settings(tmp_path)
+    bridge = _NoopBridge(settings)
+    handler = ClaudeHandler(settings, store, bridge)
+
+    # First two paths are well-formed (inside uploads_dir); third
+    # escapes. The handler must reject the entire turn.
+    uploads = settings.uploads_dir
+    uploads.mkdir(parents=True, exist_ok=True)
+    p1 = uploads / "uuid1__a.jpg"
+    p1.write_bytes(b"\xff\xd8\xff\xe0placeholder")
+    p2 = uploads / "uuid2__b.jpg"
+    p2.write_bytes(b"\xff\xd8\xff\xe0placeholder")
+    escape = Path("/etc/passwd")
+
+    emitted, emit = _make_emit()
+    msg = IncomingMessage(
+        chat_id=42,
+        message_id=42,
+        text="что общего?",
+        attachment=p1,
+        attachment_kind="jpg",
+        attachment_filename=p1.name,
+        attachment_paths=[p1, p2, escape],
+    )
+    await handler.handle(msg, emit)
+
+    # Bridge NEVER called — entire turn rejected.
+    assert bridge.calls == []
+    assert any("внутренняя ошибка" in e for e in emitted)
+    # Turn marked complete (so cleanup_orphan_pending_turns does not
+    # see it lingering).
+    async with store._conn.execute(
+        "SELECT status FROM turns WHERE chat_id=42"
+    ) as cur:
+        rows = await cur.fetchall()
+    assert rows[0][0] == "complete"
+    await store._conn.close()
+
+
 async def test_attachment_inside_uploads_dir_passes_guard(tmp_path: Path) -> None:
     """Sanity: a real attachment inside ``uploads_dir`` is NOT rejected
     by the new guard. Without this assertion the test above could pass
@@ -140,6 +191,7 @@ async def test_attachment_inside_uploads_dir_passes_guard(tmp_path: Path) -> Non
             history: list[dict[str, Any]],
             *,
             system_notes: list[str] | None = None,
+        image_blocks: list[dict[str, Any]] | None = None,
         ) -> AsyncIterator[Any]:
             self.calls += 1
             for item in self._script:

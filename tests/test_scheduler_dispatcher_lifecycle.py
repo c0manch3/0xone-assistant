@@ -43,6 +43,7 @@ class _OKBridge(ClaudeBridge):
         history: list[dict[str, Any]],
         *,
         system_notes: list[str] | None = None,
+        image_blocks: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[Any]:
         del chat_id, user_text, history, system_notes
         yield TextBlock(text="ok")
@@ -66,6 +67,7 @@ class _BrokenBridge(ClaudeBridge):
         history: list[dict[str, Any]],
         *,
         system_notes: list[str] | None = None,
+        image_blocks: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[Any]:
         del chat_id, user_text, history, system_notes
         raise RuntimeError("simulated bridge failure")

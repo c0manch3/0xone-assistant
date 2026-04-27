@@ -45,6 +45,7 @@ class _FakeBridge(ClaudeBridge):
         history: list[dict[str, Any]],
         *,
         system_notes: list[str] | None = None,
+        image_blocks: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[Any]:
         del system_notes  # phase 5: accepted but not asserted here
         if isinstance(self._script, Exception):
@@ -201,6 +202,7 @@ async def test_handler_interrupt_during_stream(tmp_path: Path) -> None:
             history: list[dict[str, Any]],
             *,
             system_notes: list[str] | None = None,
+            image_blocks: list[dict[str, Any]] | None = None,
         ) -> AsyncIterator[Any]:
             del system_notes
             yield partial

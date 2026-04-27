@@ -51,6 +51,7 @@ class _EchoBridge(ClaudeBridge):
         history: list[dict[str, Any]],
         *,
         system_notes: list[str] | None = None,
+        image_blocks: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[Any]:
         del chat_id, history, system_notes
         self.captured_text = user_text
