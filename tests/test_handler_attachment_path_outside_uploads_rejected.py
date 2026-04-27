@@ -163,10 +163,13 @@ async def test_attachment_inside_uploads_dir_passes_guard(tmp_path: Path) -> Non
 
     # Drop a real file inside the configured uploads_dir
     # (Mac-dev fallback resolves to ``<data_dir>/uploads`` per fix 1).
+    # Use TXT not PDF: phase-6a flip routes PDFs through pypdf which
+    # would reject a "%PDF-stub" payload before the path-guard runs;
+    # TXT exercises the same path-escape guard without format risk.
     uploads = settings.uploads_dir
     uploads.mkdir(parents=True, exist_ok=True)
-    tmp_file = uploads / "uuid__sample.pdf"
-    tmp_file.write_bytes(b"%PDF-stub")
+    tmp_file = uploads / "uuid__sample.txt"
+    tmp_file.write_text("hello from a real upload", encoding="utf-8")
 
     emitted, emit = _make_emit()
     msg = IncomingMessage(
@@ -174,8 +177,8 @@ async def test_attachment_inside_uploads_dir_passes_guard(tmp_path: Path) -> Non
         message_id=2,
         text="describe",
         attachment=tmp_file,
-        attachment_kind="pdf",
-        attachment_filename="sample.pdf",
+        attachment_kind="txt",
+        attachment_filename="sample.txt",
     )
     await handler.handle(msg, emit)
 

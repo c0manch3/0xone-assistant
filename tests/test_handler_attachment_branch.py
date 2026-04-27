@@ -127,12 +127,25 @@ def _make_attachment(tmp_path: Path, name: str, content: bytes = b"x") -> Path:
 # ----------------------------------------------------------------------
 
 
-async def test_pdf_option_c_appends_system_note_and_unlinks(tmp_path: Path) -> None:
-    """PDF kind: extractor NOT invoked; system-note tells the model to
-    use the Read tool. Tmp file is unlinked in ``finally`` after the
-    bridge call completes successfully.
+async def test_pdf_option_c_appends_system_note_and_unlinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PDF kind under Option C (forced via monkeypatch): extractor NOT
+    invoked; system-note tells the model to use the Read tool. Tmp file
+    is unlinked in ``finally`` after the bridge call completes.
+
+    NOTE: phase-6a live probe (2026-04-27) showed claude-opus-4-7
+    ignores the system-note and goes to Bash; ``_is_pdf_native_read``
+    flipped to ``return False`` globally. This test still exercises
+    Option C semantics by monkeypatching back to True — that path is
+    retained as a future re-enable knob.
     """
     from claude_agent_sdk import TextBlock
+
+    monkeypatch.setattr(
+        "assistant.handlers.message._is_pdf_native_read",
+        lambda kind: kind == "pdf",
+    )
 
     store = await _make_store(tmp_path)
     settings = _settings(tmp_path)
@@ -156,7 +169,7 @@ async def test_pdf_option_c_appends_system_note_and_unlinks(tmp_path: Path) -> N
     assert emitted == ["ok"]
     assert len(bridge.calls) == 1
     call = bridge.calls[0]
-    # No pre-extract for PDFs.
+    # No pre-extract for PDFs (under Option C).
     assert call["user_text"] == "describe"
     notes = call["system_notes"] or []
     pdf_notes = [n for n in notes if "Read(file_path=" in n]
@@ -168,8 +181,19 @@ async def test_pdf_option_c_appends_system_note_and_unlinks(tmp_path: Path) -> N
     await store._conn.close()
 
 
-async def test_pdf_option_c_unlinks_on_bridge_error(tmp_path: Path) -> None:
-    """Bridge raises → tmp file STILL unlinked (finally clause)."""
+async def test_pdf_option_c_unlinks_on_bridge_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bridge raises → tmp file STILL unlinked (finally clause).
+
+    Forces Option C via monkeypatch (production default is now Option B
+    after the 2026-04-27 live-probe finding).
+    """
+    monkeypatch.setattr(
+        "assistant.handlers.message._is_pdf_native_read",
+        lambda kind: kind == "pdf",
+    )
+
     store = await _make_store(tmp_path)
     settings = _settings(tmp_path)
     bridge = _CapturingBridge(settings, ClaudeBridgeError("timeout"))
@@ -188,6 +212,54 @@ async def test_pdf_option_c_unlinks_on_bridge_error(tmp_path: Path) -> None:
     await handler.handle(msg, emit)
 
     assert any("ошибка" in e for e in emitted)
+    assert not tmp_file.exists()
+    await store._conn.close()
+
+
+async def test_pdf_option_b_default_pre_extracts_via_pypdf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Phase-6a regression: default `_is_pdf_native_read` returns False
+    so PDFs go through `EXTRACTORS["pdf"]` (pypdf, Option B uniform).
+    """
+    from claude_agent_sdk import TextBlock
+
+    monkeypatch.setitem(
+        __import__("assistant.handlers.message", fromlist=["EXTRACTORS"]).EXTRACTORS,
+        "pdf",
+        lambda p: ("EXTRACTED-PDF-TEXT", 18),
+    )
+
+    store = await _make_store(tmp_path)
+    settings = _settings(tmp_path)
+    bridge = _CapturingBridge(
+        settings, [TextBlock(text="ok"), _result_message()]
+    )
+    handler = ClaudeHandler(settings, store, bridge)
+
+    tmp_file = _make_attachment(tmp_path, "abc__sample.pdf")
+    emitted, emit = _make_emit()
+    msg = IncomingMessage(
+        chat_id=11,
+        message_id=11,
+        text="describe",
+        attachment=tmp_file,
+        attachment_kind="pdf",
+        attachment_filename="sample.pdf",
+    )
+    await handler.handle(msg, emit)
+
+    assert emitted == ["ok"]
+    assert len(bridge.calls) == 1
+    call = bridge.calls[0]
+    # Option B: extracted text injected into user_text envelope.
+    assert "EXTRACTED-PDF-TEXT" in call["user_text"]
+    assert "[attached: sample.pdf]" in call["user_text"]
+    notes = call["system_notes"] or []
+    # NO Read system-note under Option B.
+    assert all("Read(file_path=" not in n for n in notes)
+
+    # Tmp file unlinked.
     assert not tmp_file.exists()
     await store._conn.close()
 

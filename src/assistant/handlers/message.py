@@ -64,8 +64,16 @@ def _is_pdf_native_read(kind: str | None) -> bool:
     """Return True iff this kind should use the SDK Read tool.
 
     Single decision point for the hybrid Option C / Option B split.
+
+    **Phase 6a live probe FAILED 2026-04-27 (CI run cefca88):**
+    claude-opus-4-7 ignored the imperative "use Read" system-note and
+    went straight to Bash (`which pdftotext`) which the allowlist hook
+    denied. The model treats the SDK Read tool as not-for-PDF despite
+    the multimodal contract. Flipped to ``return False`` — all PDFs
+    now go through ``EXTRACTORS["pdf"]`` (pypdf, Option B uniform).
+    No regressions: pypdf already shipped + tested in 6a fix-pack.
     """
-    return kind == "pdf"
+    return False  # was: kind == "pdf"
 
 
 def _classify_block(
