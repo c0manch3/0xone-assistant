@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re as _re
+import shutil
 from typing import Any
 
 from claude_agent_sdk import (
@@ -15,6 +17,11 @@ from claude_agent_sdk import (
 from assistant.adapters.base import Emit, IncomingMessage
 from assistant.bridge.claude import ClaudeBridge, ClaudeBridgeError
 from assistant.config import Settings
+from assistant.files.extract import (
+    EXTRACTORS,
+    POST_EXTRACT_CHAR_CAP,
+    ExtractionError,
+)
 from assistant.logger import get_logger
 from assistant.state.conversations import ConversationStore
 
@@ -45,6 +52,20 @@ def _detect_urls(text: str) -> list[str]:
         if u:
             urls.append(u)
     return urls
+
+
+# Phase 6a discriminator: PDF goes through the SDK Read tool's
+# multimodal payload (Option C); every other whitelisted format is
+# pre-extracted via ``assistant.files.extract`` (Option B). If the
+# in-container live RQ1 probe ever fails (model can't read PDFs over
+# the OAuth-CLI auth path), flipping this to ``return False`` makes
+# the dispatch fall through to ``EXTRACTORS["pdf"]`` (pypdf-uniform).
+def _is_pdf_native_read(kind: str | None) -> bool:
+    """Return True iff this kind should use the SDK Read tool.
+
+    Single decision point for the hybrid Option C / Option B split.
+    """
+    return kind == "pdf"
 
 
 def _classify_block(
@@ -178,19 +199,121 @@ class ClaudeHandler:
             chat_id=msg.chat_id,
             message_id=msg.message_id,
             origin=msg.origin,
+            has_attachment=msg.attachment is not None,
         )
-        # User row written with the ORIGINAL text (no system-note leak
-        # into persisted history).
+
+        # Phase 6a invariant: the three attachment fields move together.
+        # Either all three are populated (Telegram doc upload) or all
+        # three are None (text-only / scheduler-origin turn).
+        if msg.attachment is not None:
+            assert msg.attachment_kind is not None, (
+                "attachment_kind must be set when attachment is set"
+            )
+            assert msg.attachment_filename is not None, (
+                "attachment_filename must be set when attachment is set"
+            )
+            # Defensive path-containment guard (spec §I.194). Today the
+            # adapter constructs ``<uploads>/<uuid>__<safe_stem>.<ext>``
+            # — UUID prefix + sanitised stem makes escape impossible.
+            # The explicit ``is_relative_to`` check exists so that any
+            # future regression in adapter sanitisation (or a new caller
+            # that synthesises ``IncomingMessage`` with an attacker-
+            # controlled path) is caught here, before the file is read,
+            # extracted, or handed to the SDK.
+            uploads_root = self._settings.uploads_dir.resolve()
+            try:
+                tmp_resolved = msg.attachment.resolve()
+            except OSError as resolve_exc:
+                log.warning(
+                    "attachment_path_resolve_failed",
+                    path=str(msg.attachment),
+                    error=repr(resolve_exc),
+                )
+                await emit("(внутренняя ошибка: не удалось проверить путь файла)")
+                await self._conv.complete_turn(
+                    turn_id,
+                    meta={"stop_reason": "attachment_path_invalid", "usage": {}},
+                )
+                return
+            if not tmp_resolved.is_relative_to(uploads_root):
+                log.error(
+                    "attachment_path_escape_rejected",
+                    path=str(msg.attachment),
+                    uploads_root=str(uploads_root),
+                )
+                await emit("(внутренняя ошибка: путь файла вне uploads dir)")
+                await self._conv.complete_turn(
+                    turn_id,
+                    meta={"stop_reason": "attachment_path_invalid", "usage": {}},
+                )
+                return
+
+        # User row: ORIGINAL caption (no extracted bytes leak into
+        # persisted history; long-term replay sees a small marker only).
+        # Phase 6a: append a `[file: NAME]` forensics marker so post-mortem
+        # of ``conversations`` rows shows what was attached. The actual
+        # tmp file is gone after this turn — devil M3: the marker is
+        # inert at SDK replay (model sees plain text in history; no Read
+        # call attempted because the path is invalid).
+        persist_text = msg.text
+        if msg.attachment is not None:
+            persist_text = f"{msg.text}\n[file: {msg.attachment_filename}]"
         await self._conv.append(
             msg.chat_id,
             turn_id,
             "user",
-            [{"type": "text", "text": msg.text}],
+            [{"type": "text", "text": persist_text}],
             block_type="text",
         )
         history = await self._conv.load_recent(msg.chat_id, self._settings.claude.history_limit)
         # The current turn is still 'pending' so load_recent's 'complete'
         # filter excludes it — we won't replay our own user row to the model.
+
+        # Phase 6a attachment branch:
+        # - PDF (Option C): system-note appended; model uses Read tool
+        #   directly. No pre-extract.
+        # - DOCX/XLSX/TXT/MD (Option B): pre-extract via assistant.files
+        #   .extract; injected into the SDK envelope. Failure → quarantine
+        #   + Russian reply, turn marked complete with synthetic meta.
+        user_text_for_sdk = msg.text
+        attachment_notes: list[str] = []
+        extraction_error: ExtractionError | None = None
+        if msg.attachment is not None:
+            kind = msg.attachment_kind
+            assert kind is not None
+            if _is_pdf_native_read(kind):
+                # Option C: tell the model the file is on disk; the
+                # Read tool propagates the multimodal payload over the
+                # OAuth-CLI auth path.
+                attachment_notes.append(
+                    f"the user attached a PDF at path={msg.attachment}, "
+                    f"named {msg.attachment_filename}; "
+                    f"use Read(file_path={msg.attachment}) "
+                    "to inspect it before answering."
+                )
+            else:
+                try:
+                    extracted, _char_count = EXTRACTORS[kind](msg.attachment)
+                except ExtractionError as exc:
+                    extraction_error = exc
+                    extracted = ""
+                if extraction_error is None:
+                    # Defensive total-cap. The XLSX extractor honours
+                    # the cap on a clean sheet boundary; this final
+                    # substring guard handles the edge case where a
+                    # single sheet exceeds the cap on its own (~6700
+                    # capped rows by 30 cells by 1 char) and the DOCX
+                    # extractor which has no per-doc cap of its own.
+                    if len(extracted) > POST_EXTRACT_CHAR_CAP:
+                        extracted = (
+                            extracted[:POST_EXTRACT_CHAR_CAP]
+                            + f"\n[…truncated at {POST_EXTRACT_CHAR_CAP} chars]"
+                        )
+                    user_text_for_sdk = (
+                        f"{msg.text}\n\n"
+                        f"[attached: {msg.attachment_filename}]\n\n"
+                        f"{extracted}"
+                    )
 
         # Phase 3: URL detector enriches the envelope sent to the SDK
         # without touching the persisted user row. If the owner pasted a
@@ -220,13 +343,29 @@ class ClaudeHandler:
                 "concisely, do not ask clarifying questions"
             )
 
-        notes: list[str] = []
+        notes: list[str] = list(attachment_notes)
         if scheduler_note is not None:
             notes.append(scheduler_note)
         if url_hint is not None:
             notes.append(url_hint)
         system_notes: list[str] | None = notes or None
-        user_text_for_sdk = msg.text
+
+        # Phase 6a: extraction failure short-circuits the bridge call.
+        # Quarantine the file, reply in Russian, mark turn complete.
+        if extraction_error is not None:
+            try:
+                await self._handle_extraction_failure(
+                    msg, turn_id, extraction_error, emit
+                )
+            finally:
+                # In the extraction-failure branch the file was renamed
+                # into ``.failed/`` by ``_handle_extraction_failure`` —
+                # the unlink below is a no-op (idempotent). Belt-and-
+                # suspenders for any post-rename failure.
+                if msg.attachment is not None:
+                    with contextlib.suppress(OSError):
+                        msg.attachment.unlink(missing_ok=True)
+            return
 
         completed = False
         last_meta: dict[str, Any] | None = None
@@ -287,3 +426,97 @@ class ClaudeHandler:
             if not completed:
                 await self._conv.interrupt_turn(turn_id)
                 log.warning("turn_interrupted", turn_id=turn_id)
+            # Phase 6a: tmp cleanup ALWAYS — bridge success, bridge
+            # error, OR mid-stream cancellation. The ``contextlib
+            # .suppress`` keeps a flaky unlink from masking a more
+            # interesting exception in the same finally.
+            if msg.attachment is not None:
+                try:
+                    msg.attachment.unlink(missing_ok=True)
+                except OSError as unlink_exc:
+                    log.warning(
+                        "attachment_unlink_failed",
+                        path=str(msg.attachment),
+                        error=repr(unlink_exc),
+                    )
+
+    async def _handle_extraction_failure(
+        self,
+        msg: IncomingMessage,
+        turn_id: str,
+        exc: ExtractionError,
+        emit: Emit,
+    ) -> None:
+        """Quarantine + Russian reply + mark turn complete.
+
+        Quarantine path: ``<uploads_dir>/.failed/<orig_tmp_filename>``.
+        The tmp filename already embeds a UUID + sanitised original
+        stem, so collisions in ``.failed/`` are bounded. Boot-sweep
+        prunes ``.failed/`` entries older than 7 days.
+
+        The turn is marked ``complete`` with a synthetic meta — no SDK
+        call was issued, so there is no usage to bill. Leaving the turn
+        ``pending`` would trip ``cleanup_orphan_pending_turns`` on the
+        next daemon boot.
+        """
+        assert msg.attachment is not None
+        quarantine_dir = self._settings.uploads_dir / ".failed"
+        target = quarantine_dir / msg.attachment.name
+        try:
+            quarantine_dir.mkdir(parents=True, exist_ok=True)
+            msg.attachment.rename(target)
+            log.info(
+                "extraction_failed_quarantined",
+                turn_id=turn_id,
+                path=str(target),
+                reason=str(exc),
+            )
+        except OSError as rename_exc:
+            # Devil M-W2-5: ``rename`` can fail (cross-device move,
+            # permissions glitch, target collision on a non-POSIX
+            # filesystem). Without a fallback, the outer ``finally``
+            # in ``_handle_locked`` then ``unlink``s ``msg.attachment``
+            # → forensic evidence destroyed.
+            #
+            # Log everything BEFORE we try to recover, so even if both
+            # the rename and the fallback fail, the structured log
+            # carries full context for owner debugging.
+            log.exception(
+                "quarantine_rename_failed",
+                turn_id=turn_id,
+                tmp_path=str(msg.attachment),
+                quarantine_target=str(target),
+                error=str(rename_exc),
+            )
+            # Copy fallback: if we can ``copy2`` the file into
+            # ``.failed/`` we preserve the evidence even though the
+            # outer ``finally`` will unlink the source.
+            try:
+                shutil.copy2(msg.attachment, target)
+                log.info(
+                    "quarantine_copy_fallback_ok",
+                    turn_id=turn_id,
+                    path=str(target),
+                )
+            except OSError:
+                log.exception(
+                    "quarantine_copy_fallback_failed",
+                    turn_id=turn_id,
+                    tmp_path=str(msg.attachment),
+                    quarantine_target=str(target),
+                )
+            # Deliberately swallow ``rename_exc`` — propagating it
+            # would short-circuit the Russian reply + ``complete_turn``
+            # below, leaving the user without feedback and the turn
+            # stuck ``pending``.
+
+        reply = f"не смог прочитать файл: {exc}"
+        if "encrypted" in str(exc).lower():
+            reply = "файл зашифрован — пришли расшифрованный"
+        await emit(reply)
+
+        # Mark turn complete with synthetic meta — no SDK roundtrip.
+        await self._conv.complete_turn(
+            turn_id,
+            meta={"stop_reason": "extraction_error", "usage": {}},
+        )

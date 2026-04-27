@@ -182,6 +182,27 @@ class Settings(BaseSettings):
         base = self.memory.index_db_path or (self.data_dir / "memory-index.db")
         return base.expanduser().resolve()
 
+    @property
+    def uploads_dir(self) -> Path:
+        """Phase 6a: tmp dir for downloaded Telegram attachments.
+
+        - Container (``project_root == /app``): ``/app/.uploads``. The
+          file-tool hook in ``bridge/hooks.py`` constrains every ``Read``
+          / ``Write`` / ``Edit`` to ``project_root``; placing the tmp dir
+          inside ``/app`` keeps the hook surface single-arg (Option 1
+          from RQ1 spike).
+        - Mac dev (any other ``project_root``): ``<data_dir>/uploads``.
+          Mirrors the convention used by ``vault_dir`` and
+          ``memory_index_path`` so the on-disk layout for ephemeral and
+          persistent state is consistent. Living under ``data_dir``
+          (typically ``~/.local/share/0xone-assistant``) keeps tmp data
+          OUT of the working tree, so a routine ``git clean -fd`` cannot
+          wipe quarantined ``.failed/`` forensics.
+        """
+        if self.project_root == Path("/app"):
+            return Path("/app/.uploads")
+        return (self.data_dir / "uploads").expanduser().resolve()
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

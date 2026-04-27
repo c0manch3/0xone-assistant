@@ -9,6 +9,7 @@ import shutil as _shutil
 import signal
 import sqlite3
 import sys
+import time
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,109 @@ from assistant.tools_sdk import memory as _memory_mod
 from assistant.tools_sdk import scheduler as _scheduler_mod
 
 log = get_logger("main")
+
+# Phase 6a: how old a file in ``.uploads/.failed/`` must be to be
+# pruned at boot. 7 days lines up with the plan's quarantine retention
+# (devil H4); a separate ``.failed/`` size-cap is deferred to phase 6e.
+_QUARANTINE_RETENTION_S = 7 * 86400
+
+
+def _boot_sweep_uploads(uploads_dir: Path) -> None:
+    """Phase 6a: UNCONDITIONAL boot-sweep of orphaned tmp uploads.
+
+    Every file directly under ``uploads_dir/`` at ``Daemon.start()`` is
+    by definition stale — the previous daemon died, its in-flight
+    uploads are orphaned. Wipe ALL top-level entries unconditionally;
+    for ``.failed/`` quarantine entries, prune those older than 7 days.
+
+    Devil H3: the prior plan used a 1h age-bound at boot; that opens a
+    crash-loop disk-fill (a SIGKILL'd daemon restarting in <1h leaves
+    the previous boot's tmp file untouched, then the next crash adds a
+    new one, etc.). UNCONDITIONAL is the correct policy because there
+    is no in-flight turn at process start.
+
+    Errors during sweep are logged and swallowed — boot must succeed
+    even if a single file's permissions are surprising. The bound on
+    ``uploads_dir`` size is small enough (single-owner + 20 MB
+    pre-download cap + 7d retention → ≤ ~1.4 GB worst case) that sync
+    iteration in ``Daemon.start()`` is fast (<10 ms typical) and
+    finishes before the adapter accepts traffic.
+    """
+    if not uploads_dir.exists():
+        return
+    now = time.time()
+    try:
+        entries = list(uploads_dir.iterdir())
+    except OSError as exc:
+        log.warning(
+            "boot_sweep_iterdir_failed",
+            path=str(uploads_dir),
+            error=repr(exc),
+        )
+        return
+
+    wiped_orphans = 0
+    pruned_failed = 0
+    for entry in entries:
+        # ``.failed/`` is the quarantine subdir — keep it; prune by age.
+        if entry.name == ".failed":
+            if not entry.is_dir():
+                # Defensive: a file at .failed/ would block quarantine
+                # mkdir on the next ExtractionError. Log and skip; the
+                # next mkdir(parents=True, exist_ok=True) raises
+                # FileExistsError which the handler logs.
+                log.warning(
+                    "boot_sweep_failed_path_not_dir",
+                    path=str(entry),
+                )
+                continue
+            try:
+                failed_entries = list(entry.iterdir())
+            except OSError as exc:
+                log.warning(
+                    "boot_sweep_failed_iterdir_failed",
+                    path=str(entry),
+                    error=repr(exc),
+                )
+                continue
+            for f in failed_entries:
+                try:
+                    if now - f.stat().st_mtime > _QUARANTINE_RETENTION_S:
+                        f.unlink(missing_ok=True)
+                        pruned_failed += 1
+                except OSError as exc:
+                    log.warning(
+                        "boot_sweep_failed_prune_error",
+                        path=str(f),
+                        error=repr(exc),
+                    )
+            continue
+        # Top-level entry: orphan tmp from a dead daemon. Wipe.
+        try:
+            if entry.is_file() or entry.is_symlink():
+                entry.unlink(missing_ok=True)
+                wiped_orphans += 1
+            elif entry.is_dir():
+                # Future-proofing: phase 6b might land a peer subdir
+                # under uploads_dir/. We don't recurse blindly; just
+                # log and skip.
+                log.info(
+                    "boot_sweep_skipped_unexpected_dir",
+                    path=str(entry),
+                )
+        except OSError as exc:
+            log.warning(
+                "boot_sweep_orphan_unlink_error",
+                path=str(entry),
+                error=repr(exc),
+            )
+
+    log.info(
+        "boot_sweep_uploads_done",
+        path=str(uploads_dir),
+        wiped_orphans=wiped_orphans,
+        pruned_failed=pruned_failed,
+    )
 
 
 def _acquire_singleton_lock(data_dir: Path) -> int:
@@ -209,6 +313,14 @@ class Daemon:
                 ),
             )
             sys.exit(4)
+
+        # Phase 6a: UNCONDITIONAL sweep of orphaned uploads + 7d
+        # quarantine prune. Runs synchronously before the adapter
+        # accepts traffic so the very first upload turn sees a clean
+        # tmp dir. See ``_boot_sweep_uploads`` docstring for the
+        # rationale (devil H3 — 1h-bound dropped).
+        _boot_sweep_uploads(self._settings.uploads_dir)
+
         # Sweep stale tmp / cache dirs + crashed-install staging dirs.
         self._spawn_bg(_core.sweep_run_dirs(self._settings.data_dir))
         self._spawn_bg(_core.sweep_legacy_stage_dirs(self._settings.project_root))

@@ -62,3 +62,9 @@ memory-audit.log
 scheduler-audit.log
 .last_clean_exit
 .daemon.pid
+
+# Phase 6a — Telegram file-attachment tmp dir. Mac dev fallback is
+# ``<project_root>/.uploads/``; in container the canonical path is
+# ``/app/.uploads/`` (a separate filesystem location). Either way, do
+# not commit downloaded user attachments or quarantined failures.
+.uploads/

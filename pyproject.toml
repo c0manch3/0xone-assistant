@@ -11,6 +11,16 @@ dependencies = [
   "claude-agent-sdk>=0.1.59,<0.2",
   "pyyaml>=6.0",
   "PyStemmer>=2.2,<4",
+  # Phase 6a: file-attachment ingestion (PDF/DOCX/TXT/MD/XLSX).
+  # python-docx + openpyxl + pypdf are pure-Python wheels (< 1 MB total).
+  "python-docx>=1.1,<2",
+  # openpyxl >=3.1.5 — earlier 3.1.x sub-versions ignore
+  # ``iter_rows(max_row=...)`` on read-only workbooks past the first
+  # row (verified empirically), defeating the RQ2 RSS guarantee. The
+  # extractor also enforces an explicit row counter as defense-in-
+  # depth (see ``files/extract.py``).
+  "openpyxl>=3.1.5,<4",
+  "pypdf>=5.0,<6",
 ]
 
 [dependency-groups]
@@ -20,6 +30,9 @@ dev = [
   "ruff>=0.8",
   "mypy>=1.13",
   "types-pyyaml>=6.0",
+  # Phase 6a: openpyxl types so the strict mypy gate is happy with
+  # ``load_workbook`` / ``Worksheet`` calls in extract.py.
+  "types-openpyxl>=3.1,<4",
 ]
 
 [build-system]
@@ -51,6 +64,20 @@ select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF", "ASYNC"]
 "src/assistant/tools_sdk/_scheduler_core.py" = ["RUF001", "RUF002", "RUF003"]
 "tests/test_scheduler_prompt_rejects_cyrillic_lookalike.py" = ["RUF001", "RUF002", "RUF003"]
 "tests/test_scheduler_prompt_rejects_system_note.py" = ["RUF001", "RUF002", "RUF003"]
+# Phase 6a file-extract tests round-trip Cyrillic payloads through
+# DOCX/TXT/MD parsers and use math comments (×, ≈) for sizing notes.
+"tests/test_files_extract_*.py" = ["RUF001", "RUF002", "RUF003"]
+# Phase 6a fix-pack: classify_block test pins the Cyrillic
+# round-trip through json.dumps/loads — needs the ambiguous-glyph
+# allowance that the extract tests already use.
+"tests/test_classify_block_tool_result.py" = ["RUF001", "RUF002", "RUF003"]
+# Tests that mock aiogram Message objects have to call sync filesystem
+# helpers from inside async fixture lambdas (no real I/O — bytes write
+# to a tmp_path), so the ASYNC240 advisory is a false positive here.
+# ASYNC109: the fake ``bot.download`` mock has to mirror aiogram's
+# real ``timeout`` kwarg signature (devil M-W2-6); using
+# ``asyncio.timeout`` would not match the contract under test.
+"tests/test_telegram_document_handler.py" = ["ASYNC240", "ASYNC109"]
 
 [tool.mypy]
 strict = true

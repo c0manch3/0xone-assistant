@@ -193,6 +193,14 @@ COPY src/ /app/src/
 # layer and uid 1000 cannot mkdir there.
 RUN chown -R 1000:1000 /app
 
+# Phase 6a — uploads tmp dir for the file-attachment hybrid (Option 1).
+# /app is already chown'd to 1000:1000 by the line above; this is belt-
+# and-suspenders. The hook in bridge/hooks.py only allows Read inside
+# /app, so /app/.uploads/ is the canonical path for downloaded
+# attachments. Subdir .failed/ is the quarantine for ExtractionError.
+RUN mkdir -p /app/.uploads /app/.uploads/.failed \
+    && chown -R 1000:1000 /app/.uploads
+
 USER bot
 WORKDIR /app
 

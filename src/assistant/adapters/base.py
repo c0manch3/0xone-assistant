@@ -3,7 +3,13 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal, Protocol
+
+# Phase 6a: whitelisted attachment kinds. Mirrors the suffix whitelist
+# enforced by the Telegram adapter; adding a new kind requires a matching
+# extractor in ``assistant.files.extract`` and adapter-side acceptance.
+AttachmentKind = Literal["pdf", "docx", "txt", "md", "xlsx"]
 
 # ---------------------------------------------------------------------------
 # Emit callback signature used by phase-2 ``ClaudeHandler``. The adapter
@@ -40,6 +46,13 @@ class IncomingMessage:
     text: str
     origin: Origin = "telegram"
     meta: dict[str, Any] | None = None
+    # Phase 6a: file-attachment fields (END-of-class; positional-call
+    # safety verified by phase-5 RQ1 — every construction site uses
+    # kwargs but appending keeps positional callers stable). Invariant:
+    # all three set, or all three None. Handler asserts.
+    attachment: Path | None = None
+    attachment_kind: AttachmentKind | None = None
+    attachment_filename: str | None = None
 
 
 class MessengerAdapter(ABC):
