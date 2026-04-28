@@ -27,6 +27,16 @@ TUNNEL_PLIST = (
 SIDECAR_README = REPO_ROOT / "whisper-server" / "README.md"
 SETUP_SCRIPT = REPO_ROOT / "whisper-server" / "setup-mac-sidecar.sh"
 
+# CI test image only COPYs ``src/`` + ``tests/`` (per Dockerfile target=test);
+# ``deploy/`` and ``whisper-server/`` are NOT in the container. Skip the
+# file-presence assertions there. Locally + on dev hosts the repo layout
+# is full and these tests run.
+_REPO_FULL = COMPOSE_FILE.exists() and TUNNEL_PLIST.exists()
+pytestmark = pytest.mark.skipif(
+    not _REPO_FULL,
+    reason="repo deploy/+whisper-server not present (CI test container)",
+)
+
 
 def test_compose_no_tailscale_service() -> None:
     """The Tailscale sidecar service was removed in the hotfix."""
