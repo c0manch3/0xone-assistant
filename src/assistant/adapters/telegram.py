@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import re
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from uuid import uuid4
 
 from aiogram import Bot, Dispatcher, F
@@ -14,6 +14,7 @@ from aiogram.types import Message
 from aiogram.utils.chat_action import ChatActionSender
 
 from assistant.adapters.base import (
+    AUDIO_KINDS,
     AttachmentKind,
     Handler,
     IncomingMessage,
@@ -22,6 +23,7 @@ from assistant.adapters.base import (
 from assistant.adapters.media_group import MediaGroupAggregator
 from assistant.config import Settings
 from assistant.logger import get_logger
+from assistant.services.transcription import TranscriptionService
 
 log = get_logger("adapters.telegram")
 
@@ -53,9 +55,28 @@ _DOC_SUFFIX_WHITELIST: frozenset[str] = frozenset(
 _IMAGE_SUFFIX_WHITELIST: frozenset[str] = frozenset(
     {"jpg", "jpeg", "png", "webp", "heic", "heif"}
 )
+# Phase 6c: extended document-route whitelist with audio kinds that the
+# owner sometimes "send as file" (e.g. exported iPhone Voice Memo m4a).
+_AUDIO_SUFFIX_WHITELIST: frozenset[str] = AUDIO_KINDS
 _SUFFIX_WHITELIST: frozenset[str] = (
-    _DOC_SUFFIX_WHITELIST | _IMAGE_SUFFIX_WHITELIST
+    _DOC_SUFFIX_WHITELIST | _IMAGE_SUFFIX_WHITELIST | _AUDIO_SUFFIX_WHITELIST
 )
+
+# Phase 6c (C4 closure): explicit URL-transcribe trigger. Only this regex
+# routes a text message to the Mac sidecar's ``/extract`` endpoint;
+# arbitrary URLs in conversation continue to feed the phase-3 installer
+# hint via ``_URL_RE`` in handlers/message.py.
+_URL_TRANSCRIBE_TRIGGER_RE = re.compile(
+    r"^(?:транскрибируй|/voice)\s+(https?://\S+)\s*$",
+    re.IGNORECASE,
+)
+
+# Manual typing-action loop cadence. Telegram's "typing" status TTL is
+# ~5 s server-side; we refresh slightly under that to avoid the indicator
+# blinking off mid-transcribe (H2 closure: ChatActionSender.typing was
+# replaced because its internal cancel-on-error behaviour produced silent
+# typing dropouts during long voice transcribes).
+_TYPING_REFRESH_INTERVAL_S = 4.5
 
 # Default caption when the owner sends a document with no caption
 # (devil L6 — applies to ALL whitelisted formats including TXT/MD for
@@ -138,16 +159,38 @@ class TelegramAdapter(MessengerAdapter):
         # branch is retained so an animated GIF that bypasses the
         # ``F.animation`` aiogram class (rare encoding) still routes
         # away from the suffix whitelist.
+        # Phase 6c order: text → voice → audio → photo → animation →
+        # document → catch-all. ``F.voice`` and ``F.audio`` MUST land
+        # BEFORE ``F.document`` because a forwarded m4a sometimes
+        # arrives as a generic ``Document`` whose mime hint says
+        # ``audio/mp4``; the suffix whitelist on the document route
+        # then routes it back into the audio path uniformly.
         self._dp.message.register(self._on_text, F.text)
+        self._dp.message.register(self._on_voice, F.voice)
+        self._dp.message.register(self._on_audio, F.audio)
         self._dp.message.register(self._on_photo, F.photo)
         self._dp.message.register(self._on_animation, F.animation)
         self._dp.message.register(self._on_document, F.document & ~F.animation)
         self._dp.message.register(self._on_non_text)
 
+        # Phase 6c: transcription service is set post-construction by
+        # main.py; tests for non-audio paths can leave it None.
+        self._transcription: TranscriptionService | None = None
+
         self._dp.shutdown.register(self._on_shutdown)
 
     def set_handler(self, handler: Handler) -> None:
         self._handler = handler
+
+    def set_transcription(self, transcription: TranscriptionService) -> None:
+        """Phase 6c: wire the Mac sidecar client.
+
+        Adapter calls ``transcription.health_check()`` BEFORE entering
+        the per-chat handler lock so an offline Mac short-circuits with
+        a cheap rejection rather than dragging the lock through a full
+        timeout.
+        """
+        self._transcription = transcription
 
     @property
     def polling_task(self) -> asyncio.Task[None] | None:
@@ -163,17 +206,28 @@ class TelegramAdapter(MessengerAdapter):
             return
         assert message.text is not None  # guaranteed by F.text filter.
 
-        # Phase 6b (F6): pre-empt any pending photo media-group debounce
-        # timer for this chat — the photo turn flushes immediately and
-        # runs to completion BEFORE this text turn enters the per-chat
-        # lock. This preserves owner-visible order (photos answered
-        # before subsequent text), at the cost of text waiting
-        # ~ photo-turn duration. Without this, an owner who fires off a
-        # photo album then immediately types a follow-up question would
-        # have the text turn run while the photos are still in the
-        # debounce window — the model would answer the text without
-        # seeing the photos.
+        # Phase 6b (F6) / Phase 6c F8 (fix-pack): pre-empt any pending
+        # photo media-group debounce timer for this chat — the photo
+        # turn flushes immediately and runs to completion BEFORE this
+        # text turn enters the per-chat lock. This preserves
+        # owner-visible order (photos answered before subsequent text).
+        # F8 (fix-pack): the flush MUST run BEFORE the URL-transcribe
+        # routing check; otherwise an owner sending a photo album
+        # followed by ``транскрибируй <URL>`` would see the URL ack
+        # land before the photo answer.
         await self._media_group.flush_for_chat(message.chat.id)
+
+        # Phase 6c (C4 closure): explicit URL transcribe trigger. ONLY
+        # when the message text matches ``транскрибируй <URL>`` or
+        # ``/voice <URL>`` do we route to the Mac sidecar's /extract
+        # endpoint. Other URLs continue to feed the phase-3 installer
+        # hint via ``_URL_RE`` in handlers/message.py. The check is
+        # deliberately strict (anchored ``^`` + ``\s*$``) so a URL
+        # buried in a longer message stays in the normal text path.
+        url_match = _URL_TRANSCRIBE_TRIGGER_RE.match(message.text.strip())
+        if url_match:
+            await self._on_url_transcribe(message, url_match.group(1))
+            return
 
         chunks: list[str] = []
 
@@ -191,6 +245,25 @@ class TelegramAdapter(MessengerAdapter):
         full = "".join(chunks).strip() or "(пустой ответ)"
         for part in _split_for_telegram(full, limit=TELEGRAM_MSG_LIMIT):
             await self._bot.send_message(message.chat.id, part)
+
+    async def _on_url_transcribe(self, message: Message, url: str) -> None:
+        """Phase 6c URL extraction path — explicit trigger only."""
+        if self._handler is None:
+            return
+        if not await self._ensure_sidecar_health(message):
+            return
+        # ack BEFORE lock — same pattern as voice/audio
+        await self._send_pre_lock_ack(
+            message.chat.id,
+            self._format_initial_ack(0, source="url"),
+        )
+        incoming = IncomingMessage(
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            text="",
+            url_for_extraction=url,
+        )
+        await self._dispatch_audio_turn(message.chat.id, incoming)
 
     async def _on_document(self, message: Message) -> None:
         """Phase 6a: file-attachment ingestion.
@@ -245,13 +318,22 @@ class TelegramAdapter(MessengerAdapter):
         # F14: list image kinds too — phase 6b expanded the whitelist
         # to JPG/PNG/WEBP/HEIC/HEIF, so the prior reply was wrong on
         # supported formats.
+        # Phase 6c: audio kinds added (MP3/M4A/WAV/OGG/OPUS).
         file_name = doc.file_name or ""
         suffix = Path(file_name).suffix.lower().lstrip(".")
         if not suffix or suffix not in _SUFFIX_WHITELIST:
             await message.reply(
                 "формат не поддерживается; список: "
-                "PDF, DOCX, TXT, MD, XLSX, JPG, PNG, WEBP, HEIC"
+                "PDF, DOCX, TXT, MD, XLSX, JPG, PNG, WEBP, HEIC, "
+                "MP3, M4A, WAV, OGG, OPUS"
             )
+            return
+
+        # Phase 6c: audio-suffix documents route to the audio path
+        # (transcribe → standard turn) instead of the extract path.
+        # H3 closure: suffix is PRIMARY, MIME secondary.
+        if suffix in _AUDIO_SUFFIX_WHITELIST:
+            await self._on_audio_document(message, doc, suffix, file_name)
             return
 
         # Tmp path inside ``settings.uploads_dir``. The hook in
@@ -627,6 +709,391 @@ class TelegramAdapter(MessengerAdapter):
 
         async with ChatActionSender.typing(bot=self._bot, chat_id=chat_id):
             await self._handler.handle(incoming, emit)
+
+        full = "".join(chunks).strip() or "(пустой ответ)"
+        for part in _split_for_telegram(full, limit=TELEGRAM_MSG_LIMIT):
+            await self._bot.send_message(chat_id, part)
+
+    # ------------------------------------------------------------------
+    # Phase 6c: voice / audio / URL transcription
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _format_initial_ack(duration_sec: int, *, source: str) -> str:
+        """Build the Russian "⏳ получил…" reply sent BEFORE the lock.
+
+        ETA is ``max(1, duration // 4)`` seconds at 4× realtime on M4
+        (research RQ1). For URL extraction we don't know the audio
+        duration up front, so the ack omits the number.
+
+        F15 (fix-pack): when the source is ``audio`` and duration is
+        unknown (audio-document route — Telegram doesn't expose
+        duration metadata for arbitrary documents), emit a clean
+        "длительность определяю на сервере" string instead of the
+        broken "⏳ получил аудио 0:00, начинаю транскрибацию (~1 мин)".
+        """
+        if source == "url":
+            return (
+                "⏳ получил ссылку, скачиваю аудио и транскрибирую "
+                "(~5-15 мин для длинного видео)"
+            )
+        if source == "audio" and duration_sec <= 0:
+            return (
+                "⏳ получил аудио, начинаю транскрибацию "
+                "(длительность определяю на сервере)"
+            )
+        h, rem = divmod(max(0, duration_sec), 3600)
+        m, s = divmod(rem, 60)
+        dur = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+        eta_sec = max(int(duration_sec / 4), 5)
+        eta_min = max(eta_sec // 60, 1)
+        return (
+            f"⏳ получил аудио {dur}, начинаю транскрибацию "
+            f"(~{eta_min} мин при 4x realtime)"
+        )
+
+    async def _periodic_typing(self, chat_id: int) -> None:
+        """Manual replacement for ``ChatActionSender.typing`` (H2 closure).
+
+        Keeps the typing indicator alive across the full transcribe +
+        Claude turn. Each ``send_chat_action`` call is wrapped in
+        try/except — an aiogram transient (rate-limit, network blip)
+        must NOT abort the loop. Cancelled in the caller's ``finally``.
+        """
+        while True:
+            try:
+                await self._bot.send_chat_action(chat_id, "typing")
+            except asyncio.CancelledError:
+                # Re-raise so the caller's gather/await sees the cancel.
+                raise
+            except Exception as exc:
+                log.debug("typing_action_skip", error=repr(exc))
+            await asyncio.sleep(_TYPING_REFRESH_INTERVAL_S)
+
+    async def _send_pre_lock_ack(self, chat_id: int, ack: str) -> bool:
+        """Send the initial ack message directly (bypass chunks).
+
+        Returns ``True`` on success, ``False`` if the send failed —
+        we still proceed with the transcribe path because losing the
+        ack does NOT invalidate the audio. Logged either way.
+        """
+        try:
+            await self._bot.send_message(chat_id, ack)
+            return True
+        except Exception as exc:
+            log.warning("audio_pre_lock_ack_failed", error=repr(exc))
+            return False
+
+    async def _ensure_sidecar_health(self, message: Message) -> bool:
+        """Pre-flight Mac sidecar health check before per-chat lock.
+
+        Returns ``True`` when the sidecar reports healthy. Otherwise
+        replies in Russian and returns ``False``. NO queue, NO retry
+        per spec.
+        """
+        if self._transcription is None or not self._transcription.enabled:
+            await message.reply(
+                "транскрипция временно недоступна (Mac sidecar offline), "
+                "перезапиши через минуту"
+            )
+            return False
+        if not await self._transcription.health_check():
+            await message.reply(
+                "транскрипция временно недоступна (Mac sidecar offline), "
+                "перезапиши через минуту"
+            )
+            return False
+        return True
+
+    async def _on_voice(self, message: Message) -> None:
+        """Phase 6c: ``F.voice`` ingestion (Telegram native voice).
+
+        Routing contract: ``F.voice`` filter guarantees ``message.voice``
+        is set; the OGG/Opus encoding is fixed by Telegram (no need to
+        sniff). Synthetic filename ``<uuid>__voice_<msg_id>.ogg``.
+        """
+        if self._handler is None:
+            log.warning("voice_received_without_handler")
+            return
+
+        voice = message.voice
+        if voice is None:  # pragma: no cover — F.voice filter guarantees set
+            return
+
+        # 1. Pre-download size guard.
+        file_size = voice.file_size or 0
+        if file_size > TELEGRAM_DOC_MAX_BYTES:
+            await message.reply(
+                "голосовое больше 20 МБ — это лимит Telegram bot API"
+            )
+            return
+
+        duration = voice.duration or 0
+        # 2. 3-hour cap pre-flight (server-side check too, but we
+        # short-circuit here to save a transcribe round-trip).
+        if duration > 3 * 3600:
+            await message.reply(
+                "слишком длинная запись (>3 часа), разбей на части"
+            )
+            return
+
+        # 3. Pre-flight Mac sidecar health.
+        if not await self._ensure_sidecar_health(message):
+            return
+
+        # 4. Initial ack (BEFORE lock). H1: aiogram defaults parse_mode
+        # to None at adapter init; the ack is plain text.
+        await self._send_pre_lock_ack(
+            message.chat.id,
+            self._format_initial_ack(duration, source="voice"),
+        )
+
+        # 5. Download.
+        tmp_path = await self._download_audio_to_uploads(
+            message,
+            file_obj=voice,
+            synthetic_name=f"voice_{message.message_id}.ogg",
+        )
+        if tmp_path is None:
+            return
+
+        incoming = IncomingMessage(
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            text=(message.caption or "").strip(),
+            attachment=tmp_path,
+            attachment_kind="ogg",
+            attachment_filename=tmp_path.name,
+            audio_duration=duration,
+            audio_mime_type="audio/ogg",
+        )
+        await self._dispatch_audio_turn(message.chat.id, incoming)
+
+    async def _on_audio(self, message: Message) -> None:
+        """Phase 6c: ``F.audio`` ingestion (audio file with metadata).
+
+        Audio attachments carry a ``file_name`` (often) and ``mime_type``
+        (sometimes). Suffix is the PRIMARY signal (H3 closure); MIME is
+        fallback. ffmpeg server-side handles the rest.
+        """
+        if self._handler is None:
+            log.warning("audio_received_without_handler")
+            return
+
+        audio = message.audio
+        if audio is None:  # pragma: no cover — F.audio filter guarantees set
+            return
+
+        file_size = audio.file_size or 0
+        if file_size > TELEGRAM_DOC_MAX_BYTES:
+            await message.reply(
+                "аудио больше 20 МБ — это лимит Telegram bot API"
+            )
+            return
+
+        duration = audio.duration or 0
+        if duration and duration > 3 * 3600:
+            await message.reply(
+                "слишком длинная запись (>3 часа), разбей на части"
+            )
+            return
+
+        # Suffix detection (H3 closure: filename PRIMARY, MIME fallback).
+        file_name = audio.file_name or ""
+        suffix = Path(file_name).suffix.lower().lstrip(".")
+        mime = (audio.mime_type or "").lower()
+        if suffix not in _AUDIO_SUFFIX_WHITELIST:
+            # Fallback by MIME — common iPhone Voice Memo path is
+            # ``audio/x-m4a`` with a missing or non-audio file_name.
+            if "ogg" in mime or "opus" in mime:
+                suffix = "ogg"
+            elif "mp4" in mime or "m4a" in mime:
+                suffix = "m4a"
+            elif "mpeg" in mime or "mp3" in mime:
+                suffix = "mp3"
+            elif "wav" in mime:
+                suffix = "wav"
+            else:
+                await message.reply(
+                    "аудио формат не распознан; пришли ogg/mp3/m4a/wav/opus"
+                )
+                return
+
+        if not await self._ensure_sidecar_health(message):
+            return
+
+        await self._send_pre_lock_ack(
+            message.chat.id,
+            self._format_initial_ack(duration, source="audio"),
+        )
+
+        # Synthesise upload filename. We keep the suffix because the
+        # sidecar uses it for ffmpeg's input-format detection.
+        synthetic = file_name or f"audio_{message.message_id}.{suffix}"
+        tmp_path = await self._download_audio_to_uploads(
+            message,
+            file_obj=audio,
+            synthetic_name=synthetic,
+        )
+        if tmp_path is None:
+            return
+
+        kind = cast(AttachmentKind, suffix)
+        incoming = IncomingMessage(
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            text=(message.caption or "").strip(),
+            attachment=tmp_path,
+            attachment_kind=kind,
+            attachment_filename=file_name or tmp_path.name,
+            audio_duration=duration if duration > 0 else None,
+            audio_mime_type=audio.mime_type,
+        )
+        await self._dispatch_audio_turn(message.chat.id, incoming)
+
+    async def _download_audio_to_uploads(
+        self,
+        message: Message,
+        *,
+        file_obj: Any,
+        synthetic_name: str,
+    ) -> Path | None:
+        """Common download wrapper for voice / audio / audio-document.
+
+        On success, returns the tmp Path. On any failure (timeout, too
+        big, generic error) replies in Russian, cleans up the partial
+        file, and returns ``None`` — caller short-circuits.
+        """
+        uploads_dir = self._settings.uploads_dir
+        try:
+            uploads_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log.error("uploads_mkdir_failed", path=str(uploads_dir), error=repr(exc))
+            await message.reply("не смог подготовить папку для файлов")
+            return None
+
+        # Filename normalisation: <uuid>__<sanitised>.<ext>
+        stem = Path(synthetic_name).stem or "audio"
+        safe_stem = re.sub(r"[^\w.-]", "_", stem)[:_FILENAME_MAX_LEN]
+        if not safe_stem or safe_stem.strip(".") == "":
+            safe_stem = "audio"
+        suffix = Path(synthetic_name).suffix.lstrip(".") or "ogg"
+        safe_suffix = re.sub(r"[^\w]", "", suffix)[:8] or "ogg"
+        tmp_name = f"{uuid4().hex}__{safe_stem}.{safe_suffix}"
+        tmp_path = uploads_dir / tmp_name
+
+        try:
+            await self._bot.download(file_obj, destination=tmp_path, timeout=90)
+        except TelegramBadRequest as exc:
+            log.warning(
+                "telegram_audio_download_failed",
+                path=str(tmp_path),
+                error=str(exc),
+            )
+            msg_lower = str(exc).lower()
+            if "too big" in msg_lower or "too large" in msg_lower:
+                await message.reply(
+                    "аудио больше 20 МБ — это лимит Telegram bot API"
+                )
+            else:
+                await message.reply("не смог скачать аудио — проверь логи")
+            with contextlib.suppress(OSError):
+                tmp_path.unlink(missing_ok=True)
+            return None
+        except TimeoutError:
+            log.warning(
+                "telegram_audio_download_timeout",
+                path=str(tmp_path),
+                timeout_s=90,
+            )
+            await message.reply(
+                "Telegram не успел отдать аудио за 90 секунд — попробуй ещё раз"
+            )
+            with contextlib.suppress(OSError):
+                tmp_path.unlink(missing_ok=True)
+            return None
+        except Exception as exc:
+            log.exception(
+                "telegram_audio_unexpected_error",
+                path=str(tmp_path),
+                error_type=type(exc).__name__,
+            )
+            await message.reply("произошла внутренняя ошибка обработки аудио")
+            with contextlib.suppress(OSError):
+                tmp_path.unlink(missing_ok=True)
+            return None
+
+        return tmp_path
+
+    async def _on_audio_document(
+        self,
+        message: Message,
+        doc: Any,
+        suffix: str,
+        file_name: str,
+    ) -> None:
+        """Audio file via "send as file" route (e.g. iPhone Voice Memo
+        export)."""
+        if not await self._ensure_sidecar_health(message):
+            return
+        # No reliable duration on the document path — Telegram doesn't
+        # surface it for arbitrary documents. Pass 0 to the ack helper;
+        # the user sees "~5-15 мин" only when source=url, and a
+        # placeholder otherwise.
+        await self._send_pre_lock_ack(
+            message.chat.id,
+            self._format_initial_ack(0, source="audio"),
+        )
+        synthetic = file_name or f"audio_{message.message_id}.{suffix}"
+        tmp_path = await self._download_audio_to_uploads(
+            message,
+            file_obj=doc,
+            synthetic_name=synthetic,
+        )
+        if tmp_path is None:
+            return
+        kind = cast(AttachmentKind, suffix)
+        # MIME hint for the sidecar; ffmpeg uses suffix anyway, but a
+        # correct MIME helps server-side telemetry.
+        mime_hint = (getattr(doc, "mime_type", None) or "").lower() or {
+            "ogg": "audio/ogg",
+            "mp3": "audio/mpeg",
+            "m4a": "audio/mp4",
+            "wav": "audio/wav",
+            "opus": "audio/ogg",
+        }.get(suffix, "application/octet-stream")
+        incoming = IncomingMessage(
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            text=(message.caption or "").strip(),
+            attachment=tmp_path,
+            attachment_kind=kind,
+            attachment_filename=file_name or tmp_path.name,
+            audio_duration=None,
+            audio_mime_type=mime_hint,
+        )
+        await self._dispatch_audio_turn(message.chat.id, incoming)
+
+    async def _dispatch_audio_turn(
+        self,
+        chat_id: int,
+        incoming: IncomingMessage,
+    ) -> None:
+        """Run the audio turn through the standard handler with a manual
+        typing loop instead of ``ChatActionSender`` (H2 closure)."""
+        if self._handler is None:
+            return
+        chunks: list[str] = []
+
+        async def emit(text: str) -> None:
+            chunks.append(text)
+
+        typing_task = asyncio.create_task(self._periodic_typing(chat_id))
+        try:
+            await self._handler.handle(incoming, emit)
+        finally:
+            typing_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await typing_task
 
         full = "".join(chunks).strip() or "(пустой ответ)"
         for part in _split_for_telegram(full, limit=TELEGRAM_MSG_LIMIT):

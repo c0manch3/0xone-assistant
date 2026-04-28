@@ -14,6 +14,37 @@
       "matchUpdateTypes": ["major"],
       "automerge": false,
       "labels": ["needs-review", "security-relevant"]
+    },
+    {
+      "description": "Phase 6c F18: yt-dlp anti-bot signature rotation requires aggressive bumps; auto-merge minor + patch.",
+      "matchFileNames": ["whisper-server/requirements.txt"],
+      "matchPackageNames": ["yt-dlp"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "automerge": true,
+      "platformAutomerge": true
+    },
+    {
+      "description": "Phase 6c F18: review yt-dlp majors manually — extractor APIs change.",
+      "matchFileNames": ["whisper-server/requirements.txt"],
+      "matchPackageNames": ["yt-dlp"],
+      "matchUpdateTypes": ["major"],
+      "automerge": false,
+      "labels": ["needs-review", "yt-dlp-major"]
+    },
+    {
+      "description": "Phase 6c F18: mlx-whisper bumps require Mac smoke; never auto-merge.",
+      "matchFileNames": ["whisper-server/requirements.txt"],
+      "matchPackageNames": ["mlx-whisper"],
+      "automerge": false,
+      "labels": ["needs-review", "mac-smoke-required"]
+    },
+    {
+      "description": "Phase 6c F18: fastapi / uvicorn / pydantic patch + minor auto-merge once sidecar tests live.",
+      "matchFileNames": ["whisper-server/requirements.txt"],
+      "matchPackageNames": ["fastapi", "uvicorn", "pydantic", "pydantic-settings", "python-multipart", "structlog", "httpx"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "automerge": true,
+      "platformAutomerge": true
     }
   ],
   "vulnerabilityAlerts": { "labels": ["security"], "automerge": true }

@@ -36,6 +36,7 @@ from assistant.scheduler.store import (
     unlink_clean_exit_marker,
     write_clean_exit_marker,
 )
+from assistant.services.transcription import TranscriptionService
 from assistant.state.conversations import ConversationStore
 from assistant.state.db import apply_schema, connect
 from assistant.tools_sdk import _installer_core as _core
@@ -339,9 +340,17 @@ class Daemon:
             log.info("orphan_turns_cleaned", count=orphans)
 
         bridge = ClaudeBridge(self._settings)
-        handler = ClaudeHandler(self._settings, store, bridge)
+        # Phase 6c: transcription service is constructed unconditionally
+        # but its ``enabled`` flag is False when no whisper URL/token
+        # is configured. The handler routes audio turns through the
+        # offline-reject path in that case.
+        transcription = TranscriptionService(self._settings)
+        handler = ClaudeHandler(
+            self._settings, store, bridge, transcription=transcription
+        )
         self._adapter = TelegramAdapter(self._settings)
         self._adapter.set_handler(handler)
+        self._adapter.set_transcription(transcription)
 
         # --------------------------------------------------------------
         # Phase 5: scheduler subsystem

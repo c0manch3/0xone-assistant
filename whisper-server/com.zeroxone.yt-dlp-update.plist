@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Phase 6c (H8 closure): daily yt-dlp upgrade job.
+
+  YouTube anti-bot signature rotation requires regular bumps of yt-dlp.
+  This plist runs `pip install -U yt-dlp` daily at 04:00 local time.
+  RunAtLoad=false so a fresh install doesn't redundantly upgrade
+  immediately after setup-mac-sidecar.sh ran.
+
+  No restart of whisper-server needed — yt-dlp is invoked as an
+  external subprocess; new version takes effect on next request.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.zeroxone.yt-dlp-update</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/whisper-server/.venv/bin/pip</string>
+        <string>install</string>
+        <string>-U</string>
+        <string>yt-dlp</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/whisper-server/logs/yt-dlp-update.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/whisper-server/logs/yt-dlp-update.err</string>
+</dict>
+</plist>

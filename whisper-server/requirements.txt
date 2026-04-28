@@ -1,0 +1,18 @@
+# Phase 6c: Mac mini Whisper sidecar dependencies.
+#
+# Floors chosen per research RQ1/RQ3:
+# - mlx-whisper 0.4.x — Apple MLX port, supports Whisper Large v3 Turbo
+# - yt-dlp >= 2026.4.0 — anti-bot countermeasures need fresh extractors
+# - fastapi/uvicorn — pinned to current LTS-style minor windows
+#
+# Python interpreter: 3.12 (see setup-mac-sidecar.sh — we pin away from
+# 3.13 because mlx-whisper transitive deps occasionally lag).
+fastapi>=0.135,<0.140
+uvicorn[standard]>=0.30,<0.40
+mlx-whisper>=0.4,<0.5
+yt-dlp>=2026.4.0
+python-multipart>=0.0.20,<0.1
+pydantic>=2.9,<3
+pydantic-settings>=2.6,<3
+httpx>=0.27,<1
+structlog>=25.1

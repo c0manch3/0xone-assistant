@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Phase 6c: Whisper sidecar launchd LaunchAgent.
+
+  Owner installs this at ~/Library/LaunchAgents/com.zeroxone.whisper-server.plist
+  via setup-mac-sidecar.sh, which substitutes USER + HOME at install time.
+  Loaded with `launchctl bootstrap gui/$(id -u) <plist>`.
+
+  Runs as the owner's user (NOT root). Process exits when the user
+  logs out — Mac mini owners typically run with auto-login enabled, so
+  the sidecar restarts on boot automatically. KeepAlive=true respawns
+  the process if it crashes.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.zeroxone.whisper-server</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/whisper-server/.venv/bin/uvicorn</string>
+        <string>whisper_server.main:app</string>
+        <string>--host</string>
+        <string>0.0.0.0</string>
+        <string>--port</string>
+        <string>9000</string>
+        <string>--workers</string>
+        <string>1</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/whisper-server</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>__HOME__/whisper-server</string>
+        <key>PATH</key>
+        <string>__HOME__/whisper-server/.venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/whisper-server/logs/whisper-server.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/whisper-server/logs/whisper-server.err</string>
+
+    <!-- Mac mini Whisper transcription is bursty + GPU-bound; let
+         macOS scheduler keep it responsive. Default is "Standard". -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <!-- Throttle restart attempts to avoid a tight crash-loop hammering
+         huggingface model download endpoint. 30s grace before respawn. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+</dict>
+</plist>

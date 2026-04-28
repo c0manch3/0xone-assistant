@@ -4,7 +4,7 @@ import os
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -128,11 +128,89 @@ class Settings(BaseSettings):
     memory: MemorySettings = Field(default_factory=MemorySettings)
     scheduler: SchedulerSettings = Field(default_factory=SchedulerSettings)
 
+    # ------------------------------------------------------------------
+    # Phase 6c: voice / audio / URL transcription via Mac mini Whisper.
+    #
+    # Both ``whisper_api_url`` and ``whisper_api_token`` MUST be set
+    # together — see :meth:`_validate_whisper_pair`. When both are
+    # ``None`` the bot's audio handlers reply "Mac sidecar offline" and
+    # the transcription path stays disabled.
+    # ------------------------------------------------------------------
+    whisper_api_url: str | None = None
+    whisper_api_token: str | None = None
+    whisper_timeout: int = 3600
+    yt_dlp_timeout: int = 600
+    voice_vault_threshold_seconds: int = 120
+    voice_meeting_default_area: str = "inbox"
+    # C3 closure: a separate timeout for voice/url Claude turns. Default
+    # 900s (15 min) is enough for the auto-summary turn that follows a
+    # 1-hour transcript; the standard ``claude.timeout`` (300s) stays
+    # the default for text + photo + file paths.
+    claude_voice_timeout: int = 900
+
     @field_validator("project_root", "data_dir", mode="after")
     @classmethod
     def _resolve_absolute(cls, v: Path) -> Path:
         """N2: resolve to absolute so downstream code never sees '.'-relative paths."""
         return v.expanduser().resolve()
+
+    @field_validator("whisper_api_token", mode="after")
+    @classmethod
+    def _validate_whisper_token(cls, v: str | None) -> str | None:
+        """F14 (fix-pack): mirror the Mac-side 32-char minimum.
+
+        The sidecar's ``WhisperSettings`` rejects tokens shorter than
+        32 chars at boot. If the bot side accepts a typo / truncated
+        copy-paste, every transcribe call would fail with a confusing
+        401 in production. Reject early with a useful hint.
+        """
+        if v is None or v == "":
+            return v
+        if len(v) < 32:
+            raise ValueError(
+                "WHISPER_API_TOKEN must be at least 32 chars; "
+                "regenerate via `python -c 'import secrets; "
+                "print(secrets.token_urlsafe(32))'`"
+            )
+        return v
+
+    @field_validator("whisper_api_url", mode="after")
+    @classmethod
+    def _validate_whisper_url(cls, v: str | None) -> str | None:
+        """F14 (fix-pack): require ``http://`` or ``https://`` scheme.
+
+        Empty / None passes through (sidecar simply disabled). A bare
+        hostname like ``mac-mini.tailnet.ts.net:9000`` would otherwise
+        be silently accepted and every request would fail with a
+        confusing httpx ``UnsupportedProtocol``. Catch at boot.
+        """
+        if v is None or v == "":
+            return v
+        if not (v.startswith("http://") or v.startswith("https://")):
+            raise ValueError(
+                "WHISPER_API_URL must start with http:// or https:// "
+                f"(got: {v[:60]!r})"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _validate_whisper_pair(self) -> Settings:
+        """Phase 6c: WHISPER_API_URL and WHISPER_API_TOKEN must move
+        together.
+
+        A half-configured pair (URL set without a token, or vice versa)
+        would either send unauthenticated requests or send authenticated
+        requests to nowhere — both fail in the dark. Surface as a hard
+        configuration error at boot.
+        """
+        url_set = bool(self.whisper_api_url)
+        tok_set = bool(self.whisper_api_token)
+        if url_set != tok_set:
+            raise ValueError(
+                "WHISPER_API_URL and WHISPER_API_TOKEN must both be set "
+                "or both unset"
+            )
+        return self
 
     def model_post_init(self, __context: object) -> None:
         """Warn (not fail) if ``scheduler.sent_revert_timeout_s`` is

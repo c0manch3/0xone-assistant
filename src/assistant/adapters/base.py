@@ -21,12 +21,25 @@ from typing import Any, Literal, Protocol
 AttachmentKind = Literal[
     "pdf", "docx", "txt", "md", "xlsx",
     "jpg", "jpeg", "png", "webp", "heic", "heif",
+    # Phase 6c: audio kinds. ``ogg`` covers Telegram native voice (always
+    # OGG/Opus); the rest are common attachment formats. They route
+    # through ``assistant.services.transcription`` rather than the
+    # ``EXTRACTORS`` dispatch table.
+    "ogg", "mp3", "m4a", "wav", "opus",
 ]
 
 # Phase 6b: image-only subset, used by the handler to branch into the
 # vision pipeline before the extract dispatch.
 IMAGE_KINDS: frozenset[str] = frozenset(
     {"jpg", "jpeg", "png", "webp", "heic", "heif"}
+)
+
+# Phase 6c: audio-only subset. The handler's audio branch fires when
+# ``attachment_kind in AUDIO_KINDS`` OR when ``url_for_extraction`` is
+# non-None (yt-dlp URL extraction). Routed BEFORE the image / extract
+# branches in ``_handle_locked``.
+AUDIO_KINDS: frozenset[str] = frozenset(
+    {"ogg", "mp3", "m4a", "wav", "opus"}
 )
 
 # ---------------------------------------------------------------------------
@@ -84,6 +97,36 @@ class IncomingMessage:
     # photo. Single-photo + non-image-document construction stays
     # unchanged from 6a.
     attachment_paths: list[Path] | None = None
+    # Phase 6c: audio metadata. Set by the Telegram adapter's voice /
+    # audio / audio-document handlers. ``audio_duration`` comes from
+    # ``message.voice.duration`` / ``message.audio.duration``; for the
+    # ``audio-document`` route Telegram does not expose a duration so
+    # the field is ``None`` (handler later reads it from the Whisper
+    # response). ``audio_mime_type`` defaults to ``"audio/ogg"`` for
+    # voice messages and is ``None`` when unknown.
+    audio_duration: int | None = None
+    audio_mime_type: str | None = None
+    # Phase 6c: when set, the handler's audio branch routes through the
+    # Mac sidecar's ``/extract`` endpoint (yt-dlp + Whisper) instead of
+    # the standard ``/transcribe``. ``attachment`` MUST be ``None`` in
+    # this case — there is no local file to upload.
+    url_for_extraction: str | None = None
+
+    def __post_init__(self) -> None:
+        """Phase 6c F10 (fix-pack): enforce mutually-exclusive fields.
+
+        ``attachment`` (a downloaded local file) and
+        ``url_for_extraction`` (a remote URL fetched server-side via
+        yt-dlp) cannot both be set on the same turn — they represent
+        two different audio sources and the handler's audio branch
+        would otherwise have to guess which to honour. Fail fast at
+        construction to catch any future caller that violates the
+        contract.
+        """
+        if self.attachment is not None and self.url_for_extraction is not None:
+            raise AssertionError(
+                "attachment and url_for_extraction are mutually exclusive"
+            )
 
 
 class MessengerAdapter(ABC):

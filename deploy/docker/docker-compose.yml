@@ -11,6 +11,62 @@
 #     sidecar fills that gap (W2-H3).
 
 services:
+  # ----------------------------------------------------------------
+  # Phase 6c: Tailscale sidecar.
+  #
+  # Provides a private mesh tunnel from the bot container to the Mac
+  # mini whisper-server. The bot container shares this sidecar's
+  # network namespace via ``network_mode: "service:tailscale"`` so it
+  # can reach ``http://<mac-magicdns>:9000`` via MagicDNS.
+  #
+  # ``TS_AUTHKEY`` is a one-time auth key generated in the Tailscale
+  # admin console with tag ``tag:bot-vps`` preauthorized + ephemeral=
+  # false + reusable=false. Stored in ~/.config/0xone-assistant/
+  # secrets.env on the VPS (mode 600, NOT in git).
+  # ----------------------------------------------------------------
+  tailscale:
+    image: tailscale/tailscale:stable
+    container_name: 0xone-tailscale
+    hostname: bot-vps
+    # F4 (fix-pack): each service consumes its OWN secrets file.
+    # Sharing one ``secrets.env`` between tailscale and the bot leaked
+    # ``WHISPER_API_TOKEN`` into the tailscale container's env (and
+    # ``TS_AUTHKEY`` into the bot container's env). Both are visible
+    # via ``docker inspect`` to anyone with the docker socket. Splitting
+    # gives each service the principle-of-least-privilege view.
+    env_file:
+      - path: ${HOME}/.config/0xone-assistant/secrets-tailscale.env
+        required: true
+    environment:
+      TS_EXTRA_ARGS: "--advertise-tags=tag:bot-vps"
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "false"
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    restart: unless-stopped
+    # F16 (fix-pack): dedicated healthcheck so the bot service can
+    # wait on tailscale being authenticated + Backend=Running before
+    # it boots — otherwise a cold deploy races and the very first
+    # outbound /health call from the bot fails with ConnectError.
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "tailscale status --peers=false --json | grep -q '\"BackendState\":\"Running\"'"
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 6
+    labels:
+      # Restart by autoheal on prolonged unhealthy.
+      - "autoheal=true"
+    # Modest resource cap. Tailscale is event-driven; 200 MB is plenty.
+    mem_limit: 200m
+    cpus: 0.5
+
   0xone-assistant:
     # TAG MUST be set in deploy/docker/.env (e.g. TAG=phase5d-rc1 or
     # TAG=sha-abc1234). The :? form fails compose loudly if unset
@@ -18,10 +74,25 @@ services:
     image: ghcr.io/c0manch3/0xone-assistant:${TAG:?set TAG in deploy/docker/.env, e.g. TAG=phase5d or TAG=sha-abc1234}
     container_name: 0xone-assistant
     restart: unless-stopped
+    # Phase 6c: share the tailscale sidecar's network namespace so
+    # ``WHISPER_API_URL`` can resolve via MagicDNS.
+    network_mode: "service:tailscale"
+    # F16 (fix-pack): wait for tailscale to be healthy (Backend=Running)
+    # before booting the bot. Cold-deploy race otherwise: bot started
+    # before tailscale authenticated → first egress /health fails.
+    depends_on:
+      tailscale:
+        condition: service_healthy
 
     # env_file object form (W2-C2). Compose v2.20+ supports per-entry
     # `required: false`. Simple-list form errors fast on missing file
     # — undesirable for the optional GH_TOKEN bag.
+    #
+    # F4 (fix-pack): bot consumes ``secrets.env`` (WHISPER_API_TOKEN,
+    # GH_TOKEN). The Tailscale ``TS_AUTHKEY`` lives in a separate file
+    # (``secrets-tailscale.env``) wired to the tailscale service ONLY,
+    # so ``docker inspect 0xone-assistant`` no longer reveals the
+    # tailscale auth key.
     env_file:
       - path: ${HOME}/.config/0xone-assistant/.env
         required: true
@@ -132,3 +203,9 @@ services:
       interval: 60s
       timeout: 5s
       retries: 3
+
+# Phase 6c: tailscale state persists between container restarts.
+# Without a named volume, every restart triggers a fresh node
+# registration and the bot disappears from the tailnet briefly.
+volumes:
+  tailscale-state:

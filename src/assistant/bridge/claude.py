@@ -219,6 +219,7 @@ class ClaudeBridge:
         *,
         system_notes: list[str] | None = None,
         image_blocks: list[dict[str, Any]] | None = None,
+        timeout_override: int | None = None,
     ) -> AsyncIterator[Any]:
         """Stream blocks + the terminal ``ResultMessage`` for one turn.
 
@@ -248,6 +249,14 @@ class ClaudeBridge:
         VERIFIED for image content via the RQ0 spike at
         ``plan/phase6b/spikes/rq0_multimodal/probe.py`` (PASS
         2026-04-27). Non-vision callers retain the plain-string path.
+
+        Phase 6c (C3 closure): ``timeout_override`` lets the audio
+        handler raise the ``asyncio.timeout`` ceiling above the default
+        ``settings.claude.timeout`` (300s) for voice/url turns whose
+        auto-summary may run 5-15 minutes on a 1-hour transcript. When
+        ``None`` the default is used; non-voice paths must NOT pass it.
+        The semaphore (``settings.claude.max_concurrent``) is unchanged
+        — voice turns simply hold the slot longer.
         """
         opts = self._build_options(system_prompt=self._render_system_prompt())
         if system_notes:
@@ -287,9 +296,24 @@ class ClaudeBridge:
             }
 
         last_model: str | None = None
+        timeout_s = (
+            timeout_override
+            if timeout_override is not None
+            else self._settings.claude.timeout
+        )
+        if (
+            timeout_override is not None
+            and timeout_override != self._settings.claude.timeout
+        ):
+            log.info(
+                "claude_ask_timeout_override",
+                chat_id=chat_id,
+                timeout_s=timeout_s,
+                default_timeout_s=self._settings.claude.timeout,
+            )
         async with self._sem:
             try:
-                async with asyncio.timeout(self._settings.claude.timeout):
+                async with asyncio.timeout(timeout_s):
                     async for message in _safe_query(prompt=prompt_stream(), options=opts):
                         if isinstance(message, SystemMessage) and message.subtype == "init":
                             log.info(
@@ -338,7 +362,7 @@ class ClaudeBridge:
                 log.warning(
                     "timeout",
                     chat_id=chat_id,
-                    timeout_s=self._settings.claude.timeout,
+                    timeout_s=timeout_s,
                 )
                 raise ClaudeBridgeError("timeout") from exc
             except Exception as exc:

@@ -41,6 +41,7 @@ dev = [
   # Phase 6a: openpyxl types so the strict mypy gate is happy with
   # ``load_workbook`` / ``Worksheet`` calls in extract.py.
   "types-openpyxl>=3.1,<4",
+  "pytest-timeout>=2.4.0",
 ]
 
 [build-system]
@@ -96,6 +97,19 @@ select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF", "ASYNC"]
 # anyio path to swap in (the suppress block guards OSError), and the
 # I/O here is bounded to one stat+unlink per overflow photo.
 "src/assistant/adapters/media_group.py" = ["ASYNC240"]
+# Phase 6c: Russian transliteration table + Russian replies ship
+# Cyrillic glyphs deliberately. Same allowance as memory_*.
+"src/assistant/memory/store.py" = ["RUF001", "RUF002", "RUF003"]
+"src/assistant/handlers/message.py" = ["RUF001", "RUF002", "RUF003"]
+"src/assistant/services/transcription.py" = ["RUF001", "RUF002", "RUF003"]
+"src/assistant/adapters/telegram.py" = ["RUF001", "RUF002", "RUF003"]
+"tests/test_memory_store_save_transcript.py" = ["RUF001", "RUF002", "RUF003"]
+"tests/test_handler_audio_branch.py" = ["RUF001", "RUF002", "RUF003"]
+"tests/test_telegram_voice_handler.py" = [
+    "RUF001", "RUF002", "RUF003", "ASYNC109", "ASYNC240"
+]
+"tests/test_transcription_service.py" = ["RUF001", "RUF002", "RUF003"]
+"tests/test_bridge_ask_timeout_override.py" = ["RUF001", "RUF002", "RUF003"]
 
 [tool.mypy]
 strict = true
