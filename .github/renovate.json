@@ -45,6 +45,20 @@
       "matchUpdateTypes": ["minor", "patch"],
       "automerge": true,
       "platformAutomerge": true
+    },
+    {
+      "description": "Phase 6 F7: SDK minor + patch bumps require runtime respike. The subagent contract (last_assistant_message field, agent_id propagation, TaskNotificationMessage status shape) lives in the bundled CLI binary that ships inside the wheel — wheel SHA can change in lockstep with hidden binary behaviour shifts. Block auto-merge.",
+      "matchPackageNames": ["claude-agent-sdk"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "automerge": false,
+      "labels": ["needs-review", "sdk-respike-required"]
+    },
+    {
+      "description": "Phase 6 F7: SDK majors NEVER auto-merge — full subagent contract revalidation required.",
+      "matchPackageNames": ["claude-agent-sdk"],
+      "matchUpdateTypes": ["major"],
+      "automerge": false,
+      "labels": ["needs-review", "sdk-major"]
     }
   ],
   "vulnerabilityAlerts": { "labels": ["security"], "automerge": true }

@@ -53,7 +53,13 @@ Emit = Callable[[str], Awaitable[None]]
 # Phase 5: the handler now receives messages from two sources — the live
 # Telegram adapter AND the scheduler dispatcher. ``origin`` lets the
 # handler branch on provenance without sniffing ``chat_id`` or ``meta``.
-Origin = Literal["telegram", "scheduler"]
+#
+# Phase 6 (research RQ8): ``"picker"`` is the SubagentRequestPicker
+# origin. Picker dispatches go through ``ClaudeHandler`` so the
+# resulting Task-tool delegation lands in ``conversations`` for owner
+# forensics — but they SHOULD NOT trigger the scheduler-origin notice
+# branch (no scheduler trigger row exists for them).
+Origin = Literal["telegram", "scheduler", "picker"]
 
 
 @dataclass(frozen=True)

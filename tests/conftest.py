@@ -70,6 +70,21 @@ def _reset_scheduler_ctx() -> Iterator[None]:
     reset_scheduler_for_tests()
 
 
+@pytest.fixture(autouse=True)
+def _reset_subagent_ctx() -> Iterator[None]:
+    """Reset the subagent module state so each test starts clean.
+
+    Phase 6 — mirrors the scheduler / memory autouse fixtures so tests
+    that build a tmp-path SubagentStore can re-call configure_subagent
+    without RuntimeError.
+    """
+    from assistant.tools_sdk.subagent import reset_subagent_for_tests
+
+    reset_subagent_for_tests()
+    yield
+    reset_subagent_for_tests()
+
+
 class FakeClock:
     """Deterministic clock for async tick-loop tests (RQ4).
 

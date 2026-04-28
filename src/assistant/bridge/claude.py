@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import AsyncIterable, AsyncIterator
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from claude_agent_sdk import (
+    AgentDefinition,
     AssistantMessage,
     ClaudeAgentOptions,
     HookMatcher,
@@ -40,6 +41,10 @@ from assistant.tools_sdk.memory import MEMORY_SERVER, MEMORY_TOOL_NAMES
 from assistant.tools_sdk.scheduler import (
     SCHEDULER_SERVER,
     SCHEDULER_TOOL_NAMES,
+)
+from assistant.tools_sdk.subagent import (
+    SUBAGENT_SERVER,
+    SUBAGENT_TOOL_NAMES,
 )
 
 log = get_logger("bridge.claude")
@@ -107,9 +112,29 @@ class ClaudeBridge:
         ``ResultMessage``.
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        extra_hooks: dict[str, list[HookMatcher]] | None = None,
+        agents: dict[str, AgentDefinition] | None = None,
+    ) -> None:
+        """Phase 6 (research RQ1 + RQ2): ``extra_hooks`` is a dict
+        keyed by SDK hook event name (``"SubagentStart"``,
+        ``"SubagentStop"``, ``"PreToolUse"``, ...) merged into the
+        bridge's own hook registry. ``"PreToolUse"`` matchers are
+        UNIONED with the existing phase-3 sandbox; other keys overwrite
+        any prior entry.
+
+        ``agents`` is the per-kind :class:`AgentDefinition` registry
+        from :func:`build_agents`. When non-None, ``"Task"`` is added
+        to ``allowed_tools`` so the model can delegate; otherwise the
+        Task tool is hidden (avoids a "no targets" model confusion).
+        """
         self._settings = settings
         self._sem = asyncio.Semaphore(settings.claude.max_concurrent)
+        self._extra_hooks = extra_hooks or {}
+        self._agents = agents
 
     # ------------------------------------------------------------------
     # Options assembly
@@ -130,14 +155,31 @@ class ClaudeBridge:
         """
         pr = self._settings.project_root
         dd = self._settings.data_dir
-        hooks: dict[HookEventName, list[HookMatcher]] = {
-            "PreToolUse": [
-                HookMatcher(matcher="Bash", hooks=[make_bash_hook(pr)]),
-                *[HookMatcher(matcher=t, hooks=[make_file_hook(pr)]) for t in FILE_TOOL_NAMES],
-                HookMatcher(matcher="WebFetch", hooks=[make_webfetch_hook()]),
+        base_pretool: list[HookMatcher] = [
+            HookMatcher(matcher="Bash", hooks=[make_bash_hook(pr)]),
+            *[
+                HookMatcher(matcher=t, hooks=[make_file_hook(pr)])
+                for t in FILE_TOOL_NAMES
             ],
+            HookMatcher(matcher="WebFetch", hooks=[make_webfetch_hook()]),
+        ]
+        hooks: dict[HookEventName, list[HookMatcher]] = {
+            "PreToolUse": base_pretool,
             "PostToolUse": make_posttool_hooks(pr, dd),
         }
+        # Phase 6 / research RQ1: merge subagent / future hooks.
+        # PreToolUse is UNIONED so the cancel-flag-poll layers on top of
+        # the phase-3 sandbox; other event keys are extended with
+        # setdefault so multiple producers can co-exist.
+        for event, matchers in self._extra_hooks.items():
+            if not matchers:
+                continue
+            if event == "PreToolUse":
+                hooks["PreToolUse"] = list(hooks["PreToolUse"]) + list(matchers)
+            else:
+                key = cast(HookEventName, event)
+                existing = hooks.get(key, [])
+                hooks[key] = list(existing) + list(matchers)
         thinking_kwargs: dict[str, Any] = {}
         if self._settings.claude.thinking_budget > 0:
             thinking_kwargs["max_thinking_tokens"] = self._settings.claude.thinking_budget
@@ -148,35 +190,44 @@ class ClaudeBridge:
             "append": system_prompt,
             "exclude_dynamic_sections": True,  # stable system prompt → stable cache
         }
-        return ClaudeAgentOptions(
-            cwd=str(pr),
-            setting_sources=["project"],
-            max_turns=self._settings.claude.max_turns,
-            # S6 fix (wave-2): derive installer tool names from the
-            # installer module's constant instead of duplicating here;
-            # adding a new @tool now requires only one edit in installer.py.
-            allowed_tools=[
-                "Bash",
-                "Read",
-                "Write",
-                "Edit",
-                "Glob",
-                "Grep",
-                "WebFetch",
-                "Skill",
-                *INSTALLER_TOOL_NAMES,
-                *MEMORY_TOOL_NAMES,
-                *SCHEDULER_TOOL_NAMES,
-            ],
-            mcp_servers={
-                "installer": INSTALLER_SERVER,
-                "memory": MEMORY_SERVER,
-                "scheduler": SCHEDULER_SERVER,
-            },
-            hooks=hooks,
-            system_prompt=system_prompt_preset,
+        # Phase 6: subagent surface — @tool always advertised; native
+        # ``Task`` tool added ONLY when an AgentDefinition registry is
+        # passed (research RQ1, pitfall #6).
+        allowed_tools: list[str] = [
+            "Bash",
+            "Read",
+            "Write",
+            "Edit",
+            "Glob",
+            "Grep",
+            "WebFetch",
+            "Skill",
+            *INSTALLER_TOOL_NAMES,
+            *MEMORY_TOOL_NAMES,
+            *SCHEDULER_TOOL_NAMES,
+            *SUBAGENT_TOOL_NAMES,
+        ]
+        if self._agents:
+            allowed_tools.append("Task")
+        mcp_servers = {
+            "installer": INSTALLER_SERVER,
+            "memory": MEMORY_SERVER,
+            "scheduler": SCHEDULER_SERVER,
+            "subagent": SUBAGENT_SERVER,
+        }
+        opts_kwargs: dict[str, Any] = {
+            "cwd": str(pr),
+            "setting_sources": ["project"],
+            "max_turns": self._settings.claude.max_turns,
+            "allowed_tools": allowed_tools,
+            "mcp_servers": mcp_servers,
+            "hooks": hooks,
+            "system_prompt": system_prompt_preset,
             **thinking_kwargs,
-        )
+        }
+        if self._agents:
+            opts_kwargs["agents"] = self._agents
+        return ClaudeAgentOptions(**opts_kwargs)
 
     def _render_system_prompt(self) -> str:
         self._check_skills_sentinel()

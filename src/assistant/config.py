@@ -109,6 +109,48 @@ class SchedulerSettings(BaseSettings):
     reclaim_older_than_s: int = 30
 
 
+class SubagentSettings(BaseSettings):
+    """Phase-6 subagent pool knobs (``ASSISTANT_SUBAGENT_*`` env prefix).
+
+    Intentionally small — SDK manages subagent lifecycle through the
+    native ``AgentDefinition`` registry; we tune only the ledger
+    cadence, notify behaviour, and per-kind ``maxTurns`` ceilings.
+
+    ``picker_tick_s`` is how often :class:`SubagentRequestPicker`
+    polls the ``subagent_jobs`` ledger for ``status='requested'``
+    rows. ``orphan_stale_s`` is the bucket for the recover_orphans
+    Branch 3 (drop ``requested`` rows older than this on boot — see
+    research RQ4). ``max_depth=1`` is defensive; the real cap is
+    enforced by :func:`build_agents` omitting ``"Task"`` from each
+    agent's tool list.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="ASSISTANT_SUBAGENT_",
+        env_file=[_user_env_file(), Path(".env")],
+        extra="ignore",
+    )
+    enabled: bool = True
+    picker_tick_s: float = 1.0
+    orphan_stale_s: int = 3600
+    max_depth: int = 1
+    notify_throttle_ms: int = 500
+    result_body_max_bytes: int = 32_768
+    max_turns_general: int = 20
+    max_turns_worker: int = 5
+    max_turns_researcher: int = 15
+    # Fix-pack F8 (devops MEDIUM): bumped from 2.0 → 5.0 so a
+    # SubagentStop notify whose Telegram chunked-send touches the
+    # 4096-char body limit (HTTP RTT + chunk reassembly + retries) has
+    # room to land before ``Daemon.stop`` cancels the gather. 2s was
+    # tight; CI-recorded p95 ranges up to 3.4s on a busy VPS.
+    drain_timeout_s: float = 5.0
+    # Picker dispatches use this ceiling via bridge.ask(timeout_override=...).
+    # Mirrors phase 6c ``claude_voice_timeout`` but kept distinct so future
+    # tuning of one path does not collaterally move the other.
+    claude_subagent_timeout: int = 900
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=[_user_env_file(), Path(".env")],
@@ -127,6 +169,7 @@ class Settings(BaseSettings):
     claude: ClaudeSettings = Field(default_factory=ClaudeSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     scheduler: SchedulerSettings = Field(default_factory=SchedulerSettings)
+    subagent: SubagentSettings = Field(default_factory=SubagentSettings)
 
     # ------------------------------------------------------------------
     # Phase 6c: voice / audio / URL transcription via Mac mini Whisper.

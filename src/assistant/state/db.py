@@ -4,7 +4,7 @@ from pathlib import Path
 
 import aiosqlite
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_0001 = """
 CREATE TABLE IF NOT EXISTS conversations (
@@ -199,6 +199,71 @@ async def _apply_0003(conn: aiosqlite.Connection) -> None:
         raise
 
 
+async def _apply_0004(conn: aiosqlite.Connection) -> None:
+    """Phase 6: ``subagent_jobs`` ledger.
+
+    Single table; partial UNIQUE on ``sdk_agent_id`` lets pre-picker
+    rows carry NULL while preventing duplicate Start fires for any
+    real agent_id (research RQ7 / B-W2-3). Status machine documented
+    on the migration SQL.
+
+    Idempotent under ``BEGIN EXCLUSIVE``. Bumps ``user_version``
+    inside the same transaction so a crash mid-DDL rolls us back to
+    v=3 cleanly. ``executescript`` is avoided (it implicit-COMMITs
+    inside an open BEGIN — phase-2 lesson B2).
+    """
+    if await _current_version(conn) >= 4:
+        return
+    try:
+        await conn.execute("BEGIN EXCLUSIVE")
+        await conn.execute(
+            "CREATE TABLE IF NOT EXISTS subagent_jobs ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "sdk_agent_id TEXT, "
+            "sdk_session_id TEXT, "
+            "parent_session_id TEXT, "
+            "agent_type TEXT NOT NULL, "
+            "task_text TEXT, "
+            "transcript_path TEXT, "
+            "status TEXT NOT NULL DEFAULT 'started', "
+            "cancel_requested INTEGER NOT NULL DEFAULT 0, "
+            "result_summary TEXT, "
+            "cost_usd REAL, "
+            "callback_chat_id INTEGER NOT NULL, "
+            "spawned_by_kind TEXT NOT NULL, "
+            "spawned_by_ref TEXT, "
+            # Fix-pack F1 (code H1 / devil C-W2-4 / QA HIGH-3): picker
+            # dispatch attempt counter + last error so a row that keeps
+            # failing (claude CLI down, model refusal) flips to 'error'
+            # after the threshold instead of looping forever.
+            "attempts INTEGER NOT NULL DEFAULT 0, "
+            "last_error TEXT, "
+            "created_at TEXT NOT NULL DEFAULT "
+            "(strftime('%Y-%m-%dT%H:%M:%SZ','now')), "
+            "started_at TEXT, "
+            "finished_at TEXT)"
+        )
+        await conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "idx_subagent_jobs_sdk_agent_id_uq "
+            "ON subagent_jobs(sdk_agent_id) "
+            "WHERE sdk_agent_id IS NOT NULL"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_subagent_jobs_status_started "
+            "ON subagent_jobs(status, started_at)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_subagent_jobs_status_created "
+            "ON subagent_jobs(status, created_at)"
+        )
+        await conn.execute("PRAGMA user_version=4")
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+
+
 async def apply_schema(conn: aiosqlite.Connection) -> None:
     current = await _current_version(conn)
     if current < 1:
@@ -207,3 +272,5 @@ async def apply_schema(conn: aiosqlite.Connection) -> None:
         await _apply_0002(conn)
     if current < 3:
         await _apply_0003(conn)
+    if current < 4:
+        await _apply_0004(conn)

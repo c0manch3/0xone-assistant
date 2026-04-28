@@ -449,6 +449,62 @@ Compose's `stop_grace_period: 35s` only applies to `docker stop` /
 
 Then `sudo systemctl restart docker`.
 
+## Phase 6 — Subagent infrastructure
+
+Phase 6 ships SDK-native subagents (general / worker / researcher) plus
+an asynchronous ``@tool`` surface so the model can delegate
+> ~30 s tasks to a background dispatcher. New deploy-relevant surface:
+
+### New env vars (all `ASSISTANT_SUBAGENT_*` — defaults are safe)
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `ASSISTANT_SUBAGENT_ENABLED` | `true` | Master switch. `false` disables the `Task` tool advertisement, the @tool surface, and the picker. |
+| `ASSISTANT_SUBAGENT_PICKER_TICK_S` | `1.0` | How often the picker polls `subagent_jobs` for `status='requested'` rows. |
+| `ASSISTANT_SUBAGENT_ORPHAN_STALE_S` | `3600` | Boot-recovery `Branch 3` cutoff: `requested` rows older than this on boot are dropped silently. |
+| `ASSISTANT_SUBAGENT_NOTIFY_THROTTLE_MS` | `500` | Min interval between back-to-back SubagentStop notify sends to one chat. |
+| `ASSISTANT_SUBAGENT_RESULT_BODY_MAX_BYTES` | `32768` | Max UTF-8 bytes of the subagent's last assistant message embedded in the Telegram notify. |
+| `ASSISTANT_SUBAGENT_DRAIN_TIMEOUT_S` | `5.0` | How long `Daemon.stop` waits for in-flight SubagentStop notify tasks before timing out. (Fix-pack F8 raised this from 2.0 to 5.0 to cover Telegram chunked-send tail latency.) |
+| `ASSISTANT_SUBAGENT_CLAUDE_SUBAGENT_TIMEOUT` | `900` | `bridge.ask` `timeout_override` used by the picker when dispatching a queued subagent job. |
+| `ASSISTANT_SUBAGENT_MAX_TURNS_GENERAL` / `_WORKER` / `_RESEARCHER` | `20` / `5` / `15` | Per-kind `maxTurns` ceiling on the SDK `AgentDefinition`. |
+
+### `subagent_jobs` table
+
+Schema v4 ledger; one row per delegated job. Columns relevant to ops:
+
+| Column | Meaning |
+|--------|---------|
+| `status` | `requested → started → (completed|failed|stopped|interrupted|error|dropped)`. `error` is the picker-dispatch dead-letter (after `attempts ≥ 3`). |
+| `attempts` | Picker dispatch attempt counter — increments on bridge failure or model-no-tool. |
+| `last_error` | Most recent picker / Stop hook failure text (≤ 500 chars). |
+| `cancel_requested` | Owner-clicked cancel via `subagent_cancel`. Cancel-before-pickup transitions the row directly to `stopped` (Fix-pack F1). |
+| `spawned_by_kind` | `user` (owner Task) / `tool` (subagent_spawn) / `scheduler` (scheduler-fired turn delegated to subagent). |
+
+### Boot recovery log lines
+
+On every daemon start the picker runs `recover_orphans` against the
+ledger. Three branches, deterministic order:
+
+```
+subagent_orphans_recovered interrupted=N dropped_no_sdk=M dropped_stale=K
+```
+
+Interpretation:
+
+* `interrupted=N` — N rows had `status='started'` AND `sdk_agent_id IS NOT NULL` AND `finished_at IS NULL` at boot. The previous daemon ran a real subagent that did not flush its result; we marked them `interrupted` and Telegram-notified the owner so they can decide whether to respawn.
+* `dropped_no_sdk=M` — Branch-1 orphans (status='started' AND sdk_agent_id IS NULL); the picker began a record but the SDK never fired SubagentStart before crash. Silent drop.
+* `dropped_stale=K` — Branch-3 orphans (status='requested' older than `ORPHAN_STALE_S`). Silent drop; owner has moved on.
+
+### Troubleshooting
+
+| Symptom | Likely cause / fix |
+|---------|--------------------|
+| `subagent_orphans_interrupted: N` notify on boot | Previous daemon crashed mid-subagent. The N value is informational; respawn manually if the work was important. |
+| `picker_dispatch_failed reason=bridge:` log spam | OAuth-failure storm signature — claude CLI cannot reach Anthropic. Check `claude_cli_not_authenticated` log lines and re-run `claude login` on the host. |
+| `picker_dispatch_failed reason=model did not invoke Task tool` | Model returned without calling `Task(...)`. Usually a refusal or a subagent_spawn invocation that hit a permission deny. Check the surrounding turn for the model's stub response. After 3 such consecutive failures the row goes `error` and the owner is notified. |
+| `subagent_finished_via_race_recovery` | Stop hook beat Start hook to the commit on a picker-claimed row (Fix-pack F5). Self-healing — informational only. |
+| `subagent_finished_skew` | Stop hook fired for an `sdk_agent_id` we have no record of. Almost always a SubagentStart that was rejected by the partial UNIQUE on a duplicate. Informational. |
+
 ## Phase 9 hardening (deferred)
 
 Tracked in `plan/phase5d/description.md §M`:

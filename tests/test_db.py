@@ -7,9 +7,9 @@ from assistant.state.db import SCHEMA_VERSION, apply_schema, connect
 
 
 async def test_schema_bootstrap(tmp_path: Path) -> None:
-    """Phase-1 schema smoke, adjusted through phase-5 (schema v3).
+    """Phase-1 schema smoke, adjusted through phase 6 (schema v4).
 
-    Verifies: WAL mode on, user_version == SCHEMA_VERSION (3 in phase 5b),
+    Verifies: WAL mode on, user_version == SCHEMA_VERSION (4 in phase 6),
     apply_schema idempotent, append() returns a valid row id.
     """
     db = tmp_path / "test.db"
@@ -25,7 +25,7 @@ async def test_schema_bootstrap(tmp_path: Path) -> None:
         row = await cur.fetchone()
         assert row is not None
         assert row[0] == SCHEMA_VERSION
-        assert SCHEMA_VERSION == 3
+        assert SCHEMA_VERSION == 4
 
     # Idempotency
     await apply_schema(conn)

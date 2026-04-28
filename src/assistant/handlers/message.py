@@ -313,7 +313,20 @@ class ClaudeHandler:
     async def handle(self, msg: IncomingMessage, emit: Emit) -> None:
         lock = await self._lock_for(msg.chat_id)
         async with lock:
-            await self._handle_locked(msg, emit)
+            # Fix-pack F2 (QA HIGH-1): pin the originating-turn origin
+            # for the duration of this handler so deeper layers
+            # (subagent_spawn @tool, native Task Start hook) can tag
+            # ``spawned_by_kind="scheduler"`` correctly. Setting before
+            # the lock would leak the value across overlapping handlers
+            # for different chats; setting inside the lock keeps the
+            # ContextVar scope tied to the active turn.
+            from assistant.subagent.hooks import CURRENT_TURN_ORIGIN
+
+            token = CURRENT_TURN_ORIGIN.set(msg.origin)
+            try:
+                await self._handle_locked(msg, emit)
+            finally:
+                CURRENT_TURN_ORIGIN.reset(token)
 
     async def _handle_locked(self, msg: IncomingMessage, emit: Emit) -> None:
         turn_id = await self._conv.start_turn(msg.chat_id)

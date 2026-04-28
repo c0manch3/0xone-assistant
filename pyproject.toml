@@ -110,6 +110,11 @@ select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF", "ASYNC"]
 ]
 "tests/test_transcription_service.py" = ["RUF001", "RUF002", "RUF003"]
 "tests/test_bridge_ask_timeout_override.py" = ["RUF001", "RUF002", "RUF003"]
+# Phase 6 picker tests: integration-style polling with a wall-clock
+# deadline mirrors how the daemon actually exercises the loop; the
+# asyncio.Event alternative would require leaking the picker's stop
+# event, which is intentionally private.
+"tests/test_subagent_picker.py" = ["ASYNC110"]
 
 [tool.mypy]
 strict = true

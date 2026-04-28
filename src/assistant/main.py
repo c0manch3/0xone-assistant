@@ -39,10 +39,15 @@ from assistant.scheduler.store import (
 from assistant.services.transcription import TranscriptionService
 from assistant.state.conversations import ConversationStore
 from assistant.state.db import apply_schema, connect
+from assistant.subagent import build_agents
+from assistant.subagent.hooks import make_subagent_hooks
+from assistant.subagent.picker import SubagentRequestPicker
+from assistant.subagent.store import SubagentStore
 from assistant.tools_sdk import _installer_core as _core
 from assistant.tools_sdk import installer as _installer_mod
 from assistant.tools_sdk import memory as _memory_mod
 from assistant.tools_sdk import scheduler as _scheduler_mod
+from assistant.tools_sdk import subagent as _subagent_mod
 
 log = get_logger("main")
 
@@ -208,6 +213,10 @@ class Daemon:
         self._sched_loop: SchedulerLoop | None = None
         self._sched_dispatcher: SchedulerDispatcher | None = None
         self._sched_queue: asyncio.Queue[ScheduledTrigger] | None = None
+        # Phase 6: subagent infrastructure (post-wipe restoration).
+        self._sub_store: SubagentStore | None = None
+        self._sub_picker: SubagentRequestPicker | None = None
+        self._sub_pending_updates: set[asyncio.Task[Any]] = set()
 
     async def _preflight_claude_auth(self) -> None:
         """Fail-fast if the ``claude`` CLI is missing or unauthenticated.
@@ -339,18 +348,89 @@ class Daemon:
         if orphans:
             log.info("orphan_turns_cleaned", count=orphans)
 
-        bridge = ClaudeBridge(self._settings)
+        # Phase 6: subagent ledger + orphan recovery BEFORE bridge
+        # construction so the bridge sees the correct schema state and
+        # the picker (started later) inherits a clean ledger.  Recovery
+        # is a 3-branch UPDATE — research RQ4 / devil H-7.
+        self._sub_store = SubagentStore(self._conn)
+        recovery = await self._sub_store.recover_orphans(
+            stale_requested_after_s=self._settings.subagent.orphan_stale_s
+        )
+        if recovery.total > 0:
+            log.warning(
+                "subagent_orphans_recovered",
+                interrupted=recovery.interrupted,
+                dropped_no_sdk=recovery.dropped_no_sdk,
+                dropped_stale=recovery.dropped_stale,
+            )
+
+        # Phase 6: configure the @tool surface BEFORE bridge construction
+        # — the bridge imports SUBAGENT_SERVER at module load and the
+        # @tool handlers need ``store`` resolved at call time through the
+        # shared ``_CTX`` dict (mirror of installer/memory/scheduler).
+        _subagent_mod.configure_subagent(
+            store=self._sub_store,
+            owner_chat_id=self._settings.owner_chat_id,
+            settings=self._settings,
+        )
+
         # Phase 6c: transcription service is constructed unconditionally
         # but its ``enabled`` flag is False when no whisper URL/token
         # is configured. The handler routes audio turns through the
         # offline-reject path in that case.
         transcription = TranscriptionService(self._settings)
+
+        # Phase 6: subagent hook factory + AgentDefinition registry.
+        # Built BEFORE bridges so both user-chat and picker bridges
+        # share the same ``extra_hooks`` dict object (Q6 PASS — single
+        # SubagentStop callback fires regardless of which bridge spawned
+        # the subagent).
+        sub_agents: dict[str, Any] | None = None
+        sub_hooks: dict[str, Any] = {}
+        if self._settings.subagent.enabled:
+            self._adapter = TelegramAdapter(self._settings)
+            sub_agents = build_agents(self._settings)
+            sub_hooks = make_subagent_hooks(
+                store=self._sub_store,
+                adapter=self._adapter,
+                settings=self._settings,
+                pending_updates=self._sub_pending_updates,
+            )
+        else:
+            self._adapter = TelegramAdapter(self._settings)
+
+        bridge = ClaudeBridge(
+            self._settings,
+            extra_hooks=sub_hooks or None,
+            agents=sub_agents,
+        )
         handler = ClaudeHandler(
             self._settings, store, bridge, transcription=transcription
         )
-        self._adapter = TelegramAdapter(self._settings)
         self._adapter.set_handler(handler)
         self._adapter.set_transcription(transcription)
+
+        # Phase 6 (research RQ2 + B-W2-6): the picker bridge is a
+        # SEPARATE ClaudeBridge instance with its own asyncio.Semaphore.
+        # A long picker dispatch holding its slot for 15 minutes cannot
+        # starve owner turns running through the user-chat bridge. Both
+        # bridges share the same ``sub_hooks`` object so SubagentStop
+        # fires through the shared ledger regardless of origin.
+        if self._settings.subagent.enabled:
+            picker_bridge = ClaudeBridge(
+                self._settings,
+                extra_hooks=sub_hooks or None,
+                agents=sub_agents,
+            )
+            self._sub_picker = SubagentRequestPicker(
+                self._sub_store,
+                picker_bridge,
+                settings=self._settings,
+                # Fix-pack F1: terminal ``'error'`` transitions notify
+                # the owner via Telegram. Adapter is already constructed
+                # at this point so handing it through is safe.
+                adapter=self._adapter,
+            )
 
         # --------------------------------------------------------------
         # Phase 5: scheduler subsystem
@@ -400,6 +480,25 @@ class Daemon:
 
         await self._adapter.start()
         log.info("daemon_started", owner=self._settings.owner_chat_id)
+
+        # Phase 6: notify the owner of any subagent orphans recovered on
+        # this boot. Done AFTER adapter.start so send_text actually
+        # reaches Telegram. ``dropped_*`` branches are info-only — owner
+        # has already moved on.
+        if recovery.interrupted > 0 and self._adapter is not None:
+            self._spawn_bg(
+                self._adapter.send_text(
+                    self._settings.owner_chat_id,
+                    f"daemon restart: {recovery.interrupted} subagent(s) "
+                    "marked interrupted (prior daemon run crashed mid-"
+                    "subagent). Respawn manually if needed.",
+                )
+            )
+
+        # Phase 6: spawn the picker after the adapter is ready so any
+        # SubagentStop notify it triggers can actually deliver.
+        if self._sub_picker is not None:
+            self._spawn_bg(self._sub_picker.run())
 
         if sched_enabled:
             assert self._sched_store is not None
@@ -608,6 +707,12 @@ class Daemon:
             self._sched_loop.stop()
         if self._sched_dispatcher is not None:
             self._sched_dispatcher.stop()
+        # Phase 6: signal the picker to stop BEFORE the bg-tasks drain
+        # so no new dispatch is initiated during shutdown.  In-flight
+        # dispatches finish their record_started / record_finished SQL
+        # because the picker awaits inline (research RQ3 / devil H-6).
+        if self._sub_picker is not None:
+            self._sub_picker.request_stop()
         if self._adapter is not None:
             await self._adapter.stop()
         # S8 (wave-3): cancel tracked bg coroutines (skill_creator bootstrap,
@@ -620,6 +725,27 @@ class Daemon:
         if self._bg_tasks:
             await asyncio.gather(*self._bg_tasks, return_exceptions=True)
         self._bg_tasks.clear()
+        # Phase 6 (GAP #12): drain SubagentStop shielded notify tasks
+        # BEFORE conn.close so a fired-but-not-yet-delivered Telegram
+        # send can finish without ProgrammingError on a closed DB.
+        if self._sub_pending_updates:
+            updates = list(self._sub_pending_updates)
+            log.info(
+                "daemon_draining_subagent_notifies",
+                count=len(updates),
+            )
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*updates, return_exceptions=True),
+                    timeout=self._settings.subagent.drain_timeout_s,
+                )
+            except TimeoutError:
+                log.warning(
+                    "daemon_subagent_drain_timeout",
+                    count=len(
+                        [t for t in updates if not t.done()]
+                    ),
+                )
         # Cancel installer-spawned uv-sync tasks (module-level set).
         await _core.cancel_bg_tasks()
         if self._conn is not None:
