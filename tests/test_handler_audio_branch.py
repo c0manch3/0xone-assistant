@@ -192,11 +192,13 @@ def _make_emit() -> tuple[list[str], Any]:
 
 
 # ----------------------------------------------------------------------
-# Short voice + empty caption → intent prefix
+# Short voice + empty caption → transcript verbatim (no intent prefix —
+# 6c hotfix-2: prefix confused claude-opus-4-7 into thinking the audio
+# was missing).
 # ----------------------------------------------------------------------
 
 
-async def test_short_voice_empty_caption_uses_intent_prefix(
+async def test_short_voice_empty_caption_passes_transcript_verbatim(
     tmp_path: Path,
 ) -> None:
     settings = _build_settings(tmp_path)
@@ -231,8 +233,9 @@ async def test_short_voice_empty_caption_uses_intent_prefix(
 
     assert len(bridge.calls) == 1
     user_text = bridge.calls[0]["user_text"]
-    assert "[голосовое от owner" in user_text
-    assert "когда у тебя следующий созвон" in user_text
+    # No intent-prefix; transcript passed verbatim.
+    assert "[голосовое от owner" not in user_text
+    assert user_text == "когда у тебя следующий созвон?"
 
 
 # ----------------------------------------------------------------------

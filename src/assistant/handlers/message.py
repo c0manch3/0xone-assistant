@@ -1301,8 +1301,11 @@ class ClaudeHandler:
 
         - Non-empty caption → caption + "\\n\\n" + transcript.
         - Empty caption AND duration > threshold → auto-summary prompt.
-        - Empty caption AND duration <= threshold → intent-prefix
-          (H6 closure) so the model knows to either answer or ack.
+        - Empty caption AND duration <= threshold → transcript verbatim
+          (model treats it as if owner typed it; H6 intent-prefix
+          removed in 6c hotfix-2 because Claude opus-4-7 read the meta
+          phrasing as "no audio attached" and refused to answer the
+          question that was actually transcribed).
         """
         cap = (caption or "").strip()
         if cap:
@@ -1312,12 +1315,9 @@ class ClaudeHandler:
                 "Сделай краткое саммари этого, выдели ключевые тезисы:"
                 f"\n\n{transcript}"
             )
-        # H6 closure
-        return (
-            "[голосовое от owner — отвечай если это вопрос/задача, или "
-            "просто 'принято' если это reminder/заметка]\n\n"
-            f"{transcript}"
-        )
+        # Short voice + no caption: pass transcript verbatim. Model sees
+        # it as a regular user message.
+        return transcript
 
     async def _save_voice_to_vault(
         self,
