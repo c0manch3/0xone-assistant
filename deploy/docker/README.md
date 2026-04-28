@@ -18,7 +18,7 @@ State paths inside the container (all bind-mounted from host):
 |----------------|-----------|---------|
 | `/home/bot/.claude/` | `~/.claude/` | OAuth creds + projects + sessions + agents/skills/plugins. Full mount required (W2-C4). |
 | `/home/bot/.local/share/0xone-assistant/` | `~/.local/share/0xone-assistant/` | Vault, sqlite DBs, `.daemon.pid`, `.last_clean_exit`, audit logs. |
-| `/home/bot/.config/0xone-assistant/` | (read via `env_file`, no mount) | `.env` + `secrets.env` + `secrets-tailscale.env` (the last one consumed by the tailscale sidecar service only — F4). |
+| `/home/bot/.config/0xone-assistant/` | (read via `env_file`, no mount) | `.env` (TELEGRAM_BOT_TOKEN, OWNER_CHAT_ID, WHISPER_API_URL) + `secrets.env` (WHISPER_API_TOKEN, optional GH_TOKEN). |
 
 ## Prerequisites
 
@@ -81,71 +81,97 @@ permission in their UI but it doesn't propagate to GHCR auth as of
 the `read:packages` scope is global across the user's packages but
 that's fine for a single-user account that owns one container.
 
-## Phase 6c first-time bootstrap (Mac sidecar + Tailscale + secrets)
+## Phase 6c first-time bootstrap (Mac sidecar + SSH tunnel + secrets)
 
-> **F19 (fix-pack) — unified phase 6c bootstrap.** Run these eight
-> steps in order on a fresh deployment before you do `docker compose
-> up -d`. The Mac sidecar must be reachable BEFORE the bot boots so
-> the very first `health_check()` succeeds.
+> **Phase 6c hotfix — SSH reverse tunnel bootstrap.** Replaces the
+> earlier Tailscale flow (Tailscale's default-route capture conflicts
+> with AmneziaVPN on the Mac). Run these steps in order on a fresh
+> deployment before `docker compose up -d`. The Mac sidecar must be
+> reachable BEFORE the bot boots so the first `health_check()` lands.
 
-1. **Tailscale account.** Sign up at <https://login.tailscale.com/>
-   (free personal tier is enough). Verify email.
-2. **ACL policy.** In the admin console
-   (`https://login.tailscale.com/admin/acls/`) paste the snippet
-   from `whisper-server/README.md` — defines `tag:bot-vps` and
-   `tag:whisper-mac` plus the deny-by-default rule that limits port
-   9000 to the bot. Save.
-3. **Auth keys.** Generate two **reusable + preauthorized + non-ephemeral**
-   keys at `https://login.tailscale.com/admin/settings/keys`:
-   - One tagged `tag:whisper-mac` for the Mac sidecar.
-   - One tagged `tag:bot-vps` for the VPS sidecar.
+1. **Run `setup-mac-sidecar.sh` on the Mac mini.** SSH or sit at the
+   Mac:
+   ```sh
+   cd /path/to/0xone-assistant/whisper-server
+   ./setup-mac-sidecar.sh
+   ```
+   The script generates the `WHISPER_API_TOKEN` (printed once) and a
+   dedicated `~/.ssh/whisper_tunnel` ed25519 key (public key printed
+   once with the exact `restrict,permitlisten="9000"` prefix to
+   paste).
 
-   Store them out-of-band; the auth keys are NOT recoverable.
-4. **Run `setup-mac-sidecar.sh` on the Mac mini.** SSH or sit at the
-   Mac, `cd /path/to/0xone-assistant/whisper-server && ./setup-mac-sidecar.sh`.
-   The script generates the `WHISPER_API_TOKEN`, prints it once, and
-   asks you to paste the `tag:whisper-mac` auth key during
-   `tailscale up`.
-5. **Copy the Whisper bearer token to the VPS.**
+2. **Add the SSH public key to VPS `authorized_keys`.** From your
+   laptop / the Mac, paste the line printed by the setup script:
+   ```sh
+   ssh 0xone@193.233.87.118 'cat >> ~/.ssh/authorized_keys' <<'EOF'
+   restrict,permitlisten="9000",permitopen="" ssh-ed25519 AAAA…paste from Mac… whisper-tunnel-mac-mini
+   EOF
+   ```
+   The `restrict,permitlisten="9000",permitopen=""` prefix is
+   load-bearing — it locks the key to a single reverse-listener on
+   port 9000, denying shell access, port-opens, agent forwarding,
+   X11, etc. Without it the key would grant a regular login shell.
 
+3. **Enable `GatewayPorts` on VPS sshd.** Without this, the reverse
+   listener binds only to `127.0.0.1` inside the VPS network
+   namespace and the docker bridge cannot reach it.
+   ```sh
+   ssh -i ~/.ssh/bot 0xone@193.233.87.118
+   sudo sed -i 's/^#\?GatewayPorts.*/GatewayPorts yes/' /etc/ssh/sshd_config
+   sudo sshd -t                          # syntax check before reload
+   sudo systemctl reload sshd
+   ```
+   Verify: `grep '^GatewayPorts' /etc/ssh/sshd_config` → `GatewayPorts yes`.
+
+4. **Drop the Whisper bearer token into VPS secrets.**
    ```sh
    ssh -i ~/.ssh/bot 0xone@193.233.87.118
    mkdir -p ~/.config/0xone-assistant
    cat > ~/.config/0xone-assistant/secrets.env <<'EOF'
-   WHISPER_API_TOKEN=<paste from Mac>
+   WHISPER_API_TOKEN=<paste from Mac setup>
    EOF
    chmod 600 ~/.config/0xone-assistant/secrets.env
-   cat > ~/.config/0xone-assistant/secrets-tailscale.env <<'EOF'
-   TS_AUTHKEY=<paste tag:bot-vps key>
-   EOF
-   chmod 600 ~/.config/0xone-assistant/secrets-tailscale.env
    ```
-6. **MagicDNS hostname.** The Mac setup script printed the Mac's
-   MagicDNS hostname (`<mac-name>.<tailnet>.ts.net`). Add to the bot
-   `.env`:
 
+5. **Set `WHISPER_API_URL` in the bot `.env`.** With the SSH-tunnel
+   pivot the bot reaches the Mac via `host.docker.internal` (resolved
+   by the docker bridge `extra_hosts: host-gateway` mapping):
    ```sh
-   echo 'WHISPER_API_URL=http://<mac-magicdns>:9000' \
+   echo 'WHISPER_API_URL=http://host.docker.internal:9000' \
      >> ~/.config/0xone-assistant/.env
    ```
-7. **`docker compose up -d`.** The compose stack now starts
-   `tailscale` first; the bot waits on `condition: service_healthy`
-   (F16) so the very first egress request lands on a Backend=Running
-   node.
 
+6. **Tunnel sanity check from VPS.** After the Mac boots and the
+   `com.zeroxone.whisper-tunnel` LaunchAgent is up, the VPS should
+   show a listener on `0.0.0.0:9000`:
+   ```sh
+   ssh -i ~/.ssh/bot 0xone@193.233.87.118 \
+     "ss -ltn | grep ':9000'"
+   # → tcp LISTEN 0 128 0.0.0.0:9000  0.0.0.0:*
+
+   ssh -i ~/.ssh/bot 0xone@193.233.87.118 \
+     "curl -s http://172.17.0.1:9000/health"
+   # → {"status":"ok","model_loaded":true,...}
+   ```
+   If you see `127.0.0.1:9000` instead of `0.0.0.0:9000`,
+   `GatewayPorts yes` is not active — re-check step 3.
+
+7. **`docker compose up -d`.**
    ```sh
    cd /opt/0xone-assistant/deploy/docker
    docker compose pull
    docker compose up -d
-   docker compose ps         # both services healthy after ~30-60s
+   docker compose ps          # bot healthy after ~30-60s
    ```
+
 8. **Owner Telegram smoke.** Record a 10-second voice → bot
    transcribes + Claude responds (AC#1). Send a 30-min YouTube URL
    prefixed with `транскрибируй ` → bot acks + extracts + summarises
    (AC#4). If the smoke fails on AC#5 (Mac sidecar offline), check
-   `tailscale status` on the Mac — anti-bot countermeasures
-   sometimes invalidate the OAuth token at the daily yt-dlp upgrade
-   job (see `whisper-server/README.md` troubleshooting).
+   the tunnel state on the Mac:
+   `launchctl list | grep whisper-tunnel` (last column is exit code;
+   non-zero = the tunnel just crashed) and the autossh log under
+   `~/whisper-server/logs/whisper-tunnel.err`.
 
 ## Initial install (fresh VPS)
 

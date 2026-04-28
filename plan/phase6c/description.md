@@ -15,7 +15,7 @@ reference: /Users/agent2/Downloads/midomis-bot/plan/phase-7-voice-transcription/
 | C2 | Initial ack механизм отсутствует | В `_on_voice/_on_audio` (и `_on_text` URL-route) send `await bot.send_message(chat_id, ack)` ДО `_handler.handle()` — обходит `chunks.append` accumulator. Lock acquired ПОСЛЕ ack, держится только на transcribe + Claude. Документирован как новый паттерн (не reuse 6a/6b). |
 | C3 | Whisper 3600s vs Claude 300s mismatch | Новый `Settings.claude_voice_timeout: int = 900` (15 мин) для voice/url turn'ов. `bridge.ask(...)` принимает kwarg `timeout_override: int | None = None`. Default остаётся 300s; voice/url path передаёт 900s. |
 | C4 | URL detection без whitelist | **Explicit trigger required.** URL транскрибируется ТОЛЬКО если message текст начинается с `транскрибируй <URL>` (или `/voice <URL>` slash command). Без trigger'а URL = обычный текст (передаётся в Claude как раньше, обрабатывается через `_URL_RE` для phase-3 installer hint). |
-| C5 | Tailscale ACL без bearer token | **Mandatory `Authorization: Bearer <secret>`** на всех FastAPI endpoints (`/transcribe`, `/extract`, `/health`). Secret генерится `setup-mac-sidecar.sh`, сохраняется в `~/.config/whisper-server/.env` на Mac + `~/.config/0xone-assistant/secrets.env` на VPS под `WHISPER_API_TOKEN`. Tailscale ACL = defense-in-depth (отдельный JSON snippet в spec). |
+| C5 | Транспорт без bearer token | **Mandatory `Authorization: Bearer <secret>`** на всех FastAPI endpoints (`/transcribe`, `/extract`, `/health`). Secret генерится `setup-mac-sidecar.sh`, сохраняется в `~/.config/whisper-server/.env` на Mac + `~/.config/0xone-assistant/secrets.env` на VPS под `WHISPER_API_TOKEN`. **Hotfix 2026-04-27**: транспорт = SSH reverse tunnel (Mac → VPS) с restricted SSH key (`restrict,permitlisten="9000"`) — заменил Tailscale из-за конфликта с AmneziaVPN. SSH key restrictions = defence-in-depth (см. `whisper-server/README.md`). |
 
 | # | HIGH | Decision |
 |---|---|---|
@@ -43,7 +43,7 @@ NO source-code changes to bridge/scheduler/memory/installer subsystems. Phase 6a
   - `POST /transcribe` (multipart) — receives audio file → ffmpeg → mlx-whisper → JSON transcript
   - `POST /extract` (JSON `{url: ...}`) — yt-dlp downloads audio → ffmpeg → mlx-whisper → JSON transcript
   - `GET /health` — model loaded, ffmpeg available
-- **Tailscale tunnel** — private mesh VPS↔Mac mini. MagicDNS for hostname (`mac-mini.tailnet-name.ts.net:9000`). No port-forward, no public IP. ACL restricts port 9000 to VPS only.
+- **SSH reverse tunnel** (hotfix 2026-04-27, replaces Tailscale): autossh on the Mac maintains `ssh -N -R 9000:localhost:9000 0xone@193.233.87.118`. VPS sshd `GatewayPorts yes` re-publishes that listener on the docker bridge (`172.17.0.1:9000`). Bot container reaches it via `host.docker.internal:9000` (compose `extra_hosts: host-gateway`). FastAPI binds to `127.0.0.1:9000` (loopback only). Authorized_keys uses `restrict,permitlisten="9000",permitopen=""` so the key is good for nothing else. Egress is normal port-22 SSH — works regardless of AmneziaVPN routing.
 - **Bot side** — new `assistant/services/transcription.py` httpx client. Used from `_handle_locked` audio branch.
 
 ## Whisper model + tooling
@@ -140,10 +140,10 @@ NO source-code changes to bridge/scheduler/memory/installer subsystems. Phase 6a
   - `config.py` — env-driven settings.
   - `requirements.txt` — fastapi, uvicorn, mlx-whisper, yt-dlp, python-multipart, pydantic-settings.
   - `com.zeroxone.whisper-server.plist` — launchd autostart plist.
-  - `setup-mac-sidecar.sh` — bootstrap script (brew + pip + tailscale + plist install).
+  - `setup-mac-sidecar.sh` — bootstrap script (brew + pip + autossh + ed25519 keygen + plist install).
   - `README.md` — Mac mini setup walkthrough.
 - `Settings` extension (`assistant/config.py`):
-  - `whisper_api_url: str | None = None` (Tailscale URL).
+  - `whisper_api_url: str | None = None` (e.g. `http://host.docker.internal:9000`; cross-host reach via SSH reverse tunnel + GatewayPorts).
   - `whisper_timeout: int = 3600`.
   - `yt_dlp_timeout: int = 600`.
   - `voice_vault_threshold_seconds: int = 120`.
@@ -166,7 +166,7 @@ NO source-code changes to bridge/scheduler/memory/installer subsystems. Phase 6a
 ## Open questions for researcher (RQ list)
 
 - **RQ1** — mlx-whisper version + model download flow on M4. Compat with macOS Sequoia (15.x)? Cold-start latency on first call?
-- **RQ2** — Tailscale on macOS — Mac App Store version vs CLI brew cask. ACL syntax for port 9000 VPS-only.
+- **RQ2** — Transport layer Mac↔VPS. **Resolved (hotfix 2026-04-27)**: SSH reverse tunnel via autossh on Mac, VPS sshd `GatewayPorts yes` + `authorized_keys` `restrict,permitlisten="9000",permitopen=""`. Tailscale was the original answer but conflicts with AmneziaVPN.
 - **RQ3** — yt-dlp anti-bot resilience 2026: cookie/oauth requirements for YouTube? PoToken extractor? Recommended dependency pin range.
 - **RQ4** — ffmpeg invocation: spawn subprocess via asyncio vs synchronous (FastAPI thread pool). Edge cases with very short audio (<1 sec).
 - **RQ5** — Telegram bot API audio download size limit confirmation (20 MB or larger?). What about audio files via "send as file" route?

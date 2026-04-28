@@ -2,17 +2,24 @@
 # Phase 6c: Mac mini Whisper sidecar bootstrap.
 #
 # Idempotent — re-running on a fully-installed host updates pip deps and
-# refreshes launchd plists, but does NOT regenerate the bearer token.
+# refreshes launchd plists, but does NOT regenerate the bearer token or
+# the SSH tunnel key.
 #
 # Pre-requisites checked:
 #   - Apple Silicon (arm64).
 #   - Homebrew installed (auto-installed if missing).
 #   - macOS 13.5+ (mlx requires Metal 3).
 #
-# Output:
-#   - Bearer token printed once (post-generation) for owner to copy
-#     into the VPS .env. Subsequent runs do not re-print it.
-#   - MagicDNS hostname printed for owner to set as WHISPER_API_URL.
+# Transport: SSH reverse tunnel (autossh -N -R 9000:localhost:9000) from
+# the Mac to the VPS. The bot container on the VPS reaches the Mac via
+# host.docker.internal:9000 (compose extra_hosts: host-gateway).
+# Replaces the previous Tailscale design — Tailscale's default-route
+# capture conflicts with the owner's AmneziaVPN.
+#
+# Output (printed once each on first run):
+#   - WHISPER_API_TOKEN  — paste into VPS ~/.config/0xone-assistant/secrets.env.
+#   - SSH public key     — paste into VPS ~/.ssh/authorized_keys with the
+#                          port-forward restriction shown.
 set -euo pipefail
 
 # ---------------------------------------------------------------------
@@ -30,14 +37,9 @@ if ! command -v brew >/dev/null 2>&1; then
 fi
 
 # ffmpeg for audio decoding/normalisation; python@3.12 for mlx-whisper
-# compat (3.13 has transitive lag per research RQ1).
-brew install ffmpeg python@3.12 || true
-
-# Tailscale CLI cask. The Mac App Store version sandboxes the CLI out
-# of reach; brew cask is required for `tailscale up --advertise-tags`.
-if ! command -v tailscale >/dev/null 2>&1; then
-    brew install --cask tailscale-app || true
-fi
+# compat (3.13 has transitive lag per research RQ1); autossh keeps the
+# reverse tunnel alive across NAT timeouts and Mac-side network blips.
+brew install ffmpeg python@3.12 autossh || true
 
 # ---------------------------------------------------------------------
 # Layout: ~/whisper-server/{.venv, logs/}
@@ -92,29 +94,46 @@ if [ ! -f "$TOKEN_FILE" ] || ! grep -q "^WHISPER_API_TOKEN=" "$TOKEN_FILE"; then
 fi
 
 # ---------------------------------------------------------------------
-# Tailscale auth
+# SSH tunnel key
 # ---------------------------------------------------------------------
-if ! tailscale status >/dev/null 2>&1; then
-    echo "Starting Tailscale auth (interactive browser flow)..."
-    sudo tailscale up --advertise-tags=tag:whisper-mac --ssh
+# Dedicated key for the reverse tunnel. Kept out of the user's normal
+# ~/.ssh/id_* so it can be revoked / rotated independently. Public key
+# is added to VPS authorized_keys with `restrict,permitlisten="9000"`
+# so it's good for nothing else (no shell, no other forwards).
+mkdir -p "$HOME/.ssh"
+chmod 700 "$HOME/.ssh"
+SSH_KEY_FILE="$HOME/.ssh/whisper_tunnel"
+if [ ! -f "$SSH_KEY_FILE" ]; then
+    ssh-keygen -t ed25519 -f "$SSH_KEY_FILE" -N "" \
+        -C "whisper-tunnel-mac-mini"
+    chmod 600 "$SSH_KEY_FILE"
 fi
-TS_HOSTNAME="$(tailscale status --json | "$SERVER_DIR/.venv/bin/python" -c "import sys, json; print(json.load(sys.stdin)['Self']['DNSName'].rstrip('.'))" || true)"
-if [ -n "$TS_HOSTNAME" ]; then
-    echo
-    echo "================================================================"
-    echo " Tailscale MagicDNS hostname: $TS_HOSTNAME"
-    echo " On the VPS, set in ~/.config/0xone-assistant/.env:"
-    echo "     WHISPER_API_URL=http://$TS_HOSTNAME:9000"
-    echo "================================================================"
-    echo
-fi
+SSH_PUB="$(cat "${SSH_KEY_FILE}.pub")"
+echo
+echo "================================================================"
+echo " SSH tunnel public key — add to VPS authorized_keys with"
+echo " port-forward restriction. From your laptop:"
+echo
+echo "   ssh 0xone@193.233.87.118 'cat >> ~/.ssh/authorized_keys' <<EOF"
+echo "   restrict,permitlisten=\"9000\",permitopen=\"\" $SSH_PUB"
+echo "   EOF"
+echo
+echo " Then on VPS enable GatewayPorts:"
+echo "   sudo sed -i 's/^#GatewayPorts no/GatewayPorts yes/' /etc/ssh/sshd_config"
+echo "   sudo systemctl reload sshd"
+echo "================================================================"
+echo
 
 # ---------------------------------------------------------------------
 # launchd plists (substitute __HOME__ at install time)
 # ---------------------------------------------------------------------
 LAUNCHD_DIR="$HOME/Library/LaunchAgents"
 mkdir -p "$LAUNCHD_DIR"
-for plist_name in "com.zeroxone.whisper-server.plist" "com.zeroxone.yt-dlp-update.plist"; do
+for plist_name in \
+    "com.zeroxone.whisper-server.plist" \
+    "com.zeroxone.whisper-tunnel.plist" \
+    "com.zeroxone.yt-dlp-update.plist"
+do
     src="$SOURCE_DIR/$plist_name"
     dst="$LAUNCHD_DIR/$plist_name"
     sed "s|__HOME__|$HOME|g" "$src" >"$dst"
@@ -147,5 +166,12 @@ except Exception as exc:
 PYEOF
 
 echo
-echo "Setup complete. The sidecar is now running on http://$TS_HOSTNAME:9000"
-echo "Test it with: curl http://$TS_HOSTNAME:9000/health"
+echo "Setup complete. Sidecar listens on 127.0.0.1:9000 (loopback only)."
+echo "Once you finish the VPS bootstrap (authorized_keys + GatewayPorts),"
+echo "the bot container reaches it via http://host.docker.internal:9000."
+echo
+echo "Sanity check from this Mac:"
+echo "  curl http://127.0.0.1:9000/health"
+echo
+echo "From the VPS once the tunnel is up:"
+echo "  ssh 0xone@193.233.87.118 'curl -s http://172.17.0.1:9000/health'"

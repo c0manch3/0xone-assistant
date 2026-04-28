@@ -36,10 +36,12 @@ class WhisperSettings(BaseSettings):
     # ``secrets.token_urlsafe(32)`` (minimum 43 chars after URL encoding).
     whisper_api_token: str = Field(min_length=32)
 
-    # Bind address. Default 0.0.0.0 — Tailscale ACL is the access
-    # boundary. The owner can pin to a specific Tailscale IP for
-    # paranoia by overriding via env.
-    host: str = "0.0.0.0"  # noqa: S104 — Tailscale ACL guards exposure
+    # Bind address. Default 127.0.0.1 — the SSH reverse tunnel from the
+    # Mac mini to the VPS does the cross-host transport, so the FastAPI
+    # process only needs to accept connections from the local SSH
+    # client. Binding to loopback closes off any LAN-side exposure
+    # (e.g. another device on the owner's home network).
+    host: str = "127.0.0.1"
     port: int = 9000
 
     # Model. Pinned to the canonical mlx-community repo; override via

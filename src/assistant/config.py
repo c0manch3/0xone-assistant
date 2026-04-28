@@ -180,9 +180,10 @@ class Settings(BaseSettings):
         """F14 (fix-pack): require ``http://`` or ``https://`` scheme.
 
         Empty / None passes through (sidecar simply disabled). A bare
-        hostname like ``mac-mini.tailnet.ts.net:9000`` would otherwise
-        be silently accepted and every request would fail with a
-        confusing httpx ``UnsupportedProtocol``. Catch at boot.
+        hostname like ``host.docker.internal:9000`` (the canonical
+        SSH-tunnel value) would otherwise be silently accepted and
+        every request would fail with a confusing httpx
+        ``UnsupportedProtocol``. Catch at boot.
         """
         if v is None or v == "":
             return v

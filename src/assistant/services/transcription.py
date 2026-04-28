@@ -1,15 +1,20 @@
 """Phase 6c: HTTP client for the Mac mini Whisper sidecar.
 
-The sidecar exposes three endpoints over Tailscale (private mesh):
+The sidecar exposes three endpoints reached over an SSH reverse tunnel
+(Mac → VPS):
 
 - ``POST /transcribe`` — multipart audio upload + bearer auth → JSON.
 - ``POST /extract`` — JSON ``{url}`` body + bearer auth → JSON.
 - ``GET /health`` — liveness probe (no auth).
 
-Trust model: requests originate from the bot container (sharing the
-Tailscale sidecar's network namespace). The bearer token is a
-defence-in-depth layer on top of the Tailscale ACL — even if the ACL
-ever leaks, requests without the token are rejected at the Mac sidecar.
+Trust model: the bot container reaches the Mac via
+``http://host.docker.internal:9000`` thanks to the compose
+``extra_hosts: host-gateway`` mapping. VPS sshd's ``GatewayPorts yes``
+republishes the autossh `-R 9000` listener on the docker bridge. The
+bearer token is a defence-in-depth layer on top of the SSH key
+restrictions (`restrict,permitlisten="9000"`) — even if the
+authorized_keys entry ever leaks, requests without the token are
+rejected at the Mac sidecar.
 
 Error policy: every transport / HTTP / non-200 outcome is normalised to
 :class:`TranscriptionError` with a sanitised Russian message that the
@@ -33,8 +38,8 @@ from assistant.config import Settings
 log = structlog.get_logger(__name__)
 
 # Health probe must be fast — Mac mini awake should answer in <50 ms over
-# Tailscale; a 5-second cap is generous and keeps the audio handler from
-# stalling for tens of seconds when the Mac is offline.
+# the SSH tunnel; a 5-second cap is generous and keeps the audio handler
+# from stalling for tens of seconds when the Mac is offline.
 _HEALTH_TIMEOUT_S = 5.0
 
 # Server-side max audio bytes per upload. Keep loosely aligned with the
@@ -98,8 +103,9 @@ class TranscriptionService:
 
     Stateless across calls; each public method opens a fresh
     ``httpx.AsyncClient`` (we do not keep a long-lived client because
-    Tailscale's NAT path occasionally rotates and a stale connection
-    pool produces opaque ConnectError spikes).
+    the SSH tunnel can rotate underneath us — autossh respawns on
+    NAT timeout / Mac wake — and a stale pool would produce opaque
+    ConnectError spikes).
 
     When :attr:`enabled` is False (no URL/token configured), every
     public method raises :class:`TranscriptionError` immediately so the
@@ -123,6 +129,8 @@ class TranscriptionService:
         # legitimate bot traffic from arbitrary tailnet probes.
         return {
             "Authorization": f"Bearer {self._token}",
+            # User-Agent helps the sidecar log distinguish legitimate
+            # bot traffic from arbitrary localhost / loopback probes.
             "User-Agent": "0xone-assistant/6c",
         }
 

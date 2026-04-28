@@ -6,6 +6,14 @@ Endpoints (per research RQ4 + RQ6):
 - ``POST /extract`` — JSON ``{url}`` body + bearer auth (yt-dlp).
 - ``GET /health`` — no auth; returns ``{status, model_loaded, yt_dlp_version}``.
 
+Transport: the FastAPI process binds to ``127.0.0.1:9000`` (loopback
+only). Cross-host reachability is handled by an SSH reverse tunnel
+(``autossh -N -R 9000:localhost:9000`` from the Mac to the VPS); the
+VPS sshd's ``GatewayPorts yes`` directive then re-publishes that
+listener on the docker bridge so the bot container reaches it via
+``host.docker.internal``. Bearer token + SSH key are layered defence-
+in-depth — both must be valid for a request to land.
+
 Architecture invariants:
 
 - mlx-whisper is pre-warmed in the FastAPI lifespan (0.5 s silence sample)
