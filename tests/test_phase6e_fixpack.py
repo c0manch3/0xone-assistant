@@ -408,8 +408,11 @@ async def test_f3_emit_direct_logs_telegram_retry_after(
     # The retry_after value carries through to the structured log.
     assert rate_limit_events[0][1].get("retry_after") == 7
     assert rate_limit_events[0][1].get("chat_id") == 42
-    # F2: the typing_lifecycle factory was wired through.
-    assert captured_lifecycle and captured_lifecycle[0] is not None
+    # F2 hotfix (2026-04-29 owner UX feedback): typing_lifecycle is
+    # NO LONGER passed by adapter — pre-lock ack is the progress
+    # signal; persistent typing during 22-45 min bg run was UI noise.
+    # Bg path falls back to AudioJob's _noop_typing_lifecycle.
+    assert captured_lifecycle == [None]
 
 
 async def test_f3_emit_direct_logs_telegram_api_error(

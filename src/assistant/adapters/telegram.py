@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import re
-from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
@@ -1142,34 +1141,21 @@ class TelegramAdapter(MessengerAdapter):
                     error=repr(exc),
                 )
 
-        @contextlib.asynccontextmanager
-        async def typing_lifecycle() -> AsyncIterator[None]:
-            """Drive ``send_chat_action`` on a periodic loop while the
-            bg task is in flight. Re-uses ``_periodic_typing`` so the
-            cadence stays single-sourced.
-            """
-            typing_task = asyncio.create_task(
-                self._periodic_typing(chat_id),
-                name=f"audio-typing-{chat_id}",
-            )
-            try:
-                yield
-            finally:
-                typing_task.cancel()
-                with contextlib.suppress(
-                    asyncio.CancelledError, Exception
-                ):
-                    await typing_task
-
+        # F2 hotfix (owner UX feedback 2026-04-29): the F2 fix-pack
+        # wired a continuous ``send_chat_action`` loop for the entire
+        # 22-45 min bg run. Owner reported it as a UI annoyance — the
+        # pre-lock ack ("⏳ получил аудио, начинаю транскрибацию ~Y мин")
+        # is already a sufficient progress signal; persistent typing
+        # for tens of minutes pretends the bot is mid-keystroke. Drop
+        # the active typing_lifecycle; bg task falls back to AudioJob's
+        # ``_noop_typing_lifecycle`` default.
         await self._handler.handle(
             incoming,
             emit,
             emit_direct=emit_direct,
-            typing_lifecycle=typing_lifecycle,
         )
         # No post-handler chunks fallback for the audio path — the bg
-        # task owns owner-visible output via emit_direct. Typing
-        # lifecycle is owned by the bg task body (see ``AudioJob``).
+        # task owns owner-visible output via emit_direct.
 
     async def _on_animation(self, message: Message) -> None:
         """Phase 6b (F2 / AC#5): dedicated handler for animated GIFs and
