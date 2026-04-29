@@ -425,39 +425,17 @@ async def test_voice_path_not_wrapped(tmp_path: Path) -> None:
 
 # ---------------------------------------------------------------------------
 # F7 — scheduler-origin audio turn passes scheduler-note
+#
+# REMOVED in phase 6e: scheduler-origin audio turns are rejected at
+# ``IncomingMessage`` construction (CRIT-3 close, spec §7). The bg
+# dispatch model has no caller waiting on the bg result, so the
+# scheduler dispatcher's ``revert_to_pending`` / dead-letter machinery
+# could never observe a failure. Three replacement tests live in
+# ``tests/test_phase6e_message_construction.py``:
+#   - test_scheduler_origin_audio_rejected_at_construction
+#   - test_scheduler_origin_url_extraction_rejected
+#   - test_telegram_origin_audio_passes
 # ---------------------------------------------------------------------------
-
-
-async def test_scheduler_origin_audio_turn_passes_scheduler_note(
-    tmp_path: Path,
-) -> None:
-    settings = _build_settings(tmp_path)
-    store = await _make_store(tmp_path)
-    bridge = _CapturingBridge(
-        settings, script=[_text_block("ok"), _result_message()]
-    )
-    transcription = _StubTranscription(
-        settings,
-        TranscriptionResult(text="reminder text", language="ru", duration=15),
-    )
-    handler = ClaudeHandler(settings, store, bridge, transcription)
-    tmp = _make_audio_tmp(tmp_path)
-    msg = IncomingMessage(
-        chat_id=42,
-        message_id=1,
-        text="",
-        origin="scheduler",
-        meta={"trigger_id": "tr-123"},
-        attachment=tmp,
-        attachment_kind="ogg",
-        attachment_filename=tmp.name,
-        audio_duration=15,
-        audio_mime_type="audio/ogg",
-    )
-    _, emit = _make_emit()
-    await handler.handle(msg, emit)
-    notes = bridge.calls[0]["system_notes"] or []
-    assert any("scheduler" in n and "tr-123" in n for n in notes)
 
 
 # ---------------------------------------------------------------------------

@@ -217,6 +217,18 @@ class Daemon:
         self._sub_store: SubagentStore | None = None
         self._sub_picker: SubagentRequestPicker | None = None
         self._sub_pending_updates: set[asyncio.Task[Any]] = set()
+        # Phase 6e: bg audio dispatch state. ``_audio_persist_pending``
+        # mirrors ``_sub_pending_updates`` — the bg ``finally`` schedules
+        # the persist as a TRACKED task rather than ``asyncio.shield(...)``
+        # (researcher RQ2 — orphan-task gotcha). ``Daemon.stop`` drains
+        # this set BEFORE ``conn.close()`` with a bounded budget so a
+        # fired-but-not-yet-flushed persist task can finish without
+        # ``aiosqlite.ProgrammingError``.
+        self._audio_persist_pending: set[asyncio.Task[Any]] = set()
+        # Single semaphore shared across every audio bg task; enforces
+        # the Mac whisper-server's hard ``Semaphore(1)`` from the client
+        # side (CLOSED-NEGATIVE per researcher RQ3).
+        self._audio_bg_sem: asyncio.Semaphore | None = None
 
     async def _preflight_claude_auth(self) -> None:
         """Fail-fast if the ``claude`` CLI is missing or unauthenticated.
@@ -404,8 +416,38 @@ class Daemon:
             extra_hooks=sub_hooks or None,
             agents=sub_agents,
         )
+
+        # Phase 6e (Alt-C): SEPARATE audio bridge. ``max_concurrent``
+        # comes from ``settings.claude.audio_max_concurrent`` (default
+        # 1) — the Mac whisper-server hard-caps to 1 concurrent
+        # request, so client-side parallelism above 1 is pointless and
+        # the lower cap also keeps the SDK subprocess footprint bounded
+        # (worst-case 5 procs @ ~150 MB = ~750 MB RSS, well under the
+        # 1500m container cap). User + picker bridges are unaffected;
+        # they share the user-text ``claude.max_concurrent``.
+        # ``agents=None`` because audio jobs do not spawn subagents;
+        # ``extra_hooks`` mirrors the user bridge so SubagentStop
+        # would still fire correctly if the audio path ever delegated
+        # (defensive — costs nothing).
+        audio_bridge = ClaudeBridge(
+            self._settings,
+            extra_hooks=sub_hooks or None,
+            agents=None,
+            max_concurrent_override=self._settings.claude.audio_max_concurrent,
+        )
+        self._audio_bg_sem = asyncio.Semaphore(
+            self._settings.claude.audio_max_concurrent
+        )
+
         handler = ClaudeHandler(
-            self._settings, store, bridge, transcription=transcription
+            self._settings,
+            store,
+            bridge,
+            transcription=transcription,
+            audio_bridge=audio_bridge,
+            audio_bg_sem=self._audio_bg_sem,
+            audio_dispatch=self.spawn_audio_task,
+            audio_persist_pending=self._audio_persist_pending,
         )
         self._adapter.set_handler(handler)
         self._adapter.set_transcription(transcription)
@@ -481,6 +523,21 @@ class Daemon:
         await self._adapter.start()
         log.info("daemon_started", owner=self._settings.owner_chat_id)
 
+        # Phase 6e (MED-5): notify the owner if the boot reaper marked
+        # any pending turns as interrupted. ``cleanup_orphan_pending_turns``
+        # is INDISCRIMINATE — it covers text, photo, audio, file turns
+        # — so the wording stays generic. Sent BEFORE the subagent
+        # orphan notify so a daemon that crashed mid-bg-audio gets the
+        # owner's attention right away.
+        if orphans > 0 and self._adapter is not None:
+            self._spawn_bg(
+                self._adapter.send_text(
+                    self._settings.owner_chat_id,
+                    f"⚠️ daemon перезапущен: {orphans} turn(s) прерван(ы). "
+                    "Если ждал результат — повтори запрос.",
+                )
+            )
+
         # Phase 6: notify the owner of any subagent orphans recovered on
         # this boot. Done AFTER adapter.start so send_text actually
         # reaches Telegram. ``dropped_*`` branches are info-only — owner
@@ -552,6 +609,45 @@ class Daemon:
         task = asyncio.create_task(coro)
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
+
+    def spawn_audio_task(
+        self, coro: Coroutine[Any, Any, None]
+    ) -> None:
+        """Phase 6e: register a bg audio coroutine in ``_bg_tasks``.
+
+        Wired into ``ClaudeHandler.audio_dispatch``; called once per
+        voice / audio / URL turn AFTER the per-chat lock releases. Same
+        anchor pattern as :meth:`_spawn_bg` (NH-5 orphan-task risk),
+        but kept distinct so future audio-only telemetry / shutdown
+        hooks have a single seam to extend.
+
+        On ``Daemon.stop`` the bg task is cancelled by the
+        ``_bg_tasks`` drain; the persist tracking lives in the
+        SEPARATE ``_audio_persist_pending`` set which is drained
+        afterwards (see :meth:`stop`). Cancellation propagates into
+        ``ClaudeHandler._run_audio_job`` and out through its outer
+        ``finally`` so the persist task is still scheduled before the
+        bg task itself terminates.
+
+        Fix-pack F4 (DevOps CRIT-1): wrap the inner coroutine so any
+        unhandled exception (AssertionError, OperationalError, etc.)
+        becomes a structured ``log.exception`` instead of a silent
+        unraisable-hook warning. ``CancelledError`` is preserved so
+        ``Daemon.stop`` drain semantics still work. Persist data is
+        independently scheduled inside ``_run_audio_job``'s outer
+        finally; the wrapper exception path doesn't lose persist
+        because the persist task lives in ``_audio_persist_pending``.
+        """
+
+        async def _wrapped() -> None:
+            try:
+                await coro
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("audio_bg_task_unhandled")
+
+        self._spawn_bg(_wrapped())
 
     def _spawn_bg_supervised(
         self,
@@ -725,6 +821,49 @@ class Daemon:
         if self._bg_tasks:
             await asyncio.gather(*self._bg_tasks, return_exceptions=True)
         self._bg_tasks.clear()
+        # Phase 6e: drain bg audio persist tasks BEFORE the subagent
+        # drain + conn.close. Each persist task writes to
+        # ``conversations`` (user-row marker) and updates the ``turns``
+        # row (interrupt_turn). The persist tasks were SHIELDED inside
+        # the bg job's ``finally`` so the previous ``_bg_tasks`` cancel
+        # didn't kill them — they keep running, anchored to this set.
+        # On drain timeout the turn stays ``pending`` in the DB and the
+        # boot reaper handles it on next start (acceptable trade-off:
+        # 5s budget covers p99 sqlite write latency on a healthy VPS).
+        if self._audio_persist_pending:
+            audio_pending = list(self._audio_persist_pending)
+            log.info(
+                "daemon_draining_audio_persist",
+                count=len(audio_pending),
+            )
+            # F11: snapshot which tasks are still running BEFORE the
+            # outer ``gather`` is cancelled by ``wait_for`` — gather
+            # cascades the cancellation to its inner tasks, which would
+            # flip them to ``done()`` by the time the except block
+            # observed them. Build the snapshot just-in-time inside
+            # ``asyncio.wait`` so the post-timeout log carries the real
+            # outstanding set.
+            try:
+                _done, not_done = await asyncio.wait(
+                    audio_pending,
+                    timeout=self._settings.audio_bg.drain_timeout_s,
+                    return_when=asyncio.ALL_COMPLETED,
+                )
+                if not_done:
+                    log.warning(
+                        "daemon_audio_persist_drain_timeout",
+                        outstanding=[t.get_name() for t in not_done],
+                    )
+                    # Cancel the still-pending so they don't outlive
+                    # ``conn.close()`` and raise on a closed DB.
+                    for t in not_done:
+                        t.cancel()
+                    await asyncio.gather(*not_done, return_exceptions=True)
+            except Exception as exc:
+                log.warning(
+                    "daemon_audio_persist_drain_error",
+                    error=repr(exc),
+                )
         # Phase 6 (GAP #12): drain SubagentStop shielded notify tasks
         # BEFORE conn.close so a fired-but-not-yet-delivered Telegram
         # send can finish without ProgrammingError on a closed DB.
@@ -734,17 +873,28 @@ class Daemon:
                 "daemon_draining_subagent_notifies",
                 count=len(updates),
             )
+            # F11 (parity with audio drain): snapshot still-running
+            # tasks via ``asyncio.wait`` so the timeout log carries the
+            # real outstanding set instead of the post-cancel empty
+            # list. Cancel any leftover tasks before ``conn.close()``.
             try:
-                await asyncio.wait_for(
-                    asyncio.gather(*updates, return_exceptions=True),
+                _done, not_done = await asyncio.wait(
+                    updates,
                     timeout=self._settings.subagent.drain_timeout_s,
+                    return_when=asyncio.ALL_COMPLETED,
                 )
-            except TimeoutError:
+                if not_done:
+                    log.warning(
+                        "daemon_subagent_drain_timeout",
+                        outstanding=[t.get_name() for t in not_done],
+                    )
+                    for t in not_done:
+                        t.cancel()
+                    await asyncio.gather(*not_done, return_exceptions=True)
+            except Exception as exc:
                 log.warning(
-                    "daemon_subagent_drain_timeout",
-                    count=len(
-                        [t for t in updates if not t.done()]
-                    ),
+                    "daemon_subagent_drain_error",
+                    error=repr(exc),
                 )
         # Cancel installer-spawned uv-sync tasks (module-level set).
         await _core.cancel_bg_tasks()

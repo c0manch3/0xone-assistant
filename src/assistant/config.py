@@ -65,6 +65,14 @@ class ClaudeSettings(BaseSettings):
     timeout: int = 300
     max_turns: int = 20
     max_concurrent: int = 2
+    # Phase 6e: dedicated semaphore size for the bg audio bridge. The
+    # owner-text bridge keeps ``max_concurrent`` (2) so a long-running
+    # audio job never blocks owner text. Mac whisper-server holds a
+    # hard ``Semaphore(1)`` for GPU memory reasons (see
+    # plan/phase6e/description.md §RQ3, "CLOSED-NEGATIVE"); raising
+    # this above 1 is pointless until the sidecar is rearchitected
+    # multi-instance.
+    audio_max_concurrent: int = 1
     history_limit: int = 20
     thinking_budget: int = 0
     effort: str = "medium"
@@ -151,6 +159,26 @@ class SubagentSettings(BaseSettings):
     claude_subagent_timeout: int = 900
 
 
+class AudioBgSettings(BaseSettings):
+    """Phase 6e bg-audio-task knobs (``ASSISTANT_AUDIO_BG_*`` env prefix).
+
+    Single knob today — the drain budget for ``Daemon._audio_persist_pending``
+    inside ``Daemon.stop``. Mirrors the phase-6 ``subagent.drain_timeout_s``
+    pattern so a fired-but-not-yet-flushed persist task can finish before
+    ``conn.close()`` slams the door (see spec §6 / researcher RQ2).
+
+    On drain timeout the turn stays ``pending`` in the DB and the boot
+    reaper picks it up on the next start.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="ASSISTANT_AUDIO_BG_",
+        env_file=[_user_env_file(), Path(".env")],
+        extra="ignore",
+    )
+    drain_timeout_s: float = 5.0
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=[_user_env_file(), Path(".env")],
@@ -170,6 +198,7 @@ class Settings(BaseSettings):
     memory: MemorySettings = Field(default_factory=MemorySettings)
     scheduler: SchedulerSettings = Field(default_factory=SchedulerSettings)
     subagent: SubagentSettings = Field(default_factory=SubagentSettings)
+    audio_bg: AudioBgSettings = Field(default_factory=AudioBgSettings)
 
     # ------------------------------------------------------------------
     # Phase 6c: voice / audio / URL transcription via Mac mini Whisper.

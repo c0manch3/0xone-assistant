@@ -118,6 +118,7 @@ class ClaudeBridge:
         *,
         extra_hooks: dict[str, list[HookMatcher]] | None = None,
         agents: dict[str, AgentDefinition] | None = None,
+        max_concurrent_override: int | None = None,
     ) -> None:
         """Phase 6 (research RQ1 + RQ2): ``extra_hooks`` is a dict
         keyed by SDK hook event name (``"SubagentStart"``,
@@ -130,9 +131,22 @@ class ClaudeBridge:
         from :func:`build_agents`. When non-None, ``"Task"`` is added
         to ``allowed_tools`` so the model can delegate; otherwise the
         Task tool is hidden (avoids a "no targets" model confusion).
+
+        Phase 6e (Alt-C): ``max_concurrent_override`` lets the daemon
+        wire a SEPARATE bridge instance (the audio bridge) with its own
+        semaphore size, decoupled from ``settings.claude.max_concurrent``
+        (which the user + picker bridges share). When ``None`` the
+        default ``settings.claude.max_concurrent`` applies; when set,
+        the override drives ``self._sem``. Other bridges are
+        unaffected — they don't pass the kwarg.
         """
         self._settings = settings
-        self._sem = asyncio.Semaphore(settings.claude.max_concurrent)
+        sem_size = (
+            max_concurrent_override
+            if max_concurrent_override is not None
+            else settings.claude.max_concurrent
+        )
+        self._sem = asyncio.Semaphore(sem_size)
         self._extra_hooks = extra_hooks or {}
         self._agents = agents
 

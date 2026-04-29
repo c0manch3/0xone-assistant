@@ -128,10 +128,53 @@ class IncomingMessage:
         would otherwise have to guess which to honour. Fail fast at
         construction to catch any future caller that violates the
         contract.
+
+        Phase 6e (CRIT-3 close): scheduler-origin turns cannot carry
+        audio. The audio branch dispatches a bg task and returns the
+        per-chat lock; the scheduler dispatcher's ``revert_to_pending``
+        / dead-letter machinery has no caller waiting on the bg task
+        to finish, so a scheduler-origin audio turn would be
+        permanently divorced from its trigger row. Reject at
+        construction; F7 (phase 6c fix-pack scheduler-note injection
+        for audio path) is explicitly reverted by this check.
+
+        Fix-pack F9 (QA H-2): an audio ``attachment_kind`` must be
+        accompanied by a concrete source — either ``attachment`` (local
+        file) or ``url_for_extraction`` (remote URL). Constructing an
+        audio kind with neither would crash deep inside
+        ``_run_audio_job`` with a confusing AssertionError; surface the
+        contract violation at the IncomingMessage boundary instead.
+
+        Fix-pack F10: tighten the audio-origin check from
+        ``!= 'scheduler'`` to ``== 'telegram'``. Picker-origin audio
+        is just as broken (bg dispatch + no caller for the picker's
+        ledger to wait on); only Telegram-originated audio turns are
+        meaningful.
         """
         if self.attachment is not None and self.url_for_extraction is not None:
             raise AssertionError(
                 "attachment and url_for_extraction are mutually exclusive"
+            )
+
+        is_audio_kind = (
+            self.attachment_kind is not None
+            and self.attachment_kind in AUDIO_KINDS
+        )
+        if (
+            is_audio_kind
+            and self.attachment is None
+            and self.url_for_extraction is None
+        ):
+            raise AssertionError(
+                "audio attachment_kind requires attachment OR "
+                "url_for_extraction"
+            )
+
+        is_audio = is_audio_kind or self.url_for_extraction is not None
+        if is_audio and self.origin != "telegram":
+            raise AssertionError(
+                "non-telegram audio/URL turns are not supported "
+                f"(got origin={self.origin!r})"
             )
 
 
@@ -151,6 +194,28 @@ class MessengerAdapter(ABC):
 
 
 class Handler(Protocol):
-    """Phase-2 handler contract: receive an incoming message, emit text chunks."""
+    """Phase-2 handler contract: receive an incoming message, emit text chunks.
 
-    async def handle(self, msg: IncomingMessage, emit: Emit) -> None: ...
+    Phase 6e: ``emit_direct`` is an optional second emit channel used by
+    the audio bg-task path. The lock-time ``emit`` keeps its phase-2
+    chunks-then-flush semantics; ``emit_direct`` short-circuits to
+    ``adapter.send_text(...)`` so a bg task firing seconds-to-minutes
+    AFTER ``handle()`` returns can still deliver owner-visible output.
+    Defaults to ``None`` for backward-compat with the scheduler
+    dispatcher and existing Handler tests that pre-date 6e.
+
+    Fix-pack F2: ``typing_lifecycle`` is an async-context-manager
+    factory used by the bg audio path so the Telegram typing indicator
+    stays visible across the entire transcribe + bridge.ask body
+    (multiple minutes for a long-form voice). Defaults to ``None`` —
+    the audio job uses a no-op lifecycle when nothing is supplied so
+    inline tests and non-audio paths see no behaviour change.
+    """
+
+    async def handle(
+        self,
+        msg: IncomingMessage,
+        emit: Emit,
+        emit_direct: Emit | None = None,
+        typing_lifecycle: Any | None = None,
+    ) -> None: ...

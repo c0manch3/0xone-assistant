@@ -3,13 +3,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import re
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramRetryAfter,
+)
 from aiogram.types import Message
 from aiogram.utils.chat_action import ChatActionSender
 
@@ -1078,26 +1083,93 @@ class TelegramAdapter(MessengerAdapter):
         chat_id: int,
         incoming: IncomingMessage,
     ) -> None:
-        """Run the audio turn through the standard handler with a manual
-        typing loop instead of ``ChatActionSender`` (H2 closure)."""
+        """Phase 6e dispatcher: lock-time pre-flight + handoff.
+
+        The handler's audio branch returns within ~50 ms (lock release);
+        the bg task running afterwards owns transcribe + bridge.ask +
+        persist + tmp cleanup. We hand it ``emit_direct`` so its output
+        reaches Telegram even though ``handle()`` has long since returned
+        and any ``chunks`` accumulator would be out of scope.
+
+        ``emit`` (lock-time) stays a no-op for parity with the
+        :class:`Handler` Protocol — phase 6c relied on a chunks-then-
+        flush fallback, but the bg path has no caller to flush for, and
+        the post-handler chunks-fallback is intentionally REMOVED for
+        the audio branch (see spec §4 — non-audio paths still use it).
+
+        Fix-pack F2: ``typing_lifecycle`` is wired so the bg task can
+        keep the Telegram typing indicator alive for the FULL transcribe
+        + bridge.ask body (minutes), not just the ~50 ms lock window.
+
+        Fix-pack F3: ``emit_direct`` distinguishes between rate-limit,
+        Telegram API, and unexpected exception paths so a flaky
+        connection doesn't silently swallow the owner-visible output.
+
+        Fix-pack F1: the bg job aggregates streamed text into one final
+        Telegram message and emits ONCE, instead of N pushes per
+        TextBlock (avoids 429 rate-limits on long answers + 10x push
+        notifications).
+        """
         if self._handler is None:
             return
-        chunks: list[str] = []
 
         async def emit(text: str) -> None:
-            chunks.append(text)
+            # Audio path dispatches to bg; nothing flushed via chunks.
+            # Kept for Handler Protocol compatibility.
+            return
 
-        typing_task = asyncio.create_task(self._periodic_typing(chat_id))
-        try:
-            await self._handler.handle(incoming, emit)
-        finally:
-            typing_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await typing_task
+        async def emit_direct(text: str) -> None:
+            try:
+                for part in _split_for_telegram(text, limit=TELEGRAM_MSG_LIMIT):
+                    await self._bot.send_message(chat_id, part)
+            except TelegramRetryAfter as exc:
+                log.warning(
+                    "emit_direct_rate_limited",
+                    chat_id=chat_id,
+                    retry_after=exc.retry_after,
+                )
+            except TelegramAPIError as exc:
+                log.warning(
+                    "emit_direct_telegram_api_error",
+                    chat_id=chat_id,
+                    error=repr(exc),
+                )
+            except Exception as exc:
+                # Adapter session closed during shutdown, generic guard.
+                log.warning(
+                    "emit_direct_unexpected",
+                    chat_id=chat_id,
+                    error=repr(exc),
+                )
 
-        full = "".join(chunks).strip() or "(пустой ответ)"
-        for part in _split_for_telegram(full, limit=TELEGRAM_MSG_LIMIT):
-            await self._bot.send_message(chat_id, part)
+        @contextlib.asynccontextmanager
+        async def typing_lifecycle() -> AsyncIterator[None]:
+            """Drive ``send_chat_action`` on a periodic loop while the
+            bg task is in flight. Re-uses ``_periodic_typing`` so the
+            cadence stays single-sourced.
+            """
+            typing_task = asyncio.create_task(
+                self._periodic_typing(chat_id),
+                name=f"audio-typing-{chat_id}",
+            )
+            try:
+                yield
+            finally:
+                typing_task.cancel()
+                with contextlib.suppress(
+                    asyncio.CancelledError, Exception
+                ):
+                    await typing_task
+
+        await self._handler.handle(
+            incoming,
+            emit,
+            emit_direct=emit_direct,
+            typing_lifecycle=typing_lifecycle,
+        )
+        # No post-handler chunks fallback for the audio path — the bg
+        # task owns owner-visible output via emit_direct. Typing
+        # lifecycle is owned by the bg task body (see ``AudioJob``).
 
     async def _on_animation(self, message: Message) -> None:
         """Phase 6b (F2 / AC#5): dedicated handler for animated GIFs and

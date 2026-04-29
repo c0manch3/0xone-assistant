@@ -76,14 +76,30 @@ class _FakeHandler:
     def __init__(self) -> None:
         self.received: list[IncomingMessage] = []
         self.reply_text = "ok"
+        # Phase 6e fix-pack F2: capture the typing_lifecycle factory so
+        # tests can assert the adapter wired one through.
+        self.typing_lifecycle: Any | None = None
 
     async def handle(
         self,
         msg: IncomingMessage,
         emit: Callable[[str], Awaitable[None]],
+        emit_direct: Callable[[str], Awaitable[None]] | None = None,
+        typing_lifecycle: Any | None = None,
     ) -> None:
+        # Phase 6e: ``emit_direct`` is now part of the Handler Protocol
+        # (audio path bg-time channel). For the audio fixtures here we
+        # route the reply through ``emit_direct`` when supplied so the
+        # adapter's ``_dispatch_audio_turn`` rewrite (no chunks fallback)
+        # still surfaces the test's "ok" reply through the bg path.
+        # Non-audio paths leave ``emit_direct`` None and keep using
+        # ``emit`` exactly as before.
         self.received.append(msg)
-        await emit(self.reply_text)
+        self.typing_lifecycle = typing_lifecycle
+        if emit_direct is not None:
+            await emit_direct(self.reply_text)
+        else:
+            await emit(self.reply_text)
 
 
 class _StubTranscription(TranscriptionService):
