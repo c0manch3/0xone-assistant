@@ -6,10 +6,20 @@ import asyncio
 import datetime as dt
 import os
 import shutil
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+
+# Phase 6e debug: capture failed-test reports so they print BEFORE
+# pytest_sessionfinish os._exit cuts off pytest's terminal summary.
+_FAILED_REPORTS: list[pytest.TestReport] = []
+
+
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    if report.when == "call" and report.failed:
+        _FAILED_REPORTS.append(report)
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
@@ -22,6 +32,12 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     teardown — fine for CI where the container is destroyed anyway.
     """
     if os.environ.get("PYTEST_FORCE_EXIT") == "1":
+        if _FAILED_REPORTS:
+            sys.stderr.write("\n=== FAILED TESTS ===\n")
+            for r in _FAILED_REPORTS:
+                sys.stderr.write(f"FAILED {r.nodeid}\n")
+                sys.stderr.write(f"{r.longreprtext}\n")
+            sys.stderr.flush()
         os._exit(int(exitstatus))
 
 
