@@ -1,216 +1,429 @@
-# Phase 8 — GitHub CLI + ежедневный vault auto-commit
+# Phase 8 — Vault → GitHub push-only periodic sync
 
-## Цель
+> Spec v0. Owner-fixed scope (no re-litigation): push-only direction,
+> dedicated private GH repo, SSH deploy key auth, periodic batch
+> trigger. All RQs from the Plan-agent draft are closed below — see
+> §1 final paragraph and §3 settings table for the exact values.
 
-Подключить GitHub-операции (issues / PR-introspection / `gh api`) и organisational
-git-state (commit/push) к боту через тонкий CLI `tools/gh/main.py` плюс
-сидируемый по дефолту scheduled-job, который ежедневно коммитит и пушит
-содержимое `<data_dir>/vault/` в сконфигурированный owner-репозиторий
-(README §Порядок фаз line 44 + §Ключевые архитектурные решения line 13).
-Phase 8 расширяет phase-3 read-only `gh api` allowlist на дополнительные
-read-only субкоманды (`gh issue`, `gh pr`, `gh repo`) **и** добавляет
-узко-сфокусированный write-канал на vault-репозиторий — без расширения
-доступа к произвольным remote-репозиториям. Тяжёлые write-операции
-(creation PR, force-push, любые `gh api -X POST`) остаются недоступны
-модели и переносятся на phase 9 keyboard-confirm flow.
+## 1. Goal
 
-## Вход
+The bot's long-term memory vault at `<data_dir>/vault/` on the VPS gets
+push-only synced to a dedicated private GitHub repo on a periodic batch
+schedule. GitHub holds a read-only mirror of the vault contents — the
+bot is the sole writer, there is no pull-back path, and out-of-band
+edits on the GH side are treated as an error to surface (not
+auto-merge).
 
-- **Phase 7 shipped:** `dispatch_reply` + `_DedupLedger` (артефакты из
-  outbox автоматически становятся Telegram-вложениями), Bash hook factory
-  с `make_pretool_hooks(project_root, data_dir=None)` (I-7.5),
-  `make_subagent_hooks(*, store, adapter, settings, pending_updates,
-  dedup_ledger)` (I-7.4), shared `validate_existing_input_path` /
-  `validate_future_output_path` в `src/assistant/media/path_guards.py`,
-  retention sweeper для `<data_dir>/media/` (НЕ vault).
-- **Phase 6 shipped:** SDK-native subagent infrastructure + worker
-  AgentDefinition + `tools/task/main.py spawn` для async delegation.
-- **Phase 5 shipped:** `SchedulerLoop`, `SchedulerDispatcher`, DB schema v3
-  с `schedules` / `triggers` таблицами, scheduler-injected turn с
-  `IncomingMessage(origin="scheduler")`, per-chat lock, scheduler
-  system-note. Default-seed pattern отложен из phase 5 на phase 8.
-- **Phase 4 shipped:** vault на `<data_dir>/vault/`, memory CLI пишет
-  markdown-only — binary артефакты в vault не попадают.
-- **Phase 3 shipped:** read-only `gh api` allowlist с whitelist endpoints
-  `/repos/anthropics/skills/contents/...`; `gh auth status` allow;
-  `gh pr create` deny.
-- **External:** `gh` CLI установлен на хосте, `gh auth status` успешный.
-- **SSH deploy key для vault remote (dedicated GitHub account):** Owner
-  создаёт отдельный GitHub аккаунт `vaultbot-owner` (или аналог) + приватный
-  repo `<vaultbot-owner>/vault-backup` + deploy key (write access) подгружен
-  в `~/.ssh/id_vault`. Path задаётся через `GH_VAULT_SSH_KEY` env (default
-  `~/.ssh/id_vault`). Git push использует ssh URL `git@github.com:<vault-owner>/<vault-repo>.git`.
-  Основной `gh auth login` на host-аккаунте используется ТОЛЬКО для issue/pr/repo
-  operations и НЕ участвует в vault push.
+The single supported flow:
 
-## Выход — пользовательские сценарии (E2E)
+1. Owner chats with the bot → the model invokes the existing phase-4
+   `memory_write` MCP tool → markdown files appear under
+   `<data_dir>/vault/` (existing phase-4 behaviour, unchanged).
+2. On a cron tick (default `0 * * * *` — every hour at :00), the daemon
+   runs a vault-sync pass: `git add . && git commit -m "..." &&
+   git push origin main` inside `<data_dir>/vault/`.
+3. The dedicated GH repo `c0manch3/0xone-vault` accumulates a commit log
+   of vault changes, viewable in the browser. No human or other system
+   pushes to that repo — the deploy key is the only writer.
+4. Model can also trigger an immediate push via the `vault_push_now`
+   MCP @tool ("важная заметка, давай сразу засинхрю" → model invokes
+   the tool → same git pipeline runs synchronously).
 
-1. **"открой issue в репо про баг X"** → модель → `tools/gh/main.py
-   issue create --repo <owner>/0xone-assistant --title 'X' --body '<...>'` →
-   exit 0, JSON `{"url": "...", "number": 42}`.
-2. **"какие открытые issues?"** → `gh issue list --state open --json
-   number,title,labels`.
-3. **"посмотри PR #15"** → `gh pr view 15 --repo <...> --json
-   title,body,state,mergeable`.
-4. **Daily vault auto-commit** (scheduler-originated). В 03:00 локального TZ
-   scheduler триггерит → handler даёт модели turn с
-   `origin="scheduler", text="ежедневный бэкап vault: сделай git add
-   data/vault, коммит и git push"` → модель вызывает
-   `Bash("python tools/gh/main.py vault-commit-push --message 'vault sync
-   2026-04-19'")` → `git -C <project_root> add -- <vault_relpath>` →
-   commit → push → exit 0 → модель проактивно отвечает owner'у
-   "vault сохранён, N файлов, sha=abc1234". Empty diff → exit 5
-   "no_changes" → silent.
-5. **Manual "запушь vault сейчас"** → тот же CLI, user-originated turn.
-6. **Conflict при push** (race с лаптопом) → CLI exits 7 + JSON
-   `{"ok": false, "error": "remote has diverged"}` → fail-fast, owner
-   разрешает на лаптопе (авто-rebase не делаем).
+This phase does NOT add `gh` CLI features — pure git-over-SSH only. No
+PR creation, no issue read/write, no `gh api` extensions. The sole
+GitHub interaction is `git push` over SSH using a dedicated deploy key
+unique to the `0xone-vault` repo.
 
-## Задачи (ordered)
+**Closed RQ decisions** (orchestrator-confirmed with owner; folded
+into this spec, no longer "open"):
 
-1. **Phase-7 fix-pack pre-flight (Wave 0).** Закрыть X-1 (isinstance check
-   в genimage `_check_and_increment_quota`) + X-2 (UnicodeDecodeError в
-   `_read_quota_best_effort`) + идентифицировать xpassed. Один коммит до
-   старта основной работы.
-2. **`GitHubSettings(BaseSettings)` с `env_prefix="GH_"`**:
-   `vault_remote_url` (ssh-format, required; e.g. `git@github.com:vaultbot-owner/vault-backup.git`),
-   `vault_ssh_key_path` (default `~/.ssh/id_vault`; путь к SSH key для vault push),
-   `vault_remote_name` (default `"origin"`), `vault_branch` (default `"main"`),
-   `auto_commit_enabled` (bool, default `True`), `auto_commit_cron` (default
-   `"0 3 * * *"`), `auto_commit_tz` (default `"UTC"`),
-   `commit_message_template` (default `"vault sync {date}"`),
-   `commit_author_email`, `allowed_repos` (tuple of `owner/repo` slugs).
-   Nested под `Settings.github`.
-3. **`tools/gh/main.py`** (~250 LOC stdlib). Subcommands:
-   - `auth-status`, `issue create/list/view`, `pr list/view`, `repo view`.
-   - `vault-commit-push --message MSG [--dry-run]`:
-     a. `git -C <project_root> rev-parse --is-inside-work-tree`.
-     b. `git -C <...> diff --quiet -- <vault_relpath>` → exit 0 = nop → exit 5.
-     c. `git -C <...> add -- <vault_relpath>` (path-pinned, НЕ `-A`).
-     d. `git -C <...> commit -m <msg> --only -- <vault_relpath>` с
-        GIT_AUTHOR из config.
-     e. `git -C <...> push <remote> <branch>` без `--force`. На non-ff → exit 7.
-        Before push: `env["GIT_SSH_COMMAND"] = f"ssh -i {vault_ssh_key_path} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"` so push использует dedicated key without polluting owner's global ssh-agent.
-     f. JSON `{"ok": true, "commit_sha": "...", "files_changed": N}`.
-   - **Out of scope:** PR creation, `gh api -X POST/...`, force-push, push
-     на не-vault remote.
-4. **`skills/gh/SKILL.md`** с `allowed-tools: [Bash]`, примеры диалогов,
-   exit-code matrix (0 ok, 2 argv, 3 validation, 4 gh not authed, 5
-   no_changes, 6 repo_not_allowed, 7 diverged, 8 push_failed, 9 lock_busy).
-5. **Bash allowlist extension в `bridge/hooks.py`.** Добавить
-   `_validate_gh_argv` для `tools/gh/main.py` подкоманд (phase-7 pattern).
-   Существующий `_validate_gh_invocation` для прямого `gh api` НЕ
-   расширяется.
-6. **Default-seed scheduled job** в `Daemon.start()`. После
-   `ensure_media_dirs` → `_ensure_vault_auto_commit_seed(store, settings.github)`:
-   check existing schedule with seed_key=`"vault_auto_commit"` (migration
-   `0004_schedule_seed_key.sql`); отсутствует → INSERT с cron из config.
-   Idempotent (unique constraint). `auto_commit_enabled=False` → skip.
-7. **Vault-remote bootstrap helper.** Если `<project_root>/.git` отсутствует
-   или нет remote `<vault_remote_name>` → `Daemon.start` логгирует
-   `vault_remote_not_configured`; owner получает one-time system-note при
-   первом gh-запросе. Auto-commit seed пропускается до настройки.
-   Log `vault_ssh_key_missing` if `vault_ssh_key_path` does not exist OR
-   `vault_remote_not_configured` if `vault_remote_url` is empty.
-8. **Concurrency / locking.** `vault-commit-push` берёт `fcntl.flock` на
-   `<data_dir>/run/gh-vault-commit.lock`; параллельный запуск ждёт 30 s
-   → exit 9 "lock_busy".
-9. **Тесты** (~600 LOC, 12 файлов):
-   - `test_gh_validate_argv.py` (argv allow/deny matrix)
-   - `test_gh_vault_commit_push_happy.py` (mock subprocess)
-   - `test_gh_vault_commit_push_no_changes.py` (exit 5)
-   - `test_gh_vault_commit_push_diverged.py` (exit 7)
-   - `test_gh_vault_commit_path_isolation.py` (phase-7 critical: data/media
-     НЕ попадает в commit)
-   - `test_gh_issue_create_happy.py` (mock subprocess + whitelist)
-   - `test_gh_repo_whitelist.py` (non-allowed repo → exit 6)
-   - `test_gh_seed_idempotency.py` (double-start не дублирует row)
-   - `test_gh_seed_disabled.py` (auto_commit_enabled=False → skip)
-   - `test_gh_flock_concurrency.py` (2 parallel → second waits or exit 9)
-   - `test_gh_bash_hook_integration.py` (`_validate_python_invocation`
-     dispatcher routing)
-   - `test_gh_skill_md_assertion.py` (H-13 паттерн: SKILL.md valid)
-10. **Документация `docs/ops/github-setup.md`.** `gh auth login` setup,
-    private vault repo creation, env vars, cron override через
-    `tools/schedule/main.py`, SSH key fallback.
+- Repo: `c0manch3/0xone-vault` (dedicated private), SSH URL
+  `git@github.com:c0manch3/0xone-vault.git`.
+- Cron default: `0 * * * *` (hourly at :00 UTC).
+- GH account: `c0manch3` (owner's main account; deploy key scoped to
+  the single `0xone-vault` repo so blast radius is bounded).
+- Manual trigger: IN scope as `vault_push_now` MCP @tool.
+- Notify channel on failure: Telegram, with 24-hour cooldown
+  (`notify_cooldown_s=86400`) so a stuck failure mode doesn't spam.
+- Scheduler shape: Shape A — new `kind` column added via migration
+  `0005_schedules_kind.sql`. The dispatcher branches on the column;
+  no sentinel-prompt heuristic.
 
-## Критерии готовности
+## 2. Architecture
 
-- Bot может создавать / читать issues и читать PR через `tools/gh/main.py`.
-- Default seed после `Daemon.start()` виден через `tools/schedule/main.py list`.
-- В 03:00 (или через ручной trigger) scheduler → handler → модель →
-  `vault-commit-push` → коммит на remote с vault-файлами only.
-- `git log` на remote показывает коммиты БЕЗ `data/media/`, `data/assistant.db`,
-  `data/run/`.
-- Empty diff → exit 5, silent (no Telegram message).
-- Conflict → exit 7 → понятный owner message, auto-rebase НЕ делается.
-- Bash hook rejects:
-  - `--force`, `--no-verify` → deny.
-  - `--repo otheruser/private` (не в allowed_repos) → CLI exit 6.
-  - `gh pr create` через прямой gh → phase-3 hook deny.
-- `auto_commit_enabled=False` → seed не создаётся.
-- `gh auth status` non-zero → vault-commit-push exit 4.
-- `GH_VAULT_SSH_KEY` missing or not readable → `vault-commit-push` exit 10 "ssh_key_error" with actionable message.
-- **Phase-7 invariants preserved:** `make_subagent_hooks` signature (I-7.4),
-  `_DedupLedger` TTL=300/cap=256 (I-7.1), `MediaSettings` retention (I-7.2),
-  `dispatch_reply` unchanged, `_ARTEFACT_RE` v3 unchanged (gh output не
-  содержит outbox paths).
-- X-1/X-2 закрыты в Wave 0 (xfail count 5 → 3).
+### 2.1 Trigger mechanism — scheduler-driven cron
 
-## Зависимости
+The vault-sync subsystem is driven by the existing phase-5b
+`SchedulerLoop` already wired into the daemon. We add a single
+seeded schedule row at daemon boot:
 
-- **Phase 7 (КРИТИЧНО, инварианты):** hook factory signature, dedup ledger
-  lifecycle, media/vault separation. Tests `test_gh_vault_commit_path_isolation`
-  явно гарантирует invariant сохранения.
-- **Phase 6:** worker AgentDefinition — optional для очень больших vault
-  commits (десятки MB).
-- **Phase 5:** scheduler + DB schema v3 + scheduler-injected turn + UDS IPC —
-  основа для default-seed. Migration `0004_schedule_seed_key.sql` (optional
-  idempotency column).
-- **Phase 4:** vault на `<data_dir>/vault/` — git add pinned.
-- **Phase 3:** existing `_validate_gh_invocation` (read-only `gh api`)
-  остаётся; новый `_validate_gh_argv` для `tools/gh/main.py` — phase-7 pattern.
-- **External:** `gh auth login` выполнен owner'ом; `<project_root>` — git repo
-  с configured remote.
+- `kind = 'system:vault_sync'`
+- `cron = settings.vault_sync.cron` (default `"0 * * * *"`)
+- `seed_key = "vault_sync"` (idempotent — repeated daemon starts do
+  not duplicate the row, see §2.8 migration).
 
-## Явно НЕ в phase 8
+When the cron tick fires, the dispatcher does NOT inject a prompt for
+the model. Instead it directly invokes
+`VaultSyncSubsystem.run_once(reason="scheduled")`. This avoids paying
+a model turn (and the associated Anthropic billing + ~5–15 s wall
+latency) for what is purely a mechanical git operation.
 
-- PR creation через `gh pr create` (phase 9 keyboard-confirm).
-- Issue close / comment / edit (phase 9).
-- `gh api -X POST/PUT/PATCH/DELETE`.
-- `git push --force`, `--force-with-lease`, `--no-verify`.
-- Auto-rebase / auto-merge при conflict.
-- Multiple vault remotes / multi-vault.
-- Encrypted vault (git-crypt).
-- Inline-keyboard для approve PR (phase 9, требует callback_query handler).
-- Webhook receiving (GitHub → bot).
-- GitHub Actions integration.
-- Per-skill `allowed-tools` enforcement (phase 9).
-- `HISTORY_MAX_SNIPPET_TOTAL_BYTES` cap (phase 9).
-- GitHub-App auth / OAuth flow (phase 9 opt-in, только если deploy key flow окажется недостаточным).
+### 2.2 Repo layout — `.git` inside the vault dir
 
-## Риск
+The vault directory `<data_dir>/vault/` is itself the working tree of
+a dedicated git repo. `.git/` lives directly under
+`<data_dir>/vault/.git/`. There is no superproject — the vault is its
+own standalone repo.
 
-**Средний.**
+`.gitignore` (committed at repo init by the bootstrap script in §4)
+includes:
 
-| Severity | Risk | Mitigation |
-|---|---|---|
-| 🟡 | Случайный push с secret'ами | `git add` pinned на `<vault_dir>/` (markdown only через memory CLI); bootstrap добавляет `.gitignore` в vault (`*.env`, `*.key`, `secrets/`). |
-| 🟡 | SSH deploy key compromised → vault exfil + tamper | Write-only deploy key (no read access to other repos на том аккаунте); key rotation documented in docs/ops/github-setup.md; separate account limits blast radius. |
-| 🟡 | gh credentials истекают → silent fail | CLI exit 4; scheduler-turn доставляет ошибку owner'у; health-check (phase 9 optional). |
-| 🟡 | Race с лаптопом owner'а | CLI exit 7 fail-fast; owner разрешает `git pull --rebase` на лаптопе; default cron 03:00 минимизирует race. |
-| 🟡 | Issue create в неправильный репо (typo) | `GitHubSettings.allowed_repos` whitelist; exit 6 if not listed. |
-| 🟢 | Force push через model | CLI argv валидация отклоняет `--force*`; `_validate_python_invocation` argv-allowlist (phase-7 pattern). |
-| 🟢 | Vault grow 100 MB+ ежедневно | git хорошо diff'ит markdown; `data/media/` явно ИСКЛЮЧЕН. |
-| 🟢 | Scheduler spam при cron misconfig | Single seed с unique key — дубликаты не создаются. |
-| 🟢 | gh CLI отсутствует | `Daemon.start` warning + отключает seed. |
+```
+# anything that shouldn't leave the VPS
+*.tmp
+*.swp
+.DS_Store
+*~
+# explicitly NO data/media/ — that path is outside the vault dir
+# already; this .gitignore is just defence in depth.
+```
 
-> **Phase-7 integration note (vault vs media).** Phase 7 кладёт inbox/outbox
-> в `<data_dir>/media/` с retention sweep (14d/7d/2GB LRU). Vault —
-> отдельная иерархия `<data_dir>/vault/`, sweeper не трогает (I-7.2).
-> Phase-8 vault auto-commit `git add`'ит **только** `<vault_dir>` путь;
-> `data/media/` и `data/run/` явно НЕ попадают — критично для приватности
-> (фото owner'а остаются локальными) и размера repo. Photo-attachments не
-> попадают в vault, если модель не сохранила их через memory skill явно.
-> Тест `test_gh_vault_commit_path_isolation.py` гарантирует что outbox-файл
-> не попал в diff vault-коммита.
+The vault's git config has `core.autocrlf = false`,
+`core.filemode = false`, `user.email` and `user.name` set to a
+bot-identity (`0xone-assistant <bot@0xone>`).
+
+### 2.3 Push mechanism — pure git over SSH
+
+The subsystem shells out to the system `git` binary via
+`asyncio.subprocess`. Authentication is via an SSH deploy key
+generated during the §4 bootstrap, stored at
+`/home/0xone/.ssh/0xone_vault_deploy` on the VPS, and registered as
+the **only** deploy key with write access on the GH repo.
+
+The subsystem sets `GIT_SSH_COMMAND` for each subprocess invocation:
+
+```
+GIT_SSH_COMMAND="ssh -i /home/0xone/.ssh/0xone_vault_deploy -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/home/0xone/.ssh/known_hosts_vault"
+```
+
+This isolates vault git ops from any other ssh-agent or default-key
+behaviour on the host. No `gh` CLI dependency — `gh` is not invoked
+anywhere in this phase.
+
+### 2.4 Locking — daemon-scoped `asyncio.Lock`
+
+A single `asyncio.Lock` instance lives on `VaultSyncSubsystem`. Both
+the cron-driven dispatcher path AND the model `vault_push_now` @tool
+path acquire this lock before running the git pipeline. The two paths
+serialise cleanly — if a cron tick fires while a manual push is
+in-flight (or vice-versa), the second waits.
+
+The lock is process-local (single daemon, per the CLAUDE.md
+non-negotiable "single active daemon at a time across hosts"). No
+`fcntl.flock` / on-disk lock is needed because the daemon is the only
+writer.
+
+### 2.5 Conflict / divergence handling
+
+The push uses plain `git push origin main` (no `--force`,
+no `--force-with-lease`). If the remote has diverged (which should
+never happen — only the deploy key writes), git returns non-zero with
+`! [rejected] main -> main (non-fast-forward)`.
+
+On divergence the subsystem:
+
+1. Logs a structured-log error with `event=vault_sync_diverged`,
+   `local_sha=...`, `remote_sha=...` (fetched on the spot for the
+   log).
+2. Sends a Telegram notify to the owner: "vault sync failed:
+   remote diverged. Manual recovery needed." (subject to the 24-hour
+   cooldown per §2.7).
+3. Does NOT attempt rebase, merge, or force-push.
+4. Returns failure to the caller.
+
+Cron continues to attempt the push every hour; each failure
+re-evaluates the cooldown and may or may not notify.
+
+### 2.6 Empty diff — silent no-op
+
+If `git status --porcelain` returns empty after `git add -A`, the
+subsystem skips the commit entirely (no empty commits). This is
+logged at debug level (`event=vault_sync_no_changes`) and does NOT
+notify Telegram. The `vault_push_now` @tool returns
+`{"ok": true, "files_changed": 0, "commit_sha": null}` in this case.
+
+### 2.7 Module location — `src/assistant/vault_sync/`
+
+New package `src/assistant/vault_sync/` contains:
+
+- `__init__.py` — exports `VaultSyncSubsystem`, `VaultSyncSettings`.
+- `subsystem.py` — `VaultSyncSubsystem` class with `run_once(reason)`
+  and the `asyncio.Lock`. Constructor takes a `vault_dir: Path`,
+  `settings: VaultSyncSettings`, `notifier: TelegramNotifier`.
+- `git_ops.py` — thin async wrappers around `git status`,
+  `git add`, `git commit`, `git push` returning typed result
+  dataclasses; centralises the `GIT_SSH_COMMAND` env injection.
+- `notify.py` — Telegram failure-notify with on-disk cooldown
+  state at `<data_dir>/run/vault_sync_last_notify` (epoch seconds).
+  Re-notifying respects `settings.vault_sync.notify_cooldown_s`
+  (default 86400 = 24 h).
+
+The subsystem is owned by `Daemon` (constructed once at boot, lives
+for the daemon lifetime). The dispatcher and the `vault_push_now`
+@tool both hold a reference to the same instance.
+
+**Manual @tool path.** A new MCP @tool `vault_push_now` is registered
+under a new MCP server group `mcp__vault__` (separate from the
+existing `mcp__memory__` and `mcp__scheduler__` groups so its
+allow/deny status is independently togglable via skill frontmatter).
+The tool body:
+
+1. Acquires `VaultSyncSubsystem._lock` (the same lock cron uses).
+2. Calls `VaultSyncSubsystem.run_once(reason="manual")`.
+3. Returns `{"ok": True, "files_changed": N, "commit_sha": "<sha>"}`
+   on success, `{"ok": False, "reason": "<short error>"}` on
+   failure. Failure also drives the same Telegram-notify path with
+   the same 24 h cooldown.
+
+The @tool wiring is gated by `settings.vault_sync.manual_tool_enabled`
+— if `False`, the tool is not registered with the SDK MCP server and
+the model never sees it in its tool catalogue.
+
+### 2.8 Scheduler integration — new `kind` column (Shape A finalised)
+
+Phase-5b's `schedules` table currently has columns
+`(id, chat_id, cron, prompt, seed_key, ...)`. Today the dispatcher
+treats every row as "inject `prompt` as an `IncomingMessage(origin=
+"scheduler")` for `chat_id` on each cron tick".
+
+Phase-8 adds a new column via migration `0005_schedules_kind.sql`:
+
+```sql
+ALTER TABLE schedules ADD COLUMN kind TEXT NOT NULL DEFAULT 'prompt';
+CREATE INDEX IF NOT EXISTS idx_schedules_kind ON schedules(kind);
+```
+
+The `DEFAULT 'prompt'` clause keeps every pre-existing row (and any
+row inserted by phase-5b paths that don't know about the new column)
+working unchanged. Phase-8 inserts its seed row with
+`kind = 'system:vault_sync'`.
+
+The dispatcher (`scheduler/dispatcher.py`) gains a top-level branch:
+
+```python
+if row.kind == 'prompt':
+    # existing path — inject IncomingMessage to the model
+    ...
+elif row.kind == 'system:vault_sync':
+    await vault_sync.run_once(reason="scheduled")
+else:
+    log.warning("unknown_schedule_kind", kind=row.kind, id=row.id)
+    # fail closed: do nothing
+```
+
+Future system-kinds (`'system:retention_sweep'`, etc.) extend the
+branch table without further migrations. The `reason` parameter
+("scheduled" | "manual" | "boot") is purely for structured-log
+correlation — it doesn't change behaviour.
+
+## 3. Settings spec
+
+New nested settings block `VaultSyncSettings`, mounted on the root
+`Settings` as `settings.vault_sync`. Env prefix `VAULT_SYNC_`.
+
+| Field | Type | Default | Purpose |
+|---|---|---|---|
+| `enabled` | `bool` | `False` | Master switch. Daemon skips all vault-sync wiring (seed insert, @tool registration, dispatcher branch is dormant) when `False`. Defaults to `False` so a fresh checkout doesn't try to push to a non-existent repo. |
+| `cron` | `str` | `"0 * * * *"` | Cron expression for the seeded schedule. Hourly at :00 UTC. |
+| `repo_url` | `str` | `""` | SSH URL of the dedicated private vault repo. Required if `enabled=True`. Production value: `git@github.com:c0manch3/0xone-vault.git`. |
+| `branch` | `str` | `"main"` | Branch to push. |
+| `ssh_key_path` | `Path` | `~/.ssh/0xone_vault_deploy` | Deploy key file. Must exist at daemon-start if `enabled=True`. |
+| `ssh_known_hosts_path` | `Path` | `~/.ssh/known_hosts_vault` | Dedicated known_hosts file (so vault's SSH host pinning is independent of the user's general SSH state). |
+| `commit_author_name` | `str` | `"0xone-assistant"` | `user.name` for vault commits. |
+| `commit_author_email` | `str` | `"bot@0xone"` | `user.email` for vault commits. |
+| `commit_message_template` | `str` | `"vault sync {timestamp} ({reason})"` | f-string-style template. Available keys: `timestamp` (ISO-8601 UTC), `reason` ("scheduled"/"manual"/"boot"), `files_changed` (int). |
+| `notify_cooldown_s` | `int` | `86400` | Min seconds between consecutive Telegram failure notifies. |
+| `manual_tool_enabled` | `bool` | `True` | Gates whether `vault_push_now` @tool is wired into the MCP server. Set `False` to disable manual model-driven pushes while keeping the cron path live. |
+| `git_timeout_s` | `int` | `60` | Per-subprocess timeout for any single `git` invocation. Push beyond this → log + notify + fail. |
+
+Validation: when `enabled=True`, settings construction asserts
+`repo_url` non-empty and starts with `git@github.com:`. The SSH key
+existence check is deferred to daemon-start (so `pytest` config
+validation doesn't require keys on the dev box).
+
+## 4. VPS bootstrap (one-time, owner does this)
+
+Owner runs these manual steps once on the VPS — the daemon does NOT
+self-bootstrap the SSH key or repo (deliberate: cred handling is
+owner work, not bot work).
+
+1. **Generate deploy key** on the VPS:
+
+   ```sh
+   ssh-keygen -t ed25519 -f ~/.ssh/0xone_vault_deploy -N "" \
+     -C "0xone-vault deploy key (VPS 193.233.87.118)"
+   ```
+
+2. **Create the GH repo** as `c0manch3` (on web UI):
+   - Name: `0xone-vault`
+   - Visibility: Private
+   - Initialise with empty README so `main` exists.
+
+3. **Add deploy key with write access** at
+   `https://github.com/c0manch3/0xone-vault/settings/keys/new`:
+   - Title: "VPS 193.233.87.118 (0xone-assistant daemon)"
+   - Key: contents of `~/.ssh/0xone_vault_deploy.pub`
+   - Allow write access: **YES**
+
+4. **Pin the host key** to the dedicated known_hosts file:
+
+   ```sh
+   ssh-keyscan -t ed25519 github.com > ~/.ssh/known_hosts_vault
+   ```
+
+5. **Initialise the vault dir as a git repo** (idempotent — only do
+   this if `<data_dir>/vault/.git/` does not exist):
+
+   ```sh
+   cd ~/.local/share/0xone-assistant/vault
+   git init -b main
+   git config user.name  "0xone-assistant"
+   git config user.email "bot@0xone"
+   git remote add origin git@github.com:c0manch3/0xone-vault.git
+   # write the .gitignore from §2.2
+   git add .gitignore .
+   GIT_SSH_COMMAND="ssh -i ~/.ssh/0xone_vault_deploy -o IdentitiesOnly=yes -o UserKnownHostsFile=~/.ssh/known_hosts_vault" \
+     git commit -m "initial vault commit"
+   GIT_SSH_COMMAND="ssh -i ~/.ssh/0xone_vault_deploy -o IdentitiesOnly=yes -o UserKnownHostsFile=~/.ssh/known_hosts_vault" \
+     git push -u origin main
+   ```
+
+6. **Enable in env file** at
+   `~/.config/0xone-assistant/.env`:
+
+   ```
+   VAULT_SYNC_ENABLED=true
+   VAULT_SYNC_REPO_URL=git@github.com:c0manch3/0xone-vault.git
+   ```
+
+7. **Restart the daemon** (`docker compose restart`). On boot:
+   - The seed-row insert runs (idempotent on `seed_key="vault_sync"`).
+   - `vault_push_now` @tool registers with the SDK MCP server.
+   - First cron tick at the next :00 fires
+     `VaultSyncSubsystem.run_once(reason="scheduled")`.
+
+If `VAULT_SYNC_ENABLED=false` (default), none of the above wiring
+runs and the daemon behaves identically to phase-5d/6/7.
+
+## 5. Acceptance criteria
+
+- **AC#1 — bootstrap dry-run works.** With `enabled=true` and the
+  GH repo, deploy key, and vault git repo all set up per §4, owner
+  manually invokes `git push` from the vault dir (using
+  `GIT_SSH_COMMAND` env from §2.3) and the push succeeds against
+  GitHub. (Sanity check before we even start the daemon path.)
+- **AC#2 — seed inserts once.** First daemon start with
+  `enabled=true` inserts exactly one row in `schedules` with
+  `kind='system:vault_sync'`, `cron='0 * * * *'`,
+  `seed_key='vault_sync'`. Second daemon start does NOT insert a
+  duplicate (idempotency on `seed_key`).
+- **AC#3 — scheduled push happy path.** With the daemon up and a
+  fresh `memory_write` from a model turn (creating one new
+  markdown file under `<data_dir>/vault/`), the next :00 cron tick
+  fires the dispatcher, the dispatcher branches on `kind`, the
+  vault-sync subsystem acquires the lock, runs the git pipeline,
+  and a new commit appears at
+  `https://github.com/c0manch3/0xone-vault` containing exactly that
+  one file.
+- **AC#4 — empty-diff no-op.** A cron tick where vault has zero
+  changes since the last push exits silently: no commit, no push,
+  no Telegram message, debug log only.
+- **AC#5 — divergence fails fast.** If the remote `main` is moved
+  out-of-band (e.g. owner force-pushes from another host — never
+  expected, but tested), the next cron tick attempts a push, sees
+  `non-fast-forward`, logs `event=vault_sync_diverged`, sends one
+  Telegram notify (cooldown empty), and does NOT modify the local
+  repo state.
+- **AC#6 — Telegram cooldown.** While the divergence persists, the
+  next cron tick within 24 h of the previous notify still attempts
+  the push (logs the failure) but does NOT send a second Telegram
+  message. After 24 h, the next failed tick does notify again.
+- **AC#7 — `enabled=false` is fully dormant.** With
+  `VAULT_SYNC_ENABLED=false`: no schedule row gets inserted, no
+  @tool registers, the dispatcher's `system:vault_sync` branch is
+  unreachable from any cron row, and zero Telegram notifies fire.
+  Daemon behaviour matches phase-7-shipped baseline byte-for-byte.
+- **AC#8 — credential isolation.** `git ps -ocomm,etime,args` (or
+  equivalent `/proc` inspection) on the VPS during a vault-sync push
+  shows `GIT_SSH_COMMAND` env containing the dedicated deploy key
+  path. The host's `~/.ssh/id_*` default keys are NOT present in
+  the env. (Verified once via owner shell session, not in CI.)
+- **AC#9 — no `gh` CLI dependency.** `grep -R "\bgh \b" src/assistant/vault_sync/`
+  returns zero matches. The whole subsystem talks to GitHub via
+  pure git over SSH.
+- **AC#10 — phase-7 invariants preserved.** All phase-1 through
+  phase-7 acceptance criteria still pass on the VPS smoke test:
+  ping, memory write/search/list/get/delete/seed, skill-installer,
+  scheduler add/list/remove/run, file/photo/voice/URL ingestion.
+  Vault-sync phase introduces no regression in the existing paths.
+- **AC#11 — manual @tool path.** With `enabled=True` and
+  `manual_tool_enabled=True`, the model has access to the
+  `vault_push_now` MCP @tool. Owner says "запушь вольт" → model
+  invokes the tool → tool acquires `VaultSyncSubsystem._lock` →
+  runs the same git pipeline as cron → returns
+  `{"ok": true, "files_changed": N, "commit_sha": "<sha>"}` to the
+  model, which surfaces a confirmation to owner. Two concurrent
+  invocations (cron tick firing at the same instant the model
+  invokes the tool) serialise on the asyncio.Lock without
+  double-push or interleaved git commands — verified via a focused
+  pytest with `asyncio.gather` on two `run_once` calls and a
+  subprocess-mock that asserts call ordering.
+
+## 6. Carry-forwards — explicitly OUT of scope
+
+The following are deferred to later phases and MUST NOT be
+implemented in phase 8. Each was considered and explicitly cut to
+keep phase 8 bounded:
+
+1. **Pull-back / two-way sync.** GitHub is a read-only mirror. A
+   future phase can add a sync-down mechanism if owner ever wants
+   to edit vault on GitHub web UI; not now.
+2. **`gh` CLI integration.** No `gh issue`, `gh pr`, `gh repo`,
+   `gh api` — none of it. Phase 8 is pure git-over-SSH. A separate
+   later phase can add a `gh`-based subsystem for issue / PR
+   workflows; that phase will live entirely outside
+   `src/assistant/vault_sync/`.
+3. **Per-file commit messages.** All changes since the last push
+   collapse into one commit with a templated message. Per-note
+   commit attribution would require model cooperation on every
+   `memory_write`; not worth the complexity.
+4. **Encrypted vault (git-crypt / age).** Vault content is plain
+   markdown on a private repo. Encryption is a separate axis of
+   protection that can be layered on later without changing the
+   sync pipeline.
+5. **Multiple vault remotes.** The `repo_url` field is a single
+   string. Mirror to a second remote (e.g. self-hosted Gitea) is a
+   future phase if ever needed.
+6. **Auto-rebase on divergence.** Fail-fast is the policy.
+   Auto-rebase risks silent history rewrites. Owner manually
+   resolves on the rare occasion this happens.
+7. **Conflict UI in Telegram.** When divergence happens, the
+   Telegram notify is plaintext ("vault sync failed: remote
+   diverged. Manual recovery needed."). No inline-keyboard
+   "force push?" buttons. Manual SSH session is the recovery path.
+8. **Per-skill `allowed-tools` enforcement on `vault_push_now`.**
+   Phase 8 ships the @tool unconditionally available to the
+   model when `manual_tool_enabled=True`. A later phase that
+   introduces per-skill MCP tool gating can scope this tool to
+   specific skills; not now.
+
+---
+
+> **Phase-7 integration note (vault vs media).** Phase 6a–6c put
+> inbox/outbox media under `<data_dir>/media/` with retention sweep.
+> Vault is the separate hierarchy `<data_dir>/vault/`. Phase 8's
+> `git add` runs from inside `<data_dir>/vault/` — the working tree
+> is the vault dir itself, so `data/media/`, `data/run/`, and the
+> SQLite DB are physically outside the working tree and cannot be
+> staged. There is no path-isolation test needed (the geometry is
+> the test).
