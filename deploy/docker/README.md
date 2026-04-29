@@ -505,6 +505,35 @@ Interpretation:
 | `subagent_finished_via_race_recovery` | Stop hook beat Start hook to the commit on a picker-claimed row (Fix-pack F5). Self-healing — informational only. |
 | `subagent_finished_skew` | Stop hook fired for an `sdk_agent_id` we have no record of. Almost always a SubagentStart that was rejected by the partial UNIQUE on a duplicate. Informational. |
 
+## Phase 6e tunables — bg audio + RSS observability
+
+Phase 6e introduced a third SDK-CLI bridge for bg audio jobs (peak
+subprocess count: 4 → 5). Phase 6e fix-pack-2 (DevOps CRIT-3 + HIGH-4)
+added an in-process RSS sampler and a `mem_reservation` so the owner
+can detect drift over weeks rather than be surprised by an OOM-restart.
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `CLAUDE_AUDIO_MAX_CONCURRENT` | `1` | Slot count for the dedicated audio `ClaudeBridge` semaphore. CLOSED-NEGATIVE per researcher RQ3 — the Mac sidecar enforces a hard `Semaphore(1)` for GPU memory; raising this above 1 is pointless until the sidecar is rearchitected multi-instance. |
+| `ASSISTANT_AUDIO_BG_DRAIN_TIMEOUT_S` | `5.0` | Budget for `Daemon.stop` to drain `_audio_persist_pending` (the per-turn user-marker + `interrupt_turn` SQL) before `conn.close()` slams the door. On overrun the turn stays `pending` and the boot reaper picks it up next start. |
+| `ASSISTANT_OBSERVABILITY_RSS_INTERVAL_S` | `60.0` | Cadence of the in-process RSS sampler. Reads `/proc/self/status` (no psutil) and emits a structured `daemon_rss` event with `rss_mb`, `bg_tasks`, `audio_persist_pending`, `sub_pending` so the operator can correlate memory drift with bg work in flight. Exits silently on macOS dev hosts (no `/proc/self/status`). |
+
+`mem_reservation: 1200m` (in `docker-compose.yml`) is the soft floor
+hint that pairs with `mem_limit: 1500m`. The kernel's OOM killer
+prefers to evict containers without a reservation first under host
+memory pressure, so the bot is shielded from being collateral when an
+unrelated container balloons. Adjust the two knobs together — bumping
+the limit without bumping the reservation leaves the bot
+disproportionately exposed.
+
+Worst-case RSS math (researcher CRIT-1, conservative): 2 user + 2
+picker + 1 audio SDK-CLI subprocesses at ~150 MB peak each = ~750 MB,
+plus ~250 MB Python heap + sqlite WAL pages → ~1050 MB peak headroom
+under a 1500m limit (~30%). The owner should tail
+`docker compose logs --tail 50 0xone-assistant | grep daemon_rss` once
+a week to confirm the steady-state RSS stays under 1.3 GB; sustained
+growth past that bound on a quiet bot signals a leak.
+
 ## Phase 9 hardening (deferred)
 
 Tracked in `plan/phase5d/description.md §M`:

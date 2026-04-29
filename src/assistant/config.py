@@ -179,6 +179,27 @@ class AudioBgSettings(BaseSettings):
     drain_timeout_s: float = 5.0
 
 
+class ObservabilitySettings(BaseSettings):
+    """Phase 6e fix-pack-2 observability knobs (``ASSISTANT_OBSERVABILITY_*``
+    env prefix).
+
+    Single knob today — the cadence of the in-process RSS observer.
+    The observer reads ``/proc/self/status`` once per ``rss_interval_s``
+    and emits a structured ``daemon_rss`` log line so the owner can
+    spot drift over weeks before an OOM-restart surprises them.
+
+    The observer exits silently on hosts without ``/proc/self/status``
+    (macOS dev box) — see :meth:`Daemon._rss_observer`.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="ASSISTANT_OBSERVABILITY_",
+        env_file=[_user_env_file(), Path(".env")],
+        extra="ignore",
+    )
+    rss_interval_s: float = 60.0
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=[_user_env_file(), Path(".env")],
@@ -199,6 +220,9 @@ class Settings(BaseSettings):
     scheduler: SchedulerSettings = Field(default_factory=SchedulerSettings)
     subagent: SubagentSettings = Field(default_factory=SubagentSettings)
     audio_bg: AudioBgSettings = Field(default_factory=AudioBgSettings)
+    observability: ObservabilitySettings = Field(
+        default_factory=ObservabilitySettings
+    )
 
     # ------------------------------------------------------------------
     # Phase 6c: voice / audio / URL transcription via Mac mini Whisper.

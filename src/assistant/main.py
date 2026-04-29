@@ -523,6 +523,18 @@ class Daemon:
         await self._adapter.start()
         log.info("daemon_started", owner=self._settings.owner_chat_id)
 
+        # Phase 6e fix-pack-2 (DevOps CRIT-3): periodic RSS sampler.
+        # Spawned AFTER ``adapter.start()`` so the daemon is fully up
+        # before the first sample fires. Anchored in ``_bg_tasks`` so
+        # ``Daemon.stop`` cancels it during shutdown (the inner
+        # ``asyncio.sleep`` is cancel-safe). On macOS dev hosts the
+        # observer exits silently after the first ``FileNotFoundError``.
+        self._spawn_bg(
+            self._rss_observer(
+                interval_s=self._settings.observability.rss_interval_s,
+            )
+        )
+
         # Phase 6e (MED-5): notify the owner if the boot reaper marked
         # any pending turns as interrupted. ``cleanup_orphan_pending_turns``
         # is INDISCRIMINATE — it covers text, photo, audio, file turns
@@ -609,6 +621,67 @@ class Daemon:
         task = asyncio.create_task(coro)
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
+
+    async def _rss_observer(self, interval_s: float = 60.0) -> None:
+        """Phase 6e fix-pack-2 (DevOps CRIT-3): periodic RSS sampler.
+
+        Reads ``/proc/self/status``, parses ``VmRSS:`` (kB), and emits a
+        structured ``daemon_rss`` log line every ``interval_s`` seconds
+        alongside the current bg-task / persist / subagent set sizes.
+        That correlation lets the operator spot whether an RSS bump
+        coincides with bg work in flight or is a steady-state leak.
+
+        Runs forever as a ``_bg_tasks``-anchored coroutine; cancelled by
+        ``Daemon.stop`` (the ``await asyncio.sleep`` is cancel-safe so
+        shutdown is prompt).
+
+        On hosts without ``/proc/self/status`` (macOS dev box) the
+        observer exits silently after the first ``FileNotFoundError`` —
+        no spam in dev runs. Any other exception while reading is
+        logged at ``debug`` and the loop continues; a transient
+        permission flake or one-off parse error must not crash the
+        daemon's observability path.
+
+        No psutil dep on purpose: ``/proc/self/status`` is a single
+        read of an in-kernel pseudo-file and avoids pulling a C-extension
+        into the runtime image. The bot already standardised on that
+        approach — see :class:`Daemon.healthcheck` (compose) which
+        readlinks ``/proc/<pid>/exe``.
+        """
+        plog = get_logger("daemon.rss_observer")
+        while True:
+            try:
+                # ``/proc/self/status`` is a kernel-synthesised pseudo-file
+                # — every read is satisfied directly from in-kernel memory
+                # without disk I/O, so ``open`` + small-buffer read does
+                # NOT block the event loop in any meaningful sense.
+                # ``ASYNC230`` is suppressed for that reason; offloading
+                # to ``asyncio.to_thread`` would be more expensive (thread
+                # hop) than the read itself.
+                with open("/proc/self/status") as f:  # noqa: ASYNC230
+                    rss_kb = next(
+                        int(line.split()[1])
+                        for line in f
+                        if line.startswith("VmRSS:")
+                    )
+            except FileNotFoundError:
+                # /proc/self/status absent on macOS dev box — silent
+                # one-shot exit; do not emit a log line on every dev
+                # boot.
+                return
+            except Exception as exc:
+                plog.debug("rss_read_failed", error=repr(exc))
+            else:
+                plog.info(
+                    "daemon_rss",
+                    rss_mb=rss_kb // 1024,
+                    bg_tasks=len(self._bg_tasks),
+                    audio_persist_pending=len(
+                        self._audio_persist_pending
+                    ),
+                    sub_pending=len(self._sub_pending_updates),
+                )
+            await asyncio.sleep(interval_s)
 
     def spawn_audio_task(
         self, coro: Coroutine[Any, Any, None]

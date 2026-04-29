@@ -87,7 +87,17 @@ services:
     # Phase 6 will add ffmpeg + transcription deps that may OOM the
     # 4 GB VPS without caps. Compose v2 standalone (no swarm) reads
     # top-level `mem_limit` / `cpus`, NOT `deploy.resources.*`.
+    #
+    # Phase 6e fix-pack-2 (DevOps HIGH-4): `mem_reservation: 1200m`
+    # is a soft floor — the kernel/Docker treats unreserved containers
+    # as the preferred OOM-eviction targets when the host is under
+    # memory pressure. With three SDK-CLI bridges (user, picker,
+    # audio) the worst-case RSS sits in the 1050–1650 MB band; the
+    # reservation shields us from being evicted ahead of less critical
+    # neighbours and the `mem_limit: 1500m` ceiling keeps a misbehaving
+    # bridge from starving the host. Adjust both knobs together.
     mem_limit: 1500m
+    mem_reservation: 1200m
     cpus: 2.0
 
     # 250 MB rotation ceiling per container (M4 — bumped from 30 MB).
