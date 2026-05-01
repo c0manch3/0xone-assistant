@@ -6,18 +6,21 @@ exactly which paths are rejected. This file tests the daemon-side
 helper directly; the script's regex is mirrored verbatim from the
 single source of truth in ``VaultSyncSettings.secret_denylist_regex``.
 
-Regex anchors (default set):
-  - ``^secrets/``        — top-level ``secrets/`` directory.
-  - ``^\\.aws/``          — top-level ``.aws/`` directory.
-  - ``^\\.config/0xone-assistant/`` — owner config dir at root.
+Regex anchors (post-fix-pack F12 default set — non-anchored for parity
+with the .gitignore RECURSIVE patterns):
+  - ``(?:^|/)secrets/``  — ``secrets/`` directory anywhere on path.
+  - ``(?:^|/)\\.aws/``    — ``.aws/`` directory anywhere on path.
+  - ``(?:^|/)\\.config/0xone-assistant/`` — owner config dir anywhere.
   - ``\\.env$``           — file ending in ``.env``.
   - ``\\.key$``           — file ending in ``.key``.
   - ``\\.pem$``           — file ending in ``.pem``.
 
-Note: the leading-anchor patterns are explicitly anchored at the
-start of the path so a path like ``notes/.config/0xone-assistant/x``
-is NOT matched (the secret detector targets repo-root layout, not
-arbitrary nested paths). Anti-test below verifies this.
+Fix-pack F12 (devops + 4-reviewer convergent): the daemon regex is
+non-anchored so ``notes/.aws/credentials`` (recursively excluded by
+``.gitignore``) ALSO trips the daemon if the file were force-added.
+This restores defense-in-depth parity with the .gitignore — no
+forced-staged path can sneak past the daemon while passing the
+gitignore check.
 """
 
 from __future__ import annotations
@@ -50,19 +53,38 @@ def test_denylist_blocks_secret_pattern(path: str) -> None:
     assert matches == [path]
 
 
-def test_nested_config_path_not_matched_by_anchored_regex() -> None:
-    """``notes/.config/0xone-assistant/setup.md`` does NOT match
-    ``^\\.config/0xone-assistant/`` because the regex is anchored at
-    the start of the path. This is intentional: the detector targets
-    repo-root paths only.
-    """
+def test_nested_config_path_matched_by_recursive_regex() -> None:
+    """F12 — post-fix-pack ``(?:^|/)\\.config/0xone-assistant/``
+    matches recursively, so ``notes/.config/0xone-assistant/setup.md``
+    IS rejected. This restores defense-in-depth parity with the
+    ``.gitignore`` ``recursive`` pattern set; the gitignore would
+    exclude this path so a force-added path matching gitignore now
+    also trips the daemon. Closes a force-add bypass (W3-CRIT-3
+    residual)."""
     matches = validate_no_secrets(
         ["notes/.config/0xone-assistant/setup.md"], DEFAULT_REGEX
     )
-    # Note: regex anchors block ``^\.config/...`` from matching but
-    # the path also doesn't match any ``\.env$`` / ``\.key$`` /
-    # ``\.pem$`` pattern, so it should NOT be rejected.
-    assert matches == []
+    assert matches == ["notes/.config/0xone-assistant/setup.md"]
+
+
+def test_nested_secrets_dir_matched_by_recursive_regex() -> None:
+    """F12 — ``notes/secrets/api.env`` (nested ``secrets/``) IS
+    matched by ``(?:^|/)secrets/`` so a hostile vault writer can't
+    bypass the daemon by burying secrets in a subdirectory."""
+    matches = validate_no_secrets(
+        ["notes/secrets/api.env"], DEFAULT_REGEX
+    )
+    assert matches == ["notes/secrets/api.env"]
+
+
+def test_nested_aws_dir_matched_by_recursive_regex() -> None:
+    """F12 — ``project/x/.aws/credentials`` IS matched by
+    ``(?:^|/)\\.aws/`` so AWS creds buried in any subdir are
+    caught."""
+    matches = validate_no_secrets(
+        ["project/x/.aws/credentials"], DEFAULT_REGEX
+    )
+    assert matches == ["project/x/.aws/credentials"]
 
 
 @pytest.mark.parametrize(

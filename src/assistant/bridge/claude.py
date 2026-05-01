@@ -120,6 +120,7 @@ class ClaudeBridge:
         extra_hooks: dict[str, list[HookMatcher]] | None = None,
         agents: dict[str, AgentDefinition] | None = None,
         max_concurrent_override: int | None = None,
+        vault_tool_visible: bool = False,
     ) -> None:
         """Phase 6 (research RQ1 + RQ2): ``extra_hooks`` is a dict
         keyed by SDK hook event name (``"SubagentStart"``,
@@ -140,6 +141,17 @@ class ClaudeBridge:
         default ``settings.claude.max_concurrent`` applies; when set,
         the override drives ``self._sem``. Other bridges are
         unaffected — they don't pass the kwarg.
+
+        Phase 8 fix-pack F1 (AC#5 violation closure):
+        ``vault_tool_visible`` gates BOTH the
+        ``mcp__vault__vault_push_now`` allowed-tool entry AND the
+        ``mcp_servers["vault"]`` registration. Default ``False`` so
+        bridges constructed without explicitly opting in (picker, audio,
+        every test fixture) cannot leak the @tool to the model. The
+        owner bridge in :class:`Daemon.start` passes
+        ``vault_tool_visible=settings.vault_sync.effective_manual_tool_enabled``
+        — which is ``True`` only when both
+        ``vault_sync.enabled=True`` AND ``vault_sync.manual_tool_enabled=True``.
         """
         self._settings = settings
         sem_size = (
@@ -150,6 +162,7 @@ class ClaudeBridge:
         self._sem = asyncio.Semaphore(sem_size)
         self._extra_hooks = extra_hooks or {}
         self._agents = agents
+        self._vault_tool_visible = vault_tool_visible
 
     # ------------------------------------------------------------------
     # Options assembly
@@ -221,17 +234,25 @@ class ClaudeBridge:
             *MEMORY_TOOL_NAMES,
             *SCHEDULER_TOOL_NAMES,
             *SUBAGENT_TOOL_NAMES,
-            *VAULT_TOOL_NAMES,
         ]
         if self._agents:
             allowed_tools.append("Task")
-        mcp_servers = {
+        mcp_servers: dict[str, Any] = {
             "installer": INSTALLER_SERVER,
             "memory": MEMORY_SERVER,
             "scheduler": SCHEDULER_SERVER,
             "subagent": SUBAGENT_SERVER,
-            "vault": VAULT_SERVER,
         }
+        # Phase 8 fix-pack F1 (AC#5 violation closure): conditional
+        # vault @tool registration. When ``vault_tool_visible`` is
+        # False (default + non-owner bridges), neither the allowed-tool
+        # name nor the MCP server entry is exposed — the model never
+        # sees ``mcp__vault__vault_push_now`` in its tool catalogue.
+        # AC#5 invariant: with ``settings.vault_sync.enabled=False``
+        # there are no observable traces of vault sync wiring.
+        if self._vault_tool_visible:
+            allowed_tools.extend(VAULT_TOOL_NAMES)
+            mcp_servers["vault"] = VAULT_SERVER
         opts_kwargs: dict[str, Any] = {
             "cwd": str(pr),
             "setting_sources": ["project"],

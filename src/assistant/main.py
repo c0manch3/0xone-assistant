@@ -423,10 +423,20 @@ class Daemon:
         else:
             self._adapter = TelegramAdapter(self._settings)
 
+        # Phase 8 fix-pack F1 (AC#5 closure): only the OWNER bridge
+        # gets ``vault_tool_visible=True`` and only when the
+        # subsystem-side ``effective_manual_tool_enabled`` is True
+        # (i.e. ``vault_sync.enabled AND vault_sync.manual_tool_enabled``).
+        # Picker / audio bridges below stay default-False so the
+        # subagent / audio paths cannot accidentally surface
+        # ``vault_push_now`` to the model.
         bridge = ClaudeBridge(
             self._settings,
             extra_hooks=sub_hooks or None,
             agents=sub_agents,
+            vault_tool_visible=(
+                self._settings.vault_sync.effective_manual_tool_enabled
+            ),
         )
 
         # Phase 6e (Alt-C): SEPARATE audio bridge. ``max_concurrent``
@@ -603,10 +613,16 @@ class Daemon:
                 pending_set=self._vault_sync_pending,
             )
             await self._vault_sync.startup_check()
-            # @tool registration is gated by ``manual_tool_enabled``;
-            # the validator already enforces it requires
-            # ``enabled=True``, so we can read the flag directly.
-            if self._settings.vault_sync.manual_tool_enabled:
+            # F1 / F6: @tool registration gated by the computed
+            # ``effective_manual_tool_enabled`` (= enabled AND
+            # manual_tool_enabled). Picker/audio bridges already pass
+            # ``vault_tool_visible=False`` so they never see the @tool;
+            # this configure step plumbs the actual subsystem
+            # reference into ``_vault_core._CTX`` so the @tool body
+            # has someone to call.
+            if (
+                self._settings.vault_sync.effective_manual_tool_enabled
+            ):
                 _vault_mod.configure_vault(
                     subsystem=self._vault_sync,
                 )

@@ -225,49 +225,96 @@ class VaultSyncSettings(BaseSettings):
     ssh_known_hosts_path: Path | None = None
     branch: str = "main"
     cron_interval_s: float = 3600.0
+    # Fix-pack F11 (devops CRIT-2): delay before the FIRST tick fires.
+    # 60s default protects boot pressure (Telegram polling start, sqlite
+    # WAL warm-up, claude preflight) from competing with the vault git
+    # pipeline. Owner can override via env var to 0 to restore
+    # immediate-first-tick semantics if desired.
+    first_tick_delay_s: float = 60.0
     git_user_name: str = "0xone-assistant"
     git_user_email: str = "0xone-assistant@users.noreply.github.com"
-    git_op_timeout_s: int = 30
+    # Fix-pack F4 (devil W3 vault_lock hold): lowered 30 → 10s so the
+    # 4-call git pipeline (status / add / diff / commit) at the worst-
+    # case ``4 * git_op_timeout_s`` budget stays within
+    # ``vault_lock_acquire_timeout_s`` (60s default). A healthy git op
+    # completes in <1s; the 10s ceiling triggers only on a wedged
+    # filesystem.
+    git_op_timeout_s: int = 10
     push_timeout_s: int = 60
     drain_timeout_s: float = 60.0
-    vault_lock_acquire_timeout_s: float = 30.0
-    # Default ``False`` (coder note): the spec table in §3 specifies
-    # ``True`` as the default, BUT pairing that with the
-    # ``enabled=False`` default would trip the
-    # ``manual_tool_enabled requires enabled=True`` validator at every
-    # daemon boot on a fresh checkout. Defaulting to ``False`` keeps
-    # the construction self-consistent without needing the validator
-    # to distinguish "user-set" vs "framework-default". Owners who
-    # flip ``VAULT_SYNC_ENABLED=true`` typically also set
-    # ``VAULT_SYNC_MANUAL_TOOL_ENABLED=true`` in the same env diff.
-    manual_tool_enabled: bool = False
+    # Fix-pack F4: bumped 30 → 60s to cover the worst-case 4-step git
+    # pipeline at ``4 * git_op_timeout_s``. Validator below enforces
+    # the invariant ``vault_lock_acquire_timeout_s >= 4 * git_op_timeout_s``.
+    vault_lock_acquire_timeout_s: float = 60.0
+    # Fix-pack F6 (UX): default ``True`` per spec §3 table — owner who
+    # flips ``VAULT_SYNC_ENABLED=true`` typically wants the manual @tool
+    # available too. The "is the @tool actually visible?" gate is the
+    # ``effective_manual_tool_enabled`` computed property below: it
+    # returns ``enabled and manual_tool_enabled`` so the validator
+    # stays simple (no special-case for owner-set vs default) and the
+    # @tool is invisible whenever the subsystem itself is disabled.
+    manual_tool_enabled: bool = True
     manual_tool_min_interval_s: float = 60.0
     notify_milestone_failures: tuple[int, ...] = (5, 10, 24)
     audit_log_max_size_mb: int = 10
+    # Fix-pack F12 (defense-in-depth parity with .gitignore): the
+    # gitignore patterns ``secrets/`` / ``.aws/`` /
+    # ``.config/0xone-assistant/`` match RECURSIVELY (a hostile path
+    # ``notes/.aws/credentials`` is excluded by the gitignore rule).
+    # The daemon-side denylist now matches anywhere on the path via
+    # ``(?:^|/)`` so a forced-staged path matching the gitignore would
+    # also trip the daemon. The bootstrap script's ``grep -E`` regex is
+    # mirrored verbatim from this set (single source of truth).
     secret_denylist_regex: tuple[str, ...] = (
-        r"^secrets/",
-        r"^\.aws/",
-        r"^\.config/0xone-assistant/",
+        r"(?:^|/)secrets/",
+        r"(?:^|/)\.aws/",
+        r"(?:^|/)\.config/0xone-assistant/",
         r"\.env$",
         r"\.key$",
         r"\.pem$",
     )
+    # Fix-pack F5 (qa HIGH-4 W2-M2 regression restore): the ``{filenames}``
+    # placeholder gives commit-log forensic value (which 3 of N files
+    # changed). Devops LOW-4: ASCII ``--`` instead of em-dash so legacy
+    # log viewers (older grep / less without UTF-8) render cleanly.
     commit_message_template: str = (
-        "vault sync {timestamp} ({reason}) — {files_changed} files"
+        "vault sync {timestamp} ({reason}) -- {files_changed} files: {filenames}"
     )
 
     @model_validator(mode="after")
     def _validate_vault_sync_consistency(self) -> VaultSyncSettings:
         """Cross-field validators (W2-C3 + W2-M3 + L-2 + repo_url
-        required-when-enabled).
+        required-when-enabled + F4 vault_lock budget).
 
         Mirrors the precedent ``_validate_whisper_pair`` at
         ``config.py:293-310`` — pydantic v2 ``mode="after"`` so all
         fields are populated when the check runs.
+
+        Fix-pack F6 (UX): the historic
+        ``manual_tool_enabled requires enabled=True`` rule is RELAXED
+        for the framework default case — when ``manual_tool_enabled``
+        is the default ``True`` and the owner has not explicitly set
+        it, ``enabled=False`` simply hides the @tool (via
+        :py:attr:`effective_manual_tool_enabled`) without raising. The
+        validator only RAISES when the owner explicitly set both
+        ``manual_tool_enabled=True`` AND ``enabled=False`` (a logical
+        error worth surfacing). Implementation uses
+        ``model_fields_set`` (pydantic v2) to distinguish owner-set
+        from default. Documented choice: this is the simpler of the
+        two paths floated in F6 — no computed-property dance through
+        bridge wiring, just a smarter validator that respects the
+        principle of least surprise.
         """
-        if self.manual_tool_enabled and not self.enabled:
+        owner_set_manual_tool = (
+            "manual_tool_enabled" in self.model_fields_set
+        )
+        if (
+            self.manual_tool_enabled
+            and not self.enabled
+            and owner_set_manual_tool
+        ):
             raise ValueError(
-                "manual_tool_enabled requires enabled=True; "
+                "manual_tool_enabled=True requires enabled=True; "
                 "set VAULT_SYNC_MANUAL_TOOL_ENABLED=false or "
                 "VAULT_SYNC_ENABLED=true"
             )
@@ -275,6 +322,19 @@ class VaultSyncSettings(BaseSettings):
             raise ValueError(
                 "drain_timeout_s must be >= push_timeout_s "
                 f"(got {self.drain_timeout_s} < {self.push_timeout_s})"
+            )
+        # F4: the vault_lock budget must cover at least one full
+        # 4-step git pipeline (status / add / diff / commit) at the
+        # worst-case ``git_op_timeout_s`` ceiling — otherwise a
+        # parallel ``memory_write`` racing the cron tick can blow the
+        # vault_lock timeout while the pipeline is still legitimately
+        # running.
+        min_lock_budget = 4 * self.git_op_timeout_s
+        if self.vault_lock_acquire_timeout_s < min_lock_budget:
+            raise ValueError(
+                "vault_lock_acquire_timeout_s must be >= "
+                f"4 * git_op_timeout_s ({min_lock_budget}s); "
+                f"got {self.vault_lock_acquire_timeout_s}"
             )
         if self.enabled and self.repo_url is None:
             raise ValueError(
@@ -289,6 +349,23 @@ class VaultSyncSettings(BaseSettings):
                 f"git@host:owner/repo.git (got {self.repo_url!r})"
             )
         return self
+
+    @property
+    def effective_manual_tool_enabled(self) -> bool:
+        """Phase 8 fix-pack F6 — single source of truth for "should the
+        ``vault_push_now`` MCP @tool be registered + visible to the
+        model?".
+
+        Returns ``True`` only when the subsystem itself is enabled AND
+        ``manual_tool_enabled`` is true. Used by ``Daemon.start`` (gate
+        for ``configure_vault``) and by ``ClaudeBridge`` (gate for
+        ``mcp_servers["vault"]`` + ``allowed_tools``). When the
+        subsystem is disabled this property is ``False`` regardless of
+        the env var, so the model never sees the tool — fixing the
+        AC#5 violation where the @tool registered even with
+        ``enabled=False``.
+        """
+        return self.enabled and self.manual_tool_enabled
 
 
 class ObservabilitySettings(BaseSettings):

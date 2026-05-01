@@ -11,16 +11,44 @@ The adapter is the abstract :class:`~assistant.adapters.base.MessengerAdapter`
 so tests can swap a fake. ``send_text`` errors are caught + logged but
 NEVER re-raised — a Telegram outage must not crash the vault sync
 loop (the sync itself is independent of the notify path).
+
+Fix-pack F9 (devops HIGH): every adapter call is wrapped in
+``asyncio.wait_for(..., timeout=NOTIFY_TIMEOUT_S)`` so a slow Telegram
+backend (HTTPX hangs, network blip) cannot stall the cron loop. The
+caller already invokes notify OUTSIDE ``self._lock`` so a timeout
+during notify never blocks ``memory_write``; this module's job is to
+ensure even the OUTER notify task itself is bounded.
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 
 from assistant.adapters.base import MessengerAdapter
 from assistant.logger import get_logger
 
 log = get_logger("vault_sync.notify")
+
+# F9: hard ceiling on a single Telegram send_text call. The adapter
+# layer already retries internally; 10s is generous against typical
+# httpx p95 (2-3s) and surfaces a real outage promptly.
+NOTIFY_TIMEOUT_S: float = 10.0
+
+
+async def _send_with_timeout(
+    adapter: MessengerAdapter,
+    chat_id: int,
+    text: str,
+) -> None:
+    """F9: bounded ``send_text`` invocation. Suppresses TimeoutError
+    AND any other exception (Telegram failures are best-effort —
+    notify path must never crash the cron loop)."""
+    with contextlib.suppress(TimeoutError, Exception):
+        await asyncio.wait_for(
+            adapter.send_text(chat_id, text),
+            timeout=NOTIFY_TIMEOUT_S,
+        )
 
 
 async def notify_failure(
@@ -38,9 +66,8 @@ async def notify_failure(
         log.debug("vault_sync_notify_failure_no_adapter")
         return
     text = f"⚠️ vault sync failed: {error}"
-    with contextlib.suppress(Exception):
-        await adapter.send_text(owner_chat_id, text)
-        log.info("vault_sync_notify_failure_sent", error=error[:200])
+    await _send_with_timeout(adapter, owner_chat_id, text)
+    log.info("vault_sync_notify_failure_sent", error=error[:200])
 
 
 async def notify_milestone(
@@ -61,12 +88,11 @@ async def notify_milestone(
         f"⚠️ vault sync still failing — {consecutive_failures} "
         "consecutive failures"
     )
-    with contextlib.suppress(Exception):
-        await adapter.send_text(owner_chat_id, text)
-        log.info(
-            "vault_sync_notify_milestone_sent",
-            consecutive_failures=consecutive_failures,
-        )
+    await _send_with_timeout(adapter, owner_chat_id, text)
+    log.info(
+        "vault_sync_notify_milestone_sent",
+        consecutive_failures=consecutive_failures,
+    )
 
 
 async def notify_recovery(
@@ -86,9 +112,8 @@ async def notify_recovery(
         f"✅ vault sync recovered after {prev_failures} "
         "consecutive failures"
     )
-    with contextlib.suppress(Exception):
-        await adapter.send_text(owner_chat_id, text)
-        log.info(
-            "vault_sync_notify_recovery_sent",
-            prev_failures=prev_failures,
-        )
+    await _send_with_timeout(adapter, owner_chat_id, text)
+    log.info(
+        "vault_sync_notify_recovery_sent",
+        prev_failures=prev_failures,
+    )

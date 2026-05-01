@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import shlex
 from pathlib import Path
 
 from assistant.logger import get_logger
@@ -207,12 +208,19 @@ def build_ssh_command(
 
     ``StrictHostKeyChecking=yes`` (NOT ``accept-new``) — the pinned
     known_hosts file is the authoritative trust anchor (H-4 closure).
+
+    Fix-pack F8 (defense-in-depth): both paths are ``shlex.quote`` d
+    in case a future override or test fixture uses a path containing
+    spaces / shell metacharacters. ``GIT_SSH_COMMAND`` is parsed by
+    git via ``/bin/sh -c``, so an unquoted path with a space would
+    break tokenisation and silently authenticate against the wrong
+    key — a security risk worth this trivial hardening.
     """
     return (
-        f"ssh -i {ssh_key_path} "
+        f"ssh -i {shlex.quote(str(ssh_key_path))} "
         "-o IdentitiesOnly=yes "
         "-o StrictHostKeyChecking=yes "
-        f"-o UserKnownHostsFile={known_hosts_path}"
+        f"-o UserKnownHostsFile={shlex.quote(str(known_hosts_path))}"
     )
 
 

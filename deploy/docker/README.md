@@ -538,7 +538,50 @@ growth past that bound on a quiet bot signals a leak.
 
 Phase 8 ships a vault → GitHub push-only periodic sync. Default is
 `VAULT_SYNC_ENABLED=false` so a fresh deploy behaves identically to
-the phase 6e baseline (AC#5). To enable on the VPS:
+the phase 6e baseline (AC#5).
+
+> **CRITICAL — bootstrap MUST precede `docker compose up`.** Phase 8
+> fix-pack F2 tightens the docker-compose bind-mounts on
+> `~/.ssh/vault_deploy` and `~/.ssh/known_hosts_vault` to
+> `create_host_path: false`. If those host files do NOT exist when
+> compose tries to start the container, Docker errors LOUDLY with
+> something like
+> `bind source path does not exist: /home/0xone/.ssh/vault_deploy`
+> — by design (devops CRIT-1 closure). Earlier compose versions
+> auto-created the missing files as **directories**, masked the
+> bootstrap requirement, and the container appeared to start while
+> vault sync silently failed with `ssh: not a regular file`.
+>
+> **On any fresh VPS where you intend to run `VAULT_SYNC_ENABLED=true`,
+> follow this exact sequence:**
+>
+> 1. SSH to the VPS as `0xone`.
+> 2. `cd /opt/0xone-assistant && git pull` (so bootstrap.sh is current).
+> 3. `sudo -u 0xone deploy/scripts/vault-bootstrap.sh` — this creates
+>    `~/.ssh/vault_deploy` + `~/.ssh/known_hosts_vault`, prompts for
+>    the GH deploy key paste, and runs the initial push.
+> 4. Edit `~/.config/0xone-assistant/.env` to add the three env vars
+>    (see step 2 below).
+> 5. `cd deploy/docker && docker compose up -d` — only NOW the
+>    bind-mount sources are in place.
+>
+> **If you do NOT want vault sync** on this host, keep
+> `VAULT_SYNC_ENABLED=false` (default) — the daemon ignores the SSH
+> files entirely. But the bind entries in `docker-compose.yml` STILL
+> require those host files to exist, because the bind is declared at
+> the compose level, not gated by env. The simplest path on a vault-
+> sync-disabled host is to create empty placeholder files:
+>
+> ```bash
+> mkdir -p ~/.ssh && touch ~/.ssh/vault_deploy ~/.ssh/known_hosts_vault
+> chmod 600 ~/.ssh/vault_deploy ~/.ssh/known_hosts_vault
+> ```
+>
+> and leave the daemon to no-op on them. (A future phase may switch
+> the bind entries to optional-mounts; for now this is the explicit
+> contract.)
+
+To enable vault sync on the VPS:
 
 1. Run the bootstrap script (idempotent):
    ```bash
@@ -568,7 +611,8 @@ the phase 6e baseline (AC#5). To enable on the VPS:
    docker exec 0xone-assistant ls -l /home/bot/.ssh/vault_deploy /home/bot/.ssh/known_hosts_vault
    ```
 
-5. Tail logs to confirm the first tick fires within ~60s:
+5. Tail logs to confirm the first tick fires within ~60s + the
+   configured `VAULT_SYNC_FIRST_TICK_DELAY_S`:
    ```bash
    docker compose logs --tail 50 0xone-assistant | grep vault_sync
    ```

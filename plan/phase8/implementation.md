@@ -1,9 +1,45 @@
 # Phase 8 — implementation notes
 
-> Coder pass. Spec v3 (post-researcher) at
+> Coder pass. Spec v3.1 (post-4-reviewer-wave fix-pack) at
 > [`description.md`](description.md). The previous implementation
 > notes live at `implementation-prewipe-rejected.md`; this file is a
 > fresh start.
+
+## Fix-pack changelog (v3 → v3.1)
+
+The 4-reviewer convergent fix-pack landed 7 CRITICAL + 6 HIGH closures
+without scope-creep into phase 9. Summary of files touched:
+
+| Path | Delta | Purpose |
+|------|-------|---------|
+| `src/assistant/config.py` | +60 LOC | F4 vault_lock budget validator + F5 commit template restore + F6 effective_manual_tool_enabled property + F11 first_tick_delay_s + F12 non-anchored denylist regex |
+| `src/assistant/bridge/claude.py` | +20 LOC | F1 `vault_tool_visible` kwarg gates both `mcp_servers["vault"]` and `VAULT_TOOL_NAMES` allowed-tool entries |
+| `src/assistant/main.py` | +5 LOC | F1 owner bridge passes `vault_tool_visible=settings.vault_sync.effective_manual_tool_enabled` |
+| `src/assistant/vault_sync/subsystem.py` | +60 LOC / -25 LOC | F3 loop refactor (each tick is a fresh child task) + F9 notify outside lock (RunResult._notify_action tag) + F10 failed-call rate-limit reset + F11 wall-clock-target sleep + first_tick_delay_s |
+| `src/assistant/vault_sync/git_ops.py` | +6 LOC | F8 `shlex.quote` SSH paths |
+| `src/assistant/vault_sync/notify.py` | +25 LOC / -10 LOC | F9 `_send_with_timeout` wrapper + asyncio.wait_for ceiling |
+| `deploy/docker/docker-compose.yml` | +18 LOC | F2 long-form bind + create_host_path: false |
+| `deploy/docker/README.md` | +50 LOC | F2 explicit bootstrap-before-compose-up sequence |
+| `deploy/scripts/vault-bootstrap.sh` | (1 line) | F12 mirror non-anchored regex |
+| `tests/test_phase8_settings_validator.py` | +90 LOC | F4 + F6 + F1 effective property tests |
+| `tests/test_phase8_validate_paths.py` | +30 LOC | F12 recursive match tests |
+| `tests/test_phase8_subsystem_run_once.py` | (3 lines) | F4 fixture compliance |
+| `tests/test_phase8_push_now_rate_limit.py` | (3 lines) | F4 fixture compliance |
+| `tests/test_phase8_disabled_invariants.py` | NEW 130 LOC | AC#5 + F1 invariants |
+| `tests/test_phase8_startup_check.py` | NEW 110 LOC | AC#3 + AC#17 + AC#26 |
+| `tests/test_phase8_prompt_injection_regression.py` | NEW 130 LOC | AC#15 + F10 retry-after-failure |
+| `tests/test_phase8_git_ssh_command_scope.py` | NEW 110 LOC | AC#16 + F8 |
+| `tests/test_phase8_loop_integration.py` | NEW 165 LOC | F3 + F11 + F13 drain integration |
+| `tests/test_phase8_loop_first_tick_timing.py` | NEW 130 LOC | AC#24 |
+| `tests/test_phase8_rss_observer_field.py` | NEW 165 LOC | AC#25 |
+| `tests/test_phase8_vault_lock_race.py` | NEW 80 LOC | AC#12 |
+| `plan/phase8/description.md` | +120 LOC | spec v3 → v3.1 deltas + §9 fix-pack closure table |
+| `plan/phase8/implementation.md` | (this file) | fix-pack changelog |
+
+**Test count**: 30 new tests (8 new test files), brings phase 8 from
+38 → 68 tests; full suite from baseline 983 to ~1013 green.
+
+**Production LOC delta**: +120 LOC across 6 source files.
 
 ## Files modified / added
 

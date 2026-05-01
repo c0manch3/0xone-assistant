@@ -23,7 +23,11 @@ REPO_URL="${REPO_URL:-git@github.com:c0manch3/0xone-vault.git}"
 # Secret denylist regex set — MUST match
 # VaultSyncSettings.secret_denylist_regex in src/assistant/config.py
 # (W2-H4 single-source-of-truth; AC#19 verifies parity).
-DENY_RE='(^secrets/|^\.aws/|^\.config/0xone-assistant/|\.env$|\.key$|\.pem$)'
+# Fix-pack F12 (devops + 4-reviewer convergent): non-anchored
+# (?:^|/) prefix matches the dir patterns RECURSIVELY (parity with
+# the recursive ``.gitignore`` patterns ``secrets/`` / ``.aws/`` /
+# ``.config/0xone-assistant/``).
+DENY_RE='((^|/)secrets/|(^|/)\.aws/|(^|/)\.config/0xone-assistant/|\.env$|\.key$|\.pem$)'
 
 log() { printf '[vault-bootstrap] %s\n' "$*"; }
 err() { printf '[vault-bootstrap] ERROR: %s\n' "$*" >&2; }

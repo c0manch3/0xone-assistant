@@ -194,6 +194,12 @@ class RunResult:
     ``result`` ∈ {"pushed", "noop", "rate_limited", "lock_contention",
     "failed"}. ``commit_sha`` is present only for ``"pushed"`` (a noop
     cycle has no commit).
+
+    F9 (devops HIGH): ``_notify_action`` is an internal field the
+    pipeline sets to tell the outer ``_run_once`` whether to dispatch
+    a Telegram notify AFTER releasing ``self._lock``. The leading
+    underscore + ``compare=False`` keeps it out of dataclass equality
+    + JSON serialisation; ``to_dict`` ignores it.
     """
 
     result: str
@@ -201,6 +207,7 @@ class RunResult:
     commit_sha: str | None = None
     error: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+    _notify_action: str = field(default="none", compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -259,6 +266,12 @@ class VaultSyncSubsystem:
         # AC#3 / AC#26 surface: external probes (tests, RSS observer)
         # can read this without needing access to the private flag.
         self.disabled_reason: str | None = None
+        # F10 — snapshot of ``last_invocation_at`` taken just BEFORE
+        # we set the new timer in ``push_now``. On a failed manual run
+        # we restore from this snapshot so the owner can retry without
+        # waiting out the 60s rate-limit window. ``None`` outside the
+        # push_now critical section.
+        self._state_pre_invocation_at: str | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -369,14 +382,26 @@ class VaultSyncSubsystem:
     # Loop
     # ------------------------------------------------------------------
     async def loop(self) -> None:
-        """Supervised asyncio loop body. Fires the FIRST tick
-        immediately (W2-H1) so a deploy with ``enabled=True`` produces
-        a visible commit within ~60s of the restart, then sleeps
-        ``cron_interval_s`` between subsequent ticks.
+        """Supervised asyncio loop body.
 
-        Defensive inner ``try / except`` so a single tick failure does
-        not crash the loop — the supervisor's respawn budget is
-        reserved for genuinely fatal exceptions.
+        Fix-pack F3 (code-review CRIT-1, qa CRIT-3): each tick runs as
+        a FRESH child task that registers itself in ``pending_set``
+        and self-removes via ``add_done_callback``. Previously a
+        single ``asyncio.current_task()`` call inside ``_run_once_tracked``
+        captured the OUTER infinite-loop task and never removed it —
+        so the drain logic in ``Daemon.stop`` always waited the full
+        timeout + cancelled the supervised loop including any in-flight
+        push.
+
+        Fix-pack F11 (devops CRIT-2): clock-drift-safe sleep using a
+        wall-clock target (``loop.time() + cron_interval_s``) so a
+        slow tick doesn't accumulate drift. ``first_tick_delay_s``
+        (default 60s) sleeps BEFORE the first tick so vault git ops
+        don't compete with daemon boot pressure (Telegram polling,
+        sqlite WAL warm-up, claude preflight). This mildly contradicts
+        the W2-H1 "fire one immediate tick at startup" contract; the
+        owner can override via ``VAULT_SYNC_FIRST_TICK_DELAY_S=0`` if
+        immediate-tick behaviour is required.
         """
         if self._force_disabled:
             log.info(
@@ -384,34 +409,40 @@ class VaultSyncSubsystem:
                 reason=self.disabled_reason,
             )
             return
+        s = self._settings
+        # F11: pre-tick boot-pressure delay.
+        if s.first_tick_delay_s > 0:
+            await asyncio.sleep(s.first_tick_delay_s)
+        loop_clock = asyncio.get_event_loop()
         while True:
+            next_tick = loop_clock.time() + s.cron_interval_s
+            tick = asyncio.create_task(
+                self._run_once(reason="scheduled"),
+                name="vault_sync_tick",
+            )
+            self._pending_set.add(tick)
+            tick.add_done_callback(self._pending_set.discard)
             try:
-                await self._run_once_tracked(reason="scheduled")
+                await tick
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - defensive
                 log.exception("vault_sync_loop_tick_error")
-            await asyncio.sleep(self._settings.cron_interval_s)
-
-    async def _run_once_tracked(self, *, reason: str) -> RunResult:
-        """Wrap ``_run_once`` so the in-flight task is registered in
-        ``pending_set`` for ``Daemon.stop`` drain (§2.9).
-
-        Cron-tick callers go through this helper too — a slow scheduled
-        push that overlaps shutdown must drain to the same budget as a
-        manual ``vault_push_now`` invocation.
-        """
-        task = asyncio.current_task()
-        if task is not None:
-            self._pending_set.add(task)
-            task.add_done_callback(self._pending_set.discard)
-        return await self._run_once(reason=reason)
+            sleep_s = max(0.0, next_tick - loop_clock.time())
+            await asyncio.sleep(sleep_s)
 
     # ------------------------------------------------------------------
     # Pipeline
     # ------------------------------------------------------------------
     async def _run_once(self, *, reason: str) -> RunResult:
         """Run a single sync cycle end-to-end.
+
+        F9 (devops HIGH): the pipeline runs INSIDE ``self._lock`` so
+        cron + manual invocations serialise; the notify dispatch runs
+        OUTSIDE the lock so a slow Telegram backend cannot stall the
+        cron loop. The notify decision is encoded in
+        ``RunResult._notify_action`` — a tagged-union payload the
+        outer code reads after releasing the lock.
 
         See class docstring for the full pipeline + locking contract.
         """
@@ -420,10 +451,29 @@ class VaultSyncSubsystem:
                 result="failed", error="force_disabled"
             )
         async with self._lock:
-            return await self._run_pipeline(reason=reason)
+            result = await self._run_pipeline(reason=reason)
+        # F9: notify outside the asyncio lock. ``_handle_failure_edge``
+        # / ``_handle_success_edge`` mutate ``self._state`` (which is
+        # not protected by ``self._lock`` — ``_state`` is logically
+        # owned by the subsystem instance and the only callers are
+        # ``_run_once`` and ``push_now``, both serialised by the
+        # outer lock anyway). Dispatching notify here means a slow
+        # Telegram outage during the edge transition won't block a
+        # parallel ``memory_write`` waiting on ``vault_lock``.
+        action = result._notify_action
+        if action == "failure":
+            await self._handle_failure_edge(result.error or "unknown")
+        elif action == "success":
+            await self._handle_success_edge()
+        return result
 
     async def _run_pipeline(self, *, reason: str) -> RunResult:
-        """Inner pipeline (caller holds ``self._lock``)."""
+        """Inner pipeline (caller holds ``self._lock``).
+
+        Returns a :class:`RunResult` with a ``_notify_action`` field
+        the caller reads to dispatch notifies AFTER releasing the
+        lock (F9). ``_notify_action`` ∈ {"none", "failure", "success"}.
+        """
         s = self._settings
         # 1. Acquire INNER fcntl vault_lock (sync ctx mgr — W2-C1).
         try:
@@ -480,7 +530,7 @@ class VaultSyncSubsystem:
                         result="failed", error=err
                     )
                     self._record_audit(reason=reason, result=result)
-                    await self._handle_failure_edge(err)
+                    result._notify_action = "failure"
                     return result
                 # 3. Commit.
                 now = dt.datetime.now(dt.UTC)
@@ -509,7 +559,7 @@ class VaultSyncSubsystem:
                         result="failed", error=str(exc)
                     )
                     self._record_audit(reason=reason, result=result)
-                    await self._handle_failure_edge(str(exc))
+                    result._notify_action = "failure"
                     return result
             # 4. INNER vault_lock RELEASED (with-block exited).
             #    memory_write can now resume; concurrent vault_sync
@@ -539,7 +589,7 @@ class VaultSyncSubsystem:
                 error=err,
             )
             self._record_audit(reason=reason, result=result)
-            await self._handle_failure_edge(err)
+            result._notify_action = "failure"
             return result
         try:
             assert s.repo_url is not None  # validator ensures this
@@ -565,7 +615,7 @@ class VaultSyncSubsystem:
                 error=str(exc),
             )
             self._record_audit(reason=reason, result=result)
-            await self._handle_failure_edge(str(exc))
+            result._notify_action = "failure"
             return result
 
         log.info(
@@ -580,7 +630,7 @@ class VaultSyncSubsystem:
             commit_sha=sha,
         )
         self._record_audit(reason=reason, result=result)
-        await self._handle_success_edge()
+        result._notify_action = "success"
         return result
 
     # ------------------------------------------------------------------
@@ -642,23 +692,44 @@ class VaultSyncSubsystem:
 
         # Update timer at INVOCATION time (not completion) so the
         # rate-limit covers the operation duration (§2.8 step 6).
+        # F10: snapshot the prior value first so a failed run can
+        # restore it (UX — failures don't burn the retry window).
+        self._state_pre_invocation_at = self._state.last_invocation_at
         self._state.last_invocation_at = now.isoformat()
         self._state.save(self._state_path)
 
         # Run the pipeline as a tracked task so ``Daemon.stop`` drain
-        # observes it. ``asyncio.shield`` keeps the surrounding await
-        # from cancelling the inner pipeline if the @tool caller's
-        # context dies mid-push (defensive).
+        # observes it. F3: register the manual-task itself in the
+        # pending_set + self-remove via ``add_done_callback`` (mirrors
+        # the loop tick wrapper). ``asyncio.shield`` keeps the
+        # surrounding await from cancelling the inner pipeline if the
+        # @tool caller's context dies mid-push (defensive).
         task: asyncio.Task[RunResult] = asyncio.create_task(
-            self._run_once_tracked(reason="manual"),
+            self._run_once(reason="manual"),
             name="vault_push_now",
         )
+        self._pending_set.add(task)
+        task.add_done_callback(self._pending_set.discard)
         try:
             result = await asyncio.shield(task)
         except asyncio.CancelledError:
             # Surface cancellation upward; the inner task continues
             # running anchored in pending_set.
             raise
+
+        # F10 (UX): a failed manual invocation must NOT burn the
+        # 60s rate-limit window — owner needs to retry immediately
+        # while diagnosing the failure. Reset
+        # ``last_invocation_at`` to the value captured BEFORE this
+        # call (or None) so the next push_now sails straight
+        # through. Successful + noop + lock_contention paths keep
+        # the timer set so prompt-injection amplification (AC#15)
+        # is still bounded by the rate-limit ceiling.
+        if result.result == "failed":
+            self._state.last_invocation_at = (
+                self._state_pre_invocation_at
+            )
+            self._state.save(self._state_path)
         return result.to_dict()
 
     # ------------------------------------------------------------------

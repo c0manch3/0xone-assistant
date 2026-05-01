@@ -1,13 +1,51 @@
 # Phase 8 — Vault → GitHub push-only periodic sync
 
-> Spec v3 — post-researcher. Owner-fixed scope (no re-litigation):
-> push-only direction, dedicated private GH repo, SSH deploy key auth,
-> periodic batch trigger. Scheduler `kind`-column integration was
-> considered in v0 and **rejected by the owner** in favour of a
-> self-contained `asyncio` loop spawned from `Daemon.start()` — see
-> §2.1 and the v0→v1 architecture diff in §7. v1 closed devil w1
-> (5 CRITICAL + 6 HIGH + key MEDIUMs); v2 folds devil w2 closures
-> (3 CRITICAL + 4 HIGH + 6 MEDIUM + 3 LOW) — see §8.
+> Spec v3.1 — post-4-reviewer-wave fix-pack. Owner-fixed scope (no
+> re-litigation): push-only direction, dedicated private GH repo, SSH
+> deploy key auth, periodic batch trigger. Scheduler `kind`-column
+> integration was considered in v0 and **rejected by the owner** in
+> favour of a self-contained `asyncio` loop spawned from
+> `Daemon.start()` — see §2.1 and the v0→v1 architecture diff in §7.
+> v1 closed devil w1 (5 CRITICAL + 6 HIGH + key MEDIUMs); v2 folded
+> devil w2 closures (3 CRITICAL + 4 HIGH + 6 MEDIUM + 3 LOW). v3.1
+> folds the convergent fix-pack from the 4-reviewer wave
+> (code-reviewer + qa-engineer + devops-expert + devil-w3) — 7
+> CRITICAL + 6 HIGH closures listed in §9.
+>
+> Spec deltas in v3.1 (relative to v3):
+>
+> - `manual_tool_enabled` default flipped back to `True` (spec §3
+>   table) with a smarter validator that distinguishes owner-set vs
+>   default and a new computed property `effective_manual_tool_enabled`
+>   that gates the @tool registration (F1 + F6).
+> - `git_op_timeout_s` default lowered 30→10s; `vault_lock_acquire_timeout_s`
+>   bumped to 60s; new validator enforces `vault_lock_acquire_timeout_s
+>   >= 4 * git_op_timeout_s` (F4).
+> - `commit_message_template` default restored to include `{filenames}`
+>   placeholder; em-dash replaced with `--` for legacy log-viewer
+>   compat (F5).
+> - `secret_denylist_regex` patterns now non-anchored
+>   (`(?:^|/)secrets/` etc.) for parity with the recursive
+>   `.gitignore` rules (F12).
+> - New setting `first_tick_delay_s: float = 60.0` — sleeps BEFORE
+>   the first tick to avoid competing with daemon boot pressure (F11);
+>   contradicts the previous "fire one immediate tick at startup"
+>   contract — owner can override to 0 to restore.
+> - Docker compose bind-mounts switched to long-form
+>   `type: bind` + `create_host_path: false` so a missing pre-bootstrap
+>   key file errors LOUDLY instead of silently auto-creating it as a
+>   directory (F2).
+> - Cron loop refactored to spawn each tick as a fresh child task
+>   that registers in `_vault_sync_pending` and self-removes; the
+>   outer loop task NEVER pollutes the pending set so drain budget is
+>   no longer always-exhausted (F3).
+> - Notify dispatch moved OUTSIDE the `_lock` so a slow Telegram
+>   backend cannot stall the cron loop; `notify_*` wrap `send_text` in
+>   `asyncio.wait_for(..., timeout=10s)` (F9).
+> - `vault_push_now` failed result resets `last_invocation_at` to its
+>   prior value so the owner can retry immediately while diagnosing
+>   the failure (F10).
+> - `GIT_SSH_COMMAND` paths are `shlex.quote`-d (F8).
 
 ## 1. Goal
 
@@ -1306,3 +1344,68 @@ v1→v2 fixes. Citations reference the v1 spec line numbers in commit
 > SQLite DB are physically outside the working tree and cannot be
 > staged. There is no path-isolation test needed (the geometry is
 > the test).
+
+## 9. Fix-pack closure table (4-reviewer wave: code-review + qa + devops + devil-w3)
+
+The 4-reviewer wave (`code-reviewer` + `qa-engineer` + `devops-expert`
++ `devil-w3`) ran post-coder; multiple reviewers converged on these
+blockers, raising confidence they were real (not noise). Closures
+applied in v3.1:
+
+### CRITICAL (7)
+
+| ID | Convergent across | v3 risk | v3.1 fix |
+|---|---|---|---|
+| F1 | code-review HIGH-1, qa CRIT-1 | `mcp__vault__vault_push_now` unconditionally added to `allowed_tools` and `vault` to `mcp_servers` — model saw the @tool with `enabled=False`. AC#5 violation. | New `vault_tool_visible: bool = False` kwarg on `ClaudeBridge.__init__`. Daemon owner-bridge passes `vault_sync.effective_manual_tool_enabled`; picker/audio bridges default to False. |
+| F2 | devops CRIT-1, qa CRIT-2 | Compose short-form bind on `~/.ssh/vault_deploy` auto-creates the host path as a DIRECTORY when bootstrap hasn't run; container starts but vault sync silently fails. | Long-form `type: bind` + `bind: { create_host_path: false }` so Docker errors LOUDLY. README updated with explicit ordering: bootstrap.sh BEFORE compose up. |
+| F3 | code-review CRIT-1, qa CRIT-3 | `_run_once_tracked` called `asyncio.current_task()` from inside `loop()`, capturing the OUTER infinite loop task and never removing it from `_vault_sync_pending`. Drain ALWAYS exhausted budget + cancelled the loop. | Refactored: each tick runs as a fresh `asyncio.create_task(_run_once(...), name="vault_sync_tick")` child task that registers + self-removes via `add_done_callback`. `_run_once_tracked` removed; manual `push_now` follows the same fresh-child pattern. |
+| F4 | devil w3 vault_lock hold | `git_op_timeout_s=30` × 4 sequential ops = 120s worst case while `vault_lock_acquire_timeout_s=30s` → memory_write times out. | `git_op_timeout_s` default 30 → 10s. `vault_lock_acquire_timeout_s` default 30 → 60s. Validator enforces `vault_lock_acquire_timeout_s >= 4 * git_op_timeout_s`. |
+| F5 | qa HIGH-4 W2-M2 regression | Coder default reverted to v0 generic without `{filenames}`, dropping forensic value. | Default restored: `"vault sync {timestamp} ({reason}) -- {files_changed} files: {filenames}"`. Em-dash replaced with `--` for legacy viewer compat (devops LOW-4). |
+| F6 | devil W3-CRIT-4, qa MED-1 | Coder flipped `manual_tool_enabled` default to False because validator hard-rejected `True+enabled=False` foot-gun. Spec said True. | Default restored to True. New computed property `effective_manual_tool_enabled = enabled AND manual_tool_enabled` is the actual @tool gate. Validator now uses `model_fields_set` to distinguish owner-explicit vs framework-default and only RAISES on owner-explicit `manual_tool_enabled=True + enabled=False`. |
+| F11 | devops CRIT-2 cron drift | Sleep-after-work accumulates drift; immediate-first-tick competes with boot pressure. | Sleep uses wall-clock target (`loop.time() + cron_interval_s`); new `first_tick_delay_s: float = 60.0` setting sleeps BEFORE first tick by default. Owner can override to 0 to restore immediate-first-tick. **Spec contradiction with W2-H1 acknowledged**: boot-pressure protection wins; the "first commit within ~60s" goal becomes "first commit within ~120s" by default. |
+
+### HIGH (6)
+
+| ID | Reviewer | v3 risk | v3.1 fix |
+|---|---|---|---|
+| F8 | devops + qa | `GIT_SSH_COMMAND` path values not quoted; a path with spaces would break tokenisation. | Both paths `shlex.quote`-d in `build_ssh_command`. |
+| F9 | devops HIGH | `notify_*` awaited inside `async with self._lock`; slow Telegram = stalled cron + blocked `memory_write`. | Notify dispatch moved OUTSIDE `_lock`. New `RunResult._notify_action` field tells the outer code which edge to drive. `notify.py` wraps every `send_text` in `asyncio.wait_for(..., timeout=10s)` with `contextlib.suppress`. |
+| F10 | qa UX | `last_invocation_at` set on INVOCATION; failed manual call burns the rate-limit window — owner can't retry for 60s. | `push_now` snapshots the prior value; on `result == "failed"` restores it so successive calls sail through. Successful + noop + lock_contention paths keep the timer. |
+| F12 | devops + 4-reviewer convergent | Daemon regex `^secrets/` only matches at root; `.gitignore secrets/` matches recursively. Force-staged `notes/secrets/api.env` would bypass daemon while gitignore rejects. | Regex set rewritten with `(?:^|/)` prefix for the dir patterns; bootstrap script's `grep -E` mirrored verbatim. |
+| F13 | qa | Drain test used a synthetic helper instead of driving the real `loop()` task. | New integration test `test_phase8_loop_integration.py` exercises the real loop + drain end-to-end. |
+| F7 | qa AC coverage | AC#3 / AC#12 / AC#15 / AC#16 / AC#17 / AC#24 / AC#25 / AC#26 had no tests. | Added: `test_phase8_startup_check.py`, `test_phase8_prompt_injection_regression.py`, `test_phase8_git_ssh_command_scope.py`, `test_phase8_loop_first_tick_timing.py`, `test_phase8_rss_observer_field.py`, `test_phase8_vault_lock_race.py`, `test_phase8_disabled_invariants.py`, `test_phase8_loop_integration.py`. |
+
+### Carry-forward to phase 9
+
+The following items from the 4-reviewer wave are deferred:
+
+- DevOps HIGH-3: audit log retention scheme (date-stamped rotation
+  beyond the single-step `.1`).
+- DevOps MED-2: CI host-key drift check (weekly cron job in GH Actions).
+- DevOps HIGH-7: bootstrap script `git reset` between re-runs.
+- Devil MED-5: periodic `startup_check` re-run for runtime host-key
+  rotation detection.
+- QA security: property-based denylist tests (Hypothesis).
+- Devil HIGH-3: real-subprocess `git_ops.py` tests (requires git
+  binary in CI image — currently mocked).
+- W3-CRIT-3: commit message template injection — daemon-side sanitisation
+  is in place (`_sanitize_filename`); deferred test to phase 9 limitations.
+
+### Architecture diff (v3 → v3.1)
+
+| Aspect | v3 | v3.1 |
+|---|---|---|
+| `vault_push_now` MCP @tool gate | unconditional registration in bridge | conditional on `vault_tool_visible=True` kwarg; daemon passes `effective_manual_tool_enabled` |
+| `manual_tool_enabled` default | False (coder divergence from spec) | True (per spec) + soft validator that distinguishes owner-explicit vs default |
+| Cron loop tick task | outer loop task captured by `asyncio.current_task()` | each tick is a fresh `asyncio.create_task` child, self-registers + self-removes |
+| First tick timing | immediate (W2-H1) | `first_tick_delay_s` default 60s (boot-pressure protection); owner can revert to 0 |
+| Sleep semantics | `await asyncio.sleep(cron_interval_s)` after each tick (drift accumulates) | wall-clock target via `loop.time() + cron_interval_s` (drift-free) |
+| Notify dispatch | inside `async with self._lock` | OUTSIDE `_lock`; bounded by `asyncio.wait_for(..., timeout=10s)` per call |
+| Failed `vault_push_now` rate-limit | timer set on invocation, NOT reset on failure | prior value restored on `result == "failed"` so owner can retry immediately |
+| `git_op_timeout_s` default | 30s | 10s |
+| `vault_lock_acquire_timeout_s` default | 30s | 60s; validator enforces `>= 4 * git_op_timeout_s` |
+| `secret_denylist_regex` anchoring | `^secrets/`, `^\.aws/`, `^\.config/0xone-assistant/` | `(?:^|/)secrets/`, `(?:^|/)\.aws/`, `(?:^|/)\.config/0xone-assistant/` (recursive parity with .gitignore) |
+| Commit message template | `vault sync {timestamp} ({reason}) — {files_changed} files` | `vault sync {timestamp} ({reason}) -- {files_changed} files: {filenames}` |
+| Docker compose SSH bind | short-form `:ro` (auto-creates dir if missing) | long-form `type: bind` + `create_host_path: false` (errors loudly if missing) |
+| `GIT_SSH_COMMAND` paths | f-string interpolation | `shlex.quote(str(path))` |
+| AC test coverage | AC#1, AC#2, AC#10, AC#13, AC#14, AC#23 | + AC#3, AC#5, AC#12, AC#15, AC#16, AC#17, AC#19, AC#22, AC#24, AC#25, AC#26 |

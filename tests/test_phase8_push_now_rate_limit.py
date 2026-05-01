@@ -25,6 +25,7 @@ from assistant.vault_sync.subsystem import VaultSyncSubsystem
 
 
 def _settings() -> VaultSyncSettings:
+    """F4: keep ``vault_lock_acquire_timeout_s >= 4 * git_op_timeout_s``."""
     return VaultSyncSettings(
         enabled=True,
         repo_url="git@github.com:c0manch3/0xone-vault.git",
@@ -32,8 +33,9 @@ def _settings() -> VaultSyncSettings:
         manual_tool_min_interval_s=60.0,
         push_timeout_s=10,
         drain_timeout_s=10.0,
-        git_op_timeout_s=5,
-        vault_lock_acquire_timeout_s=2.0,
+        git_op_timeout_s=2,
+        vault_lock_acquire_timeout_s=8.0,
+        first_tick_delay_s=0.0,
     )
 
 

@@ -36,7 +36,11 @@ def vault_dir(tmp_path: Path) -> Path:
 @pytest.fixture
 def settings_enabled() -> VaultSyncSettings:
     """Vault sync settings with sensible test defaults — short
-    timeouts so tests don't drag if the mock is mis-wired."""
+    timeouts so tests don't drag if the mock is mis-wired.
+
+    Fix-pack F4: ``vault_lock_acquire_timeout_s >= 4 * git_op_timeout_s``
+    invariant. ``2 * 4 = 8s`` budget; pad to 8.0 for boundary safety.
+    """
     return VaultSyncSettings(
         enabled=True,
         repo_url="git@github.com:c0manch3/0xone-vault.git",
@@ -44,9 +48,10 @@ def settings_enabled() -> VaultSyncSettings:
         cron_interval_s=10.0,
         push_timeout_s=10,
         drain_timeout_s=10.0,
-        git_op_timeout_s=5,
-        vault_lock_acquire_timeout_s=2.0,
+        git_op_timeout_s=2,
+        vault_lock_acquire_timeout_s=8.0,
         manual_tool_min_interval_s=60.0,
+        first_tick_delay_s=0.0,
     )
 
 

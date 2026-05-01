@@ -65,14 +65,35 @@ services:
       # features. Phase 9 hardens with read_only/cap_drop instead.
       - ${HOME}/.claude:/home/bot/.claude:rw
       - ${HOME}/.local/share/0xone-assistant:/home/bot/.local/share/0xone-assistant:rw
-      # Phase 8 (W2-M5): vault sync SSH key + pinned known_hosts.
-      # Read-only so the daemon cannot accidentally rewrite either
-      # file. Both paths are populated by deploy/scripts/vault-bootstrap.sh
-      # on the host before the first restart with VAULT_SYNC_ENABLED=true.
-      # When vault sync is disabled (default), the bind-mounts simply
-      # expose unused files inside the container — no behavioural impact.
-      - ${HOME}/.ssh/vault_deploy:/home/bot/.ssh/vault_deploy:ro
-      - ${HOME}/.ssh/known_hosts_vault:/home/bot/.ssh/known_hosts_vault:ro
+      # Phase 8 (W2-M5 + fix-pack F2): vault sync SSH key + pinned
+      # known_hosts. Long-form ``type: bind`` syntax with
+      # ``create_host_path: false`` so Docker errors LOUDLY when
+      # ``vault-bootstrap.sh`` has not yet populated these files —
+      # instead of silently auto-creating them as DIRECTORIES (which
+      # is the short-form default and the source of the devops CRIT-1
+      # surfaced in the 4-reviewer wave: container starts, vault
+      # sync silently fails because ``ssh -i`` rejects a directory).
+      #
+      # Owner MUST run ``deploy/scripts/vault-bootstrap.sh`` BEFORE
+      # ``docker compose up`` whenever ``VAULT_SYNC_ENABLED=true``;
+      # see ``deploy/docker/README.md`` "Phase 8 vault sync setup".
+      # When vault sync is disabled (default), the host files are
+      # not required because the daemon never reads them — but the
+      # bind entries still expect them to exist, so a brand-new VPS
+      # without bootstrap.sh must keep ``VAULT_SYNC_ENABLED=false``
+      # OR run bootstrap.sh first.
+      - type: bind
+        source: ${HOME}/.ssh/vault_deploy
+        target: /home/bot/.ssh/vault_deploy
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${HOME}/.ssh/known_hosts_vault
+        target: /home/bot/.ssh/known_hosts_vault
+        read_only: true
+        bind:
+          create_host_path: false
 
     # Match VPS user `0xone` (uid=1000 gid=1000, RQ7 verified).
     user: "1000:1000"
