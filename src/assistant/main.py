@@ -48,6 +48,8 @@ from assistant.tools_sdk import installer as _installer_mod
 from assistant.tools_sdk import memory as _memory_mod
 from assistant.tools_sdk import scheduler as _scheduler_mod
 from assistant.tools_sdk import subagent as _subagent_mod
+from assistant.tools_sdk import vault as _vault_mod
+from assistant.vault_sync import VaultSyncSubsystem, _cleanup_stale_vault_locks
 
 log = get_logger("main")
 
@@ -229,6 +231,16 @@ class Daemon:
         # the Mac whisper-server's hard ``Semaphore(1)`` from the client
         # side (CLOSED-NEGATIVE per researcher RQ3).
         self._audio_bg_sem: asyncio.Semaphore | None = None
+        # Phase 8: vault → GitHub push-only periodic sync. ``None``
+        # when disabled (default). Constructed in ``start()`` after
+        # subagent picker spawn and BEFORE the scheduler boot block
+        # (W2-M1). The pending set mirrors ``_audio_persist_pending``
+        # so ``Daemon.stop`` can drain in-flight pushes BEFORE
+        # cancelling ``_bg_tasks`` (subprocess push tasks aren't
+        # shielded — cancelling mid-flight orphans the SSH pipe and
+        # leaves ``.git/index.lock``).
+        self._vault_sync: VaultSyncSubsystem | None = None
+        self._vault_sync_pending: set[asyncio.Task[Any]] = set()
 
     async def _preflight_claude_auth(self) -> None:
         """Fail-fast if the ``claude`` CLI is missing or unauthenticated.
@@ -569,6 +581,50 @@ class Daemon:
         if self._sub_picker is not None:
             self._spawn_bg(self._sub_picker.run())
 
+        # Phase 8: vault → GitHub push-only periodic sync.
+        # Boot ordering (W2-M1): AFTER subagent picker spawn (the
+        # subagent's SubagentStop notify must reach Telegram before we
+        # add a new bg loop) and BEFORE the scheduler boot block
+        # (the scheduler's catchup-recap notify is independent of
+        # vault sync). Constructed only when ``settings.vault_sync.enabled``;
+        # the @tool stays unregistered when the subsystem is None.
+        if self._settings.vault_sync.enabled:
+            vault_dir = self._settings.vault_dir
+            _cleanup_stale_vault_locks(vault_dir)
+            self._vault_sync = VaultSyncSubsystem(
+                vault_dir=vault_dir,
+                index_db_lock_path=Path(
+                    str(self._settings.memory_index_path) + ".lock"
+                ),
+                settings=self._settings.vault_sync,
+                adapter=self._adapter,
+                owner_chat_id=self._settings.owner_chat_id,
+                run_dir=self._settings.data_dir / "run",
+                pending_set=self._vault_sync_pending,
+            )
+            await self._vault_sync.startup_check()
+            # @tool registration is gated by ``manual_tool_enabled``;
+            # the validator already enforces it requires
+            # ``enabled=True``, so we can read the flag directly.
+            if self._settings.vault_sync.manual_tool_enabled:
+                _vault_mod.configure_vault(
+                    subsystem=self._vault_sync,
+                )
+            # Spawn the loop only when ``startup_check`` passed.
+            # ``force_disabled=True`` means SSH/known_hosts validation
+            # failed; the daemon keeps serving phase-1..6e traffic
+            # without the loop (AC#3 / AC#17 / AC#26).
+            if not self._vault_sync.force_disabled:
+                self._spawn_bg_supervised(
+                    self._vault_sync.loop,
+                    name="vault_sync_loop",
+                )
+            else:
+                log.warning(
+                    "vault_sync_force_disabled",
+                    reason=self._vault_sync.disabled_reason,
+                )
+
         if sched_enabled:
             assert self._sched_store is not None
             self._sched_queue = asyncio.Queue(
@@ -672,15 +728,23 @@ class Daemon:
             except Exception as exc:
                 plog.debug("rss_read_failed", error=repr(exc))
             else:
-                plog.info(
-                    "daemon_rss",
-                    rss_mb=rss_kb // 1024,
-                    bg_tasks=len(self._bg_tasks),
-                    audio_persist_pending=len(
+                # Phase 8 (W2-M4): include ``vault_sync_pending`` so a
+                # stuck push surfaces in the RSS sample stream. The
+                # field is OMITTED when ``self._vault_sync is None``
+                # (i.e. ``enabled=False``) per AC#5 parity. AC#25.
+                rss_payload: dict[str, Any] = {
+                    "rss_mb": rss_kb // 1024,
+                    "bg_tasks": len(self._bg_tasks),
+                    "audio_persist_pending": len(
                         self._audio_persist_pending
                     ),
-                    sub_pending=len(self._sub_pending_updates),
-                )
+                    "sub_pending": len(self._sub_pending_updates),
+                }
+                if self._vault_sync is not None:
+                    rss_payload["vault_sync_pending"] = len(
+                        self._vault_sync_pending
+                    )
+                plog.info("daemon_rss", **rss_payload)
             await asyncio.sleep(interval_s)
 
     def spawn_audio_task(
@@ -884,6 +948,45 @@ class Daemon:
             self._sub_picker.request_stop()
         if self._adapter is not None:
             await self._adapter.stop()
+        # Phase 8: drain in-flight vault_sync pushes BEFORE _bg_tasks
+        # cancel. Subprocess push tasks are NOT shielded inside a
+        # finally (unlike phase-6e audio persist tasks) — cancelling
+        # mid-flight orphans the SSH pipe and leaves
+        # ``.git/index.lock``. Budget == drain_timeout_s (default 60s,
+        # validator enforces ``>= push_timeout_s`` per W2-M3) so a
+        # slow but otherwise healthy push always completes before the
+        # forced tear-down. Drain order deviates from the phase-6e
+        # precedent (audio drain runs AFTER ``_bg_tasks`` cancel
+        # because shielded tasks survive); vault sync runs BEFORE.
+        if self._vault_sync_pending:
+            pending = list(self._vault_sync_pending)
+            log.info(
+                "daemon_draining_vault_sync", count=len(pending)
+            )
+            try:
+                _done, not_done = await asyncio.wait(
+                    pending,
+                    timeout=self._settings.vault_sync.drain_timeout_s,
+                    return_when=asyncio.ALL_COMPLETED,
+                )
+                if not_done:
+                    log.warning(
+                        "daemon_vault_sync_drain_timeout",
+                        outstanding=[
+                            t.get_name() for t in not_done
+                        ],
+                    )
+                    for t in not_done:
+                        t.cancel()
+                    await asyncio.gather(
+                        *not_done, return_exceptions=True
+                    )
+            except Exception as exc:
+                log.warning(
+                    "daemon_vault_sync_drain_error",
+                    error=repr(exc),
+                )
+        self._vault_sync_pending.clear()
         # S8 (wave-3): cancel tracked bg coroutines (skill_creator bootstrap,
         # sweepers) BEFORE closing the sqlite connection. Otherwise a
         # long-running ``fetch_bundle_async`` could try to touch the DB-adjacent

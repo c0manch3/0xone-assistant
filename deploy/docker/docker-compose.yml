@@ -65,6 +65,14 @@ services:
       # features. Phase 9 hardens with read_only/cap_drop instead.
       - ${HOME}/.claude:/home/bot/.claude:rw
       - ${HOME}/.local/share/0xone-assistant:/home/bot/.local/share/0xone-assistant:rw
+      # Phase 8 (W2-M5): vault sync SSH key + pinned known_hosts.
+      # Read-only so the daemon cannot accidentally rewrite either
+      # file. Both paths are populated by deploy/scripts/vault-bootstrap.sh
+      # on the host before the first restart with VAULT_SYNC_ENABLED=true.
+      # When vault sync is disabled (default), the bind-mounts simply
+      # expose unused files inside the container — no behavioural impact.
+      - ${HOME}/.ssh/vault_deploy:/home/bot/.ssh/vault_deploy:ro
+      - ${HOME}/.ssh/known_hosts_vault:/home/bot/.ssh/known_hosts_vault:ro
 
     # Match VPS user `0xone` (uid=1000 gid=1000, RQ7 verified).
     user: "1000:1000"

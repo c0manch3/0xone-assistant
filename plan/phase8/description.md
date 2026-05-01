@@ -1,6 +1,6 @@
 # Phase 8 — Vault → GitHub push-only periodic sync
 
-> Spec v2 — post-devil-w2. Owner-fixed scope (no re-litigation):
+> Spec v3 — post-researcher. Owner-fixed scope (no re-litigation):
 > push-only direction, dedicated private GH repo, SSH deploy key auth,
 > periodic batch trigger. Scheduler `kind`-column integration was
 > considered in v0 and **rejected by the owner** in favour of a
@@ -94,13 +94,16 @@ scheduler boot block (`main.py:572`). Lifecycle:
 # After: self._spawn_bg(self._sub_picker.run())  ~main.py:570
 # Before: if sched_enabled: ...                  ~main.py:572
 if self._settings.vault_sync.enabled:
-    self._cleanup_stale_vault_locks(self._settings.vault_dir)  # see §2.5
+    _cleanup_stale_vault_locks(self._settings.vault_dir)  # see §2.5
     self._vault_sync = VaultSyncSubsystem(
         vault_dir=self._settings.vault_dir,
-        index_db_path=self._settings.memory_index_db_path,
+        index_db_lock_path=Path(
+            str(self._settings.memory_index_path) + ".lock"
+        ),
         settings=self._settings.vault_sync,
-        notifier=self._notifier,
-        run_dir=self._settings.run_dir,
+        adapter=self._adapter,
+        owner_chat_id=self._settings.owner_chat_id,
+        run_dir=self._settings.data_dir / "run",
         pending_set=self._vault_sync_pending,  # §2.9
     )
     await self._vault_sync.startup_check()  # known_hosts pin + key file
@@ -252,6 +255,11 @@ The lock primitive is fcntl-based on the index-db lock path
 `<index_db_path>.lock` (NOT inside the vault dir — same lock primitive
 that `memory_write`, `memory_delete`, and `reindex_under_lock` already
 use; `_memory_core.vault_lock` at `_memory_core.py:606`).
+
+`vault_lock` is a SYNCHRONOUS context manager (`@contextmanager` from
+`contextlib`). Use plain `with`, NOT `async with`. Run git ops inside
+via `asyncio.create_subprocess_exec` so the asyncio loop is not
+blocked.
 
 Sequence inside `run_once(reason)`:
 
@@ -505,22 +513,39 @@ and self-removes via `add_done_callback`.
 `_bg_tasks` (which would otherwise tear down the loop mid-push):
 
 ```python
-# In Daemon.stop, BEFORE _bg_tasks cancel:
+# In Daemon.stop, BEFORE _bg_tasks cancel.
+# F11 pattern (matches phase-6e _audio_persist_pending drain at
+# main.py:919-934): use ``asyncio.wait`` so the timeout snapshot
+# observes the real outstanding set rather than the post-cancel
+# empty list ``asyncio.wait_for(asyncio.gather(...))`` would
+# produce. Drain order deviates from the phase-6e precedent: vault
+# sync subprocess push tasks aren't shielded inside ``finally`` like
+# audio persist tasks were, so cancelling mid-flight orphans the
+# SSH pipe and leaves ``.git/index.lock``. Hence the wait-then-cancel
+# sequence here.
 if self._vault_sync_pending:
     pending = list(self._vault_sync_pending)
-    deadline = self._settings.vault_sync.drain_timeout_s  # 60s (W2-M3)
+    log.info("daemon_draining_vault_sync", count=len(pending))
     try:
-        await asyncio.wait_for(
-            asyncio.gather(*pending, return_exceptions=True),
-            timeout=deadline,
+        done, not_done = await asyncio.wait(
+            pending,
+            timeout=self._settings.vault_sync.drain_timeout_s,
+            return_when=asyncio.ALL_COMPLETED,
         )
-    except asyncio.TimeoutError:
+        if not_done:
+            log.warning(
+                "daemon_vault_sync_drain_timeout",
+                outstanding=[t.get_name() for t in not_done],
+            )
+            for t in not_done:
+                t.cancel()
+            await asyncio.gather(
+                *not_done, return_exceptions=True
+            )
+    except Exception as exc:
         log.warning(
-            "vault_sync_drain_timeout",
-            pending=len(pending),
-            deadline_s=deadline,
+            "daemon_vault_sync_drain_error", error=repr(exc)
         )
-        # Fall through: _bg_tasks cancel below will tear down hard.
 self._vault_sync_pending.clear()
 # ... existing _bg_tasks drain follows ...
 ```
@@ -602,7 +627,13 @@ class VaultSyncSettings(BaseSettings):
         "vault sync {timestamp} ({reason}) — {files_changed} files: {filenames}"
     )
 
-    def __post_init__(self) -> None:  # or pydantic validator
+    @model_validator(mode="after")
+    def _validate_vault_sync_consistency(
+        self,
+    ) -> "VaultSyncSettings":
+        """Pydantic v2 cross-field validator. Mirrors the
+        ``_validate_whisper_pair`` precedent in ``config.py:293-310``.
+        """
         # W2-C3: manual_tool requires the subsystem itself enabled.
         if self.manual_tool_enabled and not self.enabled:
             raise ValueError(
@@ -616,7 +647,24 @@ class VaultSyncSettings(BaseSettings):
                 "drain_timeout_s must be >= push_timeout_s "
                 f"(got {self.drain_timeout_s} < {self.push_timeout_s})"
             )
-        # ... existing repo_url regex validator (when enabled=True)
+        # repo_url required + regex check when enabled=True.
+        if self.enabled and self.repo_url is None:
+            raise ValueError(
+                "repo_url required when enabled=True; set "
+                "VAULT_SYNC_REPO_URL=git@github.com:<owner>/<repo>.git"
+            )
+        if self.repo_url is not None:
+            import re
+
+            if not re.match(
+                r"^git@[a-z0-9.-]+:[\w.-]+/[\w.-]+\.git$",
+                self.repo_url,
+            ):
+                raise ValueError(
+                    f"repo_url must match SSH form "
+                    f"git@host:owner/repo.git (got {self.repo_url!r})"
+                )
+        return self
 ```
 
 | Field | Default | Purpose |
@@ -661,7 +709,8 @@ steps.
 - `deploy/scripts/vault-bootstrap.sh` — idempotent shell script
   running the steps below.
 - `deploy/known_hosts_vault.pinned` — checked-in file containing
-  GitHub's current ed25519 + rsa host keys. Verify against
+  GitHub's current ed25519 + ecdsa + rsa host keys (all three
+  returned by `gh api meta | jq -r '.ssh_keys[]'`). Verify against
   `https://api.github.com/meta` before each release that touches this
   file. `vault-bootstrap.sh` copies this file into
   `~/.ssh/known_hosts_vault` rather than running `ssh-keyscan` (H-4
@@ -985,11 +1034,14 @@ docker logs).
 loads + appears in skills catalogue + Cyrillic trigger phrase test.**
 Model (in dry-run) sees the skill catalogue listing `vault` with
 trigger phrases including "запушь вольт", "сделай бэкап заметок",
-"синхронизируй vault", "push vault now". Skill frontmatter restricts
-`allowed-tools: ["mcp__vault__vault_push_now"]`. The body includes
-explicit anti-pattern guidance: "do NOT call `vault_push_now` as
-side-effect of `memory_write` or other tool chains; this tool is
-for explicit owner request only".
+"синхронизируй vault", "push vault now". Skill frontmatter declares
+`allowed-tools: ["mcp__vault__vault_push_now"]` (documentation; per-
+skill enforcement is phase 4 carry-forward — `bridge/skills.py:64`
+warns `skill_lockdown_not_enforced` because the global baseline is
+the only gate today). The body includes explicit anti-pattern
+guidance: "do NOT call `vault_push_now` as side-effect of
+`memory_write` or other tool chains; this tool is for explicit owner
+request only".
 
 **AC#19 — bootstrap pre-push secret-leak check uses identical regex
 semantics as daemon-side.** Run `vault-bootstrap.sh` with

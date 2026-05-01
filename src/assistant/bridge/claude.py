@@ -46,6 +46,7 @@ from assistant.tools_sdk.subagent import (
     SUBAGENT_SERVER,
     SUBAGENT_TOOL_NAMES,
 )
+from assistant.tools_sdk.vault import VAULT_SERVER, VAULT_TOOL_NAMES
 
 log = get_logger("bridge.claude")
 
@@ -220,6 +221,7 @@ class ClaudeBridge:
             *MEMORY_TOOL_NAMES,
             *SCHEDULER_TOOL_NAMES,
             *SUBAGENT_TOOL_NAMES,
+            *VAULT_TOOL_NAMES,
         ]
         if self._agents:
             allowed_tools.append("Task")
@@ -228,6 +230,7 @@ class ClaudeBridge:
             "memory": MEMORY_SERVER,
             "scheduler": SCHEDULER_SERVER,
             "subagent": SUBAGENT_SERVER,
+            "vault": VAULT_SERVER,
         }
         opts_kwargs: dict[str, Any] = {
             "cwd": str(pr),

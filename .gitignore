@@ -46,6 +46,8 @@ skills/*
 !skills/scheduler/**
 !skills/task/
 !skills/task/**
+!skills/vault/
+!skills/vault/**
 
 # Tools installed with skills (only ping is repo-shipped).
 tools/*

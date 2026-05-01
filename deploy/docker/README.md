@@ -534,6 +534,52 @@ under a 1500m limit (~30%). The owner should tail
 a week to confirm the steady-state RSS stays under 1.3 GB; sustained
 growth past that bound on a quiet bot signals a leak.
 
+## Phase 8 vault sync — one-time setup
+
+Phase 8 ships a vault → GitHub push-only periodic sync. Default is
+`VAULT_SYNC_ENABLED=false` so a fresh deploy behaves identically to
+the phase 6e baseline (AC#5). To enable on the VPS:
+
+1. Run the bootstrap script (idempotent):
+   ```bash
+   sudo -u 0xone /opt/0xone-assistant/deploy/scripts/vault-bootstrap.sh
+   ```
+   The script generates `~/.ssh/vault_deploy`, copies the pinned
+   `~/.ssh/known_hosts_vault`, prompts for the GitHub Deploy Key
+   paste, initialises the vault git repo, runs the secret-leak
+   pre-push validation, makes the initial commit + push, and prints
+   the env-file diff to apply.
+
+2. Update `~/.config/0xone-assistant/.env`:
+   ```
+   VAULT_SYNC_ENABLED=true
+   VAULT_SYNC_REPO_URL=git@github.com:c0manch3/0xone-vault.git
+   VAULT_SYNC_MANUAL_TOOL_ENABLED=true
+   ```
+
+3. Restart the daemon:
+   ```bash
+   cd /opt/0xone-assistant/deploy/docker
+   docker compose restart
+   ```
+
+4. Verify the SSH key + known_hosts are mounted into the container:
+   ```bash
+   docker exec 0xone-assistant ls -l /home/bot/.ssh/vault_deploy /home/bot/.ssh/known_hosts_vault
+   ```
+
+5. Tail logs to confirm the first tick fires within ~60s:
+   ```bash
+   docker compose logs --tail 50 0xone-assistant | grep vault_sync
+   ```
+
+Operational runbooks:
+
+- `docs/ops/vault-host-key-rotation.md` — what to do when GitHub
+  rotates SSH host keys (rare but plan for it).
+- `docs/ops/vault-secret-leak-recovery.md` — what to do if a secret
+  somehow gets committed despite both layers of defence.
+
 ## Phase 9 hardening (deferred)
 
 Tracked in `plan/phase5d/description.md §M`:

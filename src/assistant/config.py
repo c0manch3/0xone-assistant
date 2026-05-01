@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -179,6 +180,117 @@ class AudioBgSettings(BaseSettings):
     drain_timeout_s: float = 5.0
 
 
+_VAULT_SYNC_REPO_URL_RE = re.compile(
+    r"^git@[a-z0-9.-]+:[\w.-]+/[\w.-]+\.git$"
+)
+
+
+class VaultSyncSettings(BaseSettings):
+    """Phase 8 vault → GitHub push-only periodic sync knobs
+    (``VAULT_SYNC_*`` env prefix).
+
+    The subsystem itself is opt-in: ``enabled=False`` (default) keeps
+    the daemon observably identical to the phase-6e baseline (AC#5
+    parity — no loop spawn, no MCP @tool registration, no audit log
+    file, no RSS observer field). Setting ``enabled=True`` requires
+    the production-style SSH key + pinned known_hosts to exist on the
+    host; otherwise ``startup_check`` force-disables the subsystem
+    for the process lifetime and the daemon keeps serving phase
+    1..6e traffic (AC#3 / AC#17 / AC#26).
+
+    Validators (W2-C3 / W2-M3 / L-2):
+
+      - ``manual_tool_enabled=True`` requires ``enabled=True`` —
+        otherwise the @tool would register but the subsystem itself
+        would not be constructed (logically inconsistent). Rejected
+        at load time.
+      - ``drain_timeout_s >= push_timeout_s`` — a slow but otherwise
+        healthy push must always finish within the
+        ``Daemon.stop`` drain budget; the inverted invariant would
+        force-tear-down a still-legitimate subprocess and orphan
+        ``.git/index.lock``.
+      - ``repo_url`` required when ``enabled=True``, and (when set)
+        matches ``^git@<host>:<owner>/<repo>.git$`` so a typo or
+        accidental https URL fails fast.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="VAULT_SYNC_",
+        env_file=[_user_env_file(), Path(".env")],
+        extra="ignore",
+    )
+    enabled: bool = False
+    repo_url: str | None = None
+    ssh_key_path: Path | None = None
+    ssh_known_hosts_path: Path | None = None
+    branch: str = "main"
+    cron_interval_s: float = 3600.0
+    git_user_name: str = "0xone-assistant"
+    git_user_email: str = "0xone-assistant@users.noreply.github.com"
+    git_op_timeout_s: int = 30
+    push_timeout_s: int = 60
+    drain_timeout_s: float = 60.0
+    vault_lock_acquire_timeout_s: float = 30.0
+    # Default ``False`` (coder note): the spec table in §3 specifies
+    # ``True`` as the default, BUT pairing that with the
+    # ``enabled=False`` default would trip the
+    # ``manual_tool_enabled requires enabled=True`` validator at every
+    # daemon boot on a fresh checkout. Defaulting to ``False`` keeps
+    # the construction self-consistent without needing the validator
+    # to distinguish "user-set" vs "framework-default". Owners who
+    # flip ``VAULT_SYNC_ENABLED=true`` typically also set
+    # ``VAULT_SYNC_MANUAL_TOOL_ENABLED=true`` in the same env diff.
+    manual_tool_enabled: bool = False
+    manual_tool_min_interval_s: float = 60.0
+    notify_milestone_failures: tuple[int, ...] = (5, 10, 24)
+    audit_log_max_size_mb: int = 10
+    secret_denylist_regex: tuple[str, ...] = (
+        r"^secrets/",
+        r"^\.aws/",
+        r"^\.config/0xone-assistant/",
+        r"\.env$",
+        r"\.key$",
+        r"\.pem$",
+    )
+    commit_message_template: str = (
+        "vault sync {timestamp} ({reason}) — {files_changed} files"
+    )
+
+    @model_validator(mode="after")
+    def _validate_vault_sync_consistency(self) -> VaultSyncSettings:
+        """Cross-field validators (W2-C3 + W2-M3 + L-2 + repo_url
+        required-when-enabled).
+
+        Mirrors the precedent ``_validate_whisper_pair`` at
+        ``config.py:293-310`` — pydantic v2 ``mode="after"`` so all
+        fields are populated when the check runs.
+        """
+        if self.manual_tool_enabled and not self.enabled:
+            raise ValueError(
+                "manual_tool_enabled requires enabled=True; "
+                "set VAULT_SYNC_MANUAL_TOOL_ENABLED=false or "
+                "VAULT_SYNC_ENABLED=true"
+            )
+        if self.drain_timeout_s < self.push_timeout_s:
+            raise ValueError(
+                "drain_timeout_s must be >= push_timeout_s "
+                f"(got {self.drain_timeout_s} < {self.push_timeout_s})"
+            )
+        if self.enabled and self.repo_url is None:
+            raise ValueError(
+                "repo_url required when enabled=True; set "
+                "VAULT_SYNC_REPO_URL=git@github.com:<owner>/<repo>.git"
+            )
+        if self.repo_url is not None and not _VAULT_SYNC_REPO_URL_RE.match(
+            self.repo_url
+        ):
+            raise ValueError(
+                "repo_url must match SSH form "
+                f"git@host:owner/repo.git (got {self.repo_url!r})"
+            )
+        return self
+
+
 class ObservabilitySettings(BaseSettings):
     """Phase 6e fix-pack-2 observability knobs (``ASSISTANT_OBSERVABILITY_*``
     env prefix).
@@ -223,6 +335,7 @@ class Settings(BaseSettings):
     observability: ObservabilitySettings = Field(
         default_factory=ObservabilitySettings
     )
+    vault_sync: VaultSyncSettings = Field(default_factory=VaultSyncSettings)
 
     # ------------------------------------------------------------------
     # Phase 6c: voice / audio / URL transcription via Mac mini Whisper.
