@@ -6,7 +6,7 @@ import datetime as _dt
 import re as _re
 import shutil
 import sqlite3
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -24,6 +24,7 @@ from assistant.adapters.base import (
     IMAGE_KINDS,
     Emit,
     IncomingMessage,
+    MessengerAdapter,
 )
 from assistant.audio import AudioJob
 from assistant.bridge.claude import ClaudeBridge, ClaudeBridgeError
@@ -45,6 +46,7 @@ from assistant.memory.store import (
     save_transcript,
     slugify_area,
 )
+from assistant.render_doc import ArtefactBlock, RenderDocSubsystem
 from assistant.services.transcription import (
     TranscriptionError,
     TranscriptionResult,
@@ -281,6 +283,8 @@ class ClaudeHandler:
             Callable[[Coroutine[Any, Any, None]], None] | None
         ) = None,
         audio_persist_pending: set[asyncio.Task[Any]] | None = None,
+        render_doc: RenderDocSubsystem | None = None,
+        adapter: MessengerAdapter | None = None,
     ) -> None:
         self._settings = settings
         self._conv = conv
@@ -323,6 +327,13 @@ class ClaudeHandler:
         # legacy in-line behaviour for tests / fallback callers.
         self._audio_persist_pending = audio_persist_pending
 
+        # Phase 9: render_doc subsystem reference (None when disabled)
+        # + adapter for ``send_document`` outbound delivery. Handler
+        # uses both ONLY for the render_doc artefact flush path; non-
+        # render_doc tests can leave them None.
+        self._render_doc = render_doc
+        self._adapter = adapter
+
         # CR-1 (phase 5, NEW): serialise concurrent turns on the same
         # chat_id. Without this, an owner turn and a scheduler-injected
         # turn both targeting ``OWNER_CHAT_ID`` would interleave block
@@ -357,6 +368,7 @@ class ClaudeHandler:
         emit: Emit,
         emit_direct: Emit | None = None,
         typing_lifecycle: Any | None = None,
+        flush_text: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         lock = await self._lock_for(msg.chat_id)
         async with lock:
@@ -372,7 +384,7 @@ class ClaudeHandler:
             token = CURRENT_TURN_ORIGIN.set(msg.origin)
             try:
                 await self._handle_locked(
-                    msg, emit, emit_direct, typing_lifecycle
+                    msg, emit, emit_direct, typing_lifecycle, flush_text
                 )
             finally:
                 CURRENT_TURN_ORIGIN.reset(token)
@@ -383,6 +395,7 @@ class ClaudeHandler:
         emit: Emit,
         emit_direct: Emit | None = None,
         typing_lifecycle: Any | None = None,
+        flush_text: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         turn_id = await self._conv.start_turn(msg.chat_id)
         log.info(
@@ -746,6 +759,13 @@ class ClaudeHandler:
 
         completed = False
         last_meta: dict[str, Any] | None = None
+        # Phase 9 (CRIT-1 per-iteration flush): accumulate render_doc
+        # ArtefactBlocks emitted by the bridge AFTER each ToolResultBlock
+        # in the stream. Drained on every ``ResultMessage`` AND on
+        # normal exit from the async-for loop. Owner-visible order
+        # invariant: text₁ → doc₁ → text₂ → doc₂ for multi-iteration
+        # turns.
+        pending_artefacts: list[ArtefactBlock] = []
         # Vision auto-summary capture: F11 — accumulate ALL assistant
         # TextBlocks into a list and join with a space; the model often
         # emits a brief preamble + substantive description, so capturing
@@ -760,6 +780,14 @@ class ClaudeHandler:
                 system_notes=system_notes,
                 image_blocks=image_blocks,
             ):
+                # Phase 9: ArtefactBlock — collect into pending list,
+                # never persist (ledger lives in subsystem). Bridge
+                # yields immediately AFTER each render_doc
+                # ToolResultBlock; the per-iteration flush below
+                # delivers them in stream order.
+                if isinstance(item, ArtefactBlock):
+                    pending_artefacts.append(item)
+                    continue
                 role, payload, text_out, block_type = _classify_block(item)
                 if role == "result":
                     # Fix C (incident S13): accumulate last meta; complete
@@ -770,6 +798,17 @@ class ClaudeHandler:
                     # iterates via tool_use). Completing on the first one
                     # would race against subsequent block persistence.
                     last_meta = payload
+                    # Phase 9 (CRIT-1): flush pending artefacts on
+                    # every ResultMessage so iteration-N artefacts
+                    # land BEFORE iteration-N+1 text. Adapter-side
+                    # ordering preserved.
+                    if pending_artefacts:
+                        await self._flush_artefacts(
+                            msg.chat_id,
+                            pending_artefacts,
+                            flush_text=flush_text,
+                        )
+                        pending_artefacts.clear()
                     continue
                 if role is None:
                     continue
@@ -785,6 +824,16 @@ class ClaudeHandler:
                     if is_vision:
                         text_chunks.append(text_out)
                     await emit(text_out)
+            # Phase 9 (CRIT-1): defensive flush on async-for normal
+            # exit — guarantees drain even if SDK closed without a
+            # final ResultMessage.
+            if pending_artefacts:
+                await self._flush_artefacts(
+                    msg.chat_id,
+                    pending_artefacts,
+                    flush_text=flush_text,
+                )
+                pending_artefacts.clear()
             # Phase 6b: persist the user-row marker with the captured
             # vision summary. Done BEFORE complete_turn so the row
             # ordering is stable even if a later append races on the
@@ -899,6 +948,167 @@ class ClaudeHandler:
                         path=str(cleanup_path),
                         error=repr(unlink_exc),
                     )
+
+    async def _flush_artefacts(
+        self,
+        chat_id: int,
+        artefacts: list[ArtefactBlock],
+        *,
+        flush_text: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        """Phase 9 §2.5 / CRIT-1 + HIGH-3 — deliver pending render_doc
+        artefacts via :meth:`MessengerAdapter.send_document`.
+
+        Per-artefact try/except: a failed delivery emits a Russian
+        "(не удалось доставить ...)" text fallback (HIGH-3) and the
+        loop continues with the next artefact. ``mark_delivered`` is
+        called in ``finally`` regardless of success / failure so the
+        ledger releases the in-flight guard and TTL sweeper can reap.
+
+        Caption is None per LOW-1 (mirrors phase-6e audio path).
+
+        Fix-pack F1 (CRIT-1 / AC#19 ordering invariant): when
+        ``flush_text`` is provided, the helper joins-and-sends any
+        accumulated chunks BEFORE each ``send_document`` call so the
+        owner-visible order is ``text₁ → doc₁ → text₂ → doc₂``. Without
+        this primitive the Telegram adapter buffers all text in
+        ``chunks: list[str]`` and ships it AFTER the entire handler
+        returns — opposite of the spec's promise.
+
+        Fix-pack F3 (CR-1 + CR-4 path-traversal defense): every
+        ``art.path`` is resolved + verified to live under the configured
+        ``artefact_dir`` (and outside ``.staging``) BEFORE handing the
+        path to the adapter. A misbehaving / compromised @tool body
+        emitting ``path=/etc/passwd`` would otherwise exfiltrate
+        readable files. Defense-in-depth: bridge parser does the same.
+        """
+        if self._adapter is None:
+            log.warning(
+                "render_doc_flush_no_adapter",
+                count=len(artefacts),
+            )
+            artefacts.clear()
+            return
+        # Resolve the artefact root once for the whole batch.
+        # Defensive ``getattr`` so fake-subsystem fixtures that don't
+        # expose ``_artefact_dir`` (the legacy phase-9 handler tests
+        # use a minimal stub) skip the path-traversal guard rather
+        # than crashing. Production subsystems always carry the field.
+        artefact_root: Path | None = None
+        if self._render_doc is not None:
+            artefact_dir = getattr(
+                self._render_doc, "_artefact_dir", None
+            )
+            if isinstance(artefact_dir, Path):
+                try:
+                    artefact_root = artefact_dir.resolve()
+                except OSError as resolve_exc:
+                    log.warning(
+                        "render_doc_artefact_dir_resolve_failed",
+                        error=repr(resolve_exc),
+                    )
+                    artefact_root = None
+        for art in artefacts:
+            # F3: path-traversal defense (CR-1 + CR-4). Drop + log +
+            # text-fallback when ``art.path`` escapes the artefact dir.
+            if artefact_root is not None:
+                try:
+                    resolved = art.path.resolve()
+                except OSError as resolve_exc:
+                    log.warning(
+                        "render_doc_path_resolve_failed",
+                        path=str(art.path),
+                        error=repr(resolve_exc),
+                    )
+                    if self._render_doc is not None:
+                        with contextlib.suppress(Exception):
+                            await self._render_doc.mark_delivered(
+                                art.path
+                            )
+                    continue
+                staging_root = artefact_root / ".staging"
+                if (
+                    not resolved.is_relative_to(artefact_root)
+                    or resolved.is_relative_to(staging_root)
+                ):
+                    log.error(
+                        "artefact_path_traversal_blocked",
+                        path=str(art.path),
+                        artefact_root=str(artefact_root),
+                    )
+                    with contextlib.suppress(Exception):
+                        await self._adapter.send_text(
+                            chat_id,
+                            "(внутренняя ошибка: путь файла вне "
+                            "artefact dir)",
+                        )
+                    if self._render_doc is not None:
+                        with contextlib.suppress(Exception):
+                            await self._render_doc.mark_delivered(
+                                art.path
+                            )
+                    continue
+            # F1: flush any pending chunks BEFORE this send_document so
+            # the owner-visible order is text → doc.
+            if flush_text is not None:
+                with contextlib.suppress(Exception):
+                    await flush_text()
+            short_reason = "unknown"
+            try:
+                try:
+                    await self._adapter.send_document(
+                        chat_id,
+                        art.path,
+                        caption=None,
+                        suggested_filename=art.suggested_filename,
+                    )
+                except NotImplementedError:
+                    short_reason = "adapter-no-document-out"
+                    log.error(
+                        "render_doc_send_document_not_implemented",
+                        suggested_filename=art.suggested_filename,
+                    )
+                    await self._adapter.send_text(
+                        chat_id,
+                        f"(не могу прислать файл — adapter без "
+                        f"document-out: {art.suggested_filename})",
+                    )
+                except FileNotFoundError:
+                    short_reason = "gone"
+                    log.warning(
+                        "render_doc_send_document_failed",
+                        path_basename=art.path.name,
+                        reason=short_reason,
+                    )
+                    await self._adapter.send_text(
+                        chat_id,
+                        f"(не удалось доставить "
+                        f"{art.suggested_filename}: {short_reason})",
+                    )
+                except Exception as exc:
+                    name = type(exc).__name__.lower()
+                    if "ssl" in name or "network" in name or "aiohttp" in name:
+                        short_reason = "network"
+                    elif "toolarge" in name or "size" in name:
+                        short_reason = "too-large"
+                    else:
+                        short_reason = "unknown"
+                    log.warning(
+                        "render_doc_send_document_failed",
+                        path_basename=art.path.name,
+                        reason=short_reason,
+                        error=repr(exc),
+                    )
+                    with contextlib.suppress(Exception):
+                        await self._adapter.send_text(
+                            chat_id,
+                            f"(не удалось доставить "
+                            f"{art.suggested_filename}: {short_reason})",
+                        )
+            finally:
+                if self._render_doc is not None:
+                    with contextlib.suppress(Exception):
+                        await self._render_doc.mark_delivered(art.path)
 
     async def _handle_extraction_failure(
         self,

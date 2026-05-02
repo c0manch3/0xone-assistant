@@ -181,6 +181,15 @@ class IncomingMessage:
 class MessengerAdapter(ABC):
     """Phase-1 ABC kept verbatim — phase-5 scheduler will inject outbound
     messages via the adapter (no handler in scope at that time).
+
+    Phase 9 (W2-CRIT-1 Option A): :meth:`send_document` is a
+    NON-abstract default impl that raises :class:`NotImplementedError`.
+    Existing 5b/6e/8 test fixtures (``_FakeAdapter``, etc.) keep
+    instantiating without override; HIGH-6 handler-resilience catches
+    the runtime ``NotImplementedError`` for non-Telegram adapters.
+    Future adapters MUST override per convention (documented in
+    ``skills/render_doc/SKILL.md`` + reviewer checklist), NOT enforced
+    at @abstractmethod.
     """
 
     @abstractmethod
@@ -191,6 +200,23 @@ class MessengerAdapter(ABC):
 
     @abstractmethod
     async def send_text(self, chat_id: int, text: str) -> None: ...
+
+    async def send_document(
+        self,
+        chat_id: int,
+        path: Path,
+        *,
+        caption: str | None = None,
+        suggested_filename: str | None = None,
+    ) -> None:
+        """Phase 9 outbound document path. Default raises
+        :class:`NotImplementedError` — subclasses MUST override to
+        deliver the artefact (e.g.
+        :meth:`assistant.adapters.telegram.TelegramAdapter.send_document`).
+        """
+        raise NotImplementedError(
+            "adapter has no document-out path"
+        )
 
 
 class Handler(Protocol):
@@ -210,6 +236,14 @@ class Handler(Protocol):
     (multiple minutes for a long-form voice). Defaults to ``None`` —
     the audio job uses a no-op lifecycle when nothing is supplied so
     inline tests and non-audio paths see no behaviour change.
+
+    Phase 9 fix-pack F1: ``flush_text`` is an optional callable that
+    joins-and-sends the adapter's accumulated chunks BEFORE the next
+    ``send_document`` call. Required for the AC#19 ordering invariant
+    (text₁ → doc₁ → text₂ → doc₂) under the chunks-buffering Telegram
+    adapter; without it, all text accumulates and ships AFTER all
+    artefacts. Defaults to ``None`` for adapters/tests that don't need
+    interim flushing.
     """
 
     async def handle(
@@ -218,4 +252,5 @@ class Handler(Protocol):
         emit: Emit,
         emit_direct: Emit | None = None,
         typing_lifecycle: Any | None = None,
+        flush_text: Callable[[], Awaitable[None]] | None = None,
     ) -> None: ...

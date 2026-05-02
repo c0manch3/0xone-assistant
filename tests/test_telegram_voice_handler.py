@@ -86,6 +86,7 @@ class _FakeHandler:
         emit: Callable[[str], Awaitable[None]],
         emit_direct: Callable[[str], Awaitable[None]] | None = None,
         typing_lifecycle: Any | None = None,
+        flush_text: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         # Phase 6e: ``emit_direct`` is now part of the Handler Protocol
         # (audio path bg-time channel). For the audio fixtures here we

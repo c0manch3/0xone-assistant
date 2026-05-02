@@ -98,20 +98,28 @@ services:
     # Match VPS user `0xone` (uid=1000 gid=1000, RQ7 verified).
     user: "1000:1000"
 
-    # Phase 5b daemon writes .last_clean_exit at the top of stop();
-    # cap shutdown at 35s = systemd 30s + 5s margin so SIGKILL never
-    # pre-empts the marker write.
-    stop_grace_period: 35s
+    # Phase 5b daemon writes .last_clean_exit at the top of stop().
+    # Phase 9 fix-pack F8 (DC-1 / W2-HIGH-1): bumped 35s -> 180s to
+    # cover the cumulative drain budget admitted by spec §2.12 honesty
+    # paragraph: render drain (20s) + adapter.stop (~30s) + vault
+    # drain (60s) + audio persist (5s) + bg cancel (5s) + slack ≈
+    # 116-130s worst-case. Docker SIGKILL is now well past the worst
+    # legitimate drain, so the .last_clean_exit marker is preserved
+    # even when a render + vault push are concurrent at shutdown. See
+    # ``deploy/docker/README.md`` "Phase 9 — render_doc operations"
+    # for the rationale + tuning knobs.
+    stop_grace_period: 180s
 
     labels:
       # Required for the autoheal sidecar to monitor this container.
       - "autoheal=true"
       # Autoheal default stop timeout is 10s — too short for the daemon's
-      # 35s shutdown path (`.last_clean_exit` marker write at top of
-      # stop()). Per willfarrell/autoheal docs, the per-container override
-      # is read from this label. Without it, an autoheal-driven restart
-      # would SIGKILL the daemon mid-shutdown (devil W3-C3).
-      - "autoheal.stop.timeout=35"
+      # cumulative shutdown path. Per willfarrell/autoheal docs, the
+      # per-container override is read from this label. Phase 9 F8:
+      # match compose ``stop_grace_period: 180s``; without it, an
+      # autoheal-driven restart would SIGKILL the daemon mid-shutdown
+      # (devil W3-C3) and pre-empt the .last_clean_exit marker write.
+      - "autoheal.stop.timeout=180"
 
     # Phase 6 will add ffmpeg + transcription deps that may OOM the
     # 4 GB VPS without caps. Compose v2 standalone (no swarm) reads

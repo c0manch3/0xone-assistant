@@ -29,6 +29,14 @@ dependencies = [
   # See plan/phase6b/research.md RQ1 for the wheel-vs-apt analysis.
   "Pillow>=10,<13",
   "pillow-heif>=1.3.0,<2",
+  # Phase 9: PDF rendering via WeasyPrint (pandoc → HTML5 → PDF).
+  # ``<70`` because the legacy ``def fetcher(url, timeout)`` URL-fetcher
+  # form was deprecated in 68.0 and removed in 69.0. Phase 9 uses the
+  # ``URLFetcher`` subclass form (forward-compat to 69.0+) but the pin
+  # still excludes 69.0 pending real-world testing of subclass API
+  # stability — see ``src/assistant/render_doc/pdf_renderer.py``
+  # ``SafeURLFetcher`` and the spec §2.6 R1.2 closure.
+  "weasyprint>=63,<70",
 ]
 
 [dependency-groups]
@@ -42,6 +50,10 @@ dev = [
   # ``load_workbook`` / ``Worksheet`` calls in extract.py.
   "types-openpyxl>=3.1,<4",
   "pytest-timeout>=2.4.0",
+  # Phase 9: PDF byte-level integration test asserts
+  # (test_pdf_renderer_integration.py) parses real WeasyPrint output
+  # via pikepdf to confirm valid PDF structure. Test-only dep.
+  "pikepdf>=9.0,<11",
 ]
 
 [build-system]
@@ -102,7 +114,7 @@ select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF", "ASYNC"]
 "src/assistant/memory/store.py" = ["RUF001", "RUF002", "RUF003"]
 "src/assistant/handlers/message.py" = ["RUF001", "RUF002", "RUF003"]
 "src/assistant/services/transcription.py" = ["RUF001", "RUF002", "RUF003"]
-"src/assistant/adapters/telegram.py" = ["RUF001", "RUF002", "RUF003"]
+"src/assistant/adapters/telegram.py" = ["RUF001", "RUF002", "RUF003", "ASYNC240"]
 "tests/test_memory_store_save_transcript.py" = ["RUF001", "RUF002", "RUF003"]
 "tests/test_handler_audio_branch.py" = ["RUF001", "RUF002", "RUF003"]
 "tests/test_telegram_voice_handler.py" = [
@@ -115,6 +127,21 @@ select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF", "ASYNC"]
 # asyncio.Event alternative would require leaking the picker's stop
 # event, which is intentionally private.
 "tests/test_subagent_picker.py" = ["ASYNC110"]
+# Phase 9: render_doc + tests use Cyrillic for triggers / replies and
+# manipulate sync ``Path`` from inside async helpers (subprocess argv,
+# staging file write). The ASYNC240 advisory is a false positive
+# (async functions are allowed to do best-effort sync I/O on small
+# files; the renderers run in asyncio.to_thread already). RUF001/2/3
+# accommodate Cyrillic triggers.
+"src/assistant/render_doc/*.py" = [
+    "RUF001", "RUF002", "RUF003", "ASYNC240",
+]
+"src/assistant/tools_sdk/render_doc.py" = [
+    "RUF001", "RUF002", "RUF003",
+]
+"tests/test_phase9_*.py" = [
+    "RUF001", "RUF002", "RUF003", "N818",
+]
 
 [tool.mypy]
 strict = true
@@ -127,3 +154,7 @@ asyncio_mode = "auto"
 # pytest-asyncio auto mode in Docker contexts (test job hung 19 min
 # while pytest itself printed nothing). Real hang fix was switching
 # from buildx to plain docker build (commit 5b33891).
+markers = [
+    "requires_pandoc: integration test requires `pandoc` binary on PATH (phase 9)",
+    "requires_weasyprint_runtime: integration test requires WeasyPrint shared libs (libpango/harfbuzz/etc., phase 9)",
+]

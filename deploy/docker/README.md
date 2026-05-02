@@ -436,18 +436,68 @@ Failure rollback at any step:
 
 ## Host-level: Docker daemon shutdown timeout
 
-Compose's `stop_grace_period: 35s` only applies to `docker stop` /
-`docker compose down`. On host reboot, the Docker daemon's own
+Compose's `stop_grace_period: 180s` (raised from 35s in phase 9 — see
+"Phase 9 — render_doc operations" below) only applies to `docker stop`
+/ `docker compose down`. On host reboot, the Docker daemon's own
 `shutdown-timeout` (default 10s) takes over — too short for the
-35s daemon shutdown path. Set in `/etc/docker/daemon.json`:
+cumulative shutdown drain. Set in `/etc/docker/daemon.json`:
 
 ```json
 {
-  "shutdown-timeout": 40
+  "shutdown-timeout": 200
 }
 ```
 
 Then `sudo systemctl restart docker`.
+
+## Phase 9 — render_doc operations
+
+Phase 9 ships PDF/DOCX/XLSX rendering via a single
+`mcp__render_doc__render_doc` @tool. The runtime image adds
+`pandoc + libpango-1.0-0 + libpangoft2-1.0-0 + libharfbuzz-subset0 +
+fonts-dejavu-core`. New env vars (`RENDER_DOC_*`) are documented inline
+in `assistant.config.RenderDocSettings`; defaults are safe.
+
+### Cumulative shutdown drain budget — 180s
+
+`Daemon.stop` runs the following drain stages **sequentially** (worst
+case in parens):
+
+```
+render_doc drain (20s) → adapter.stop (~30s) → vault drain (60s) →
+audio persist (5s) → bg cancel (5s) → slack (1s)  ≈  116-130s
+```
+
+Compose `stop_grace_period: 180s` covers this with margin so SIGKILL
+never pre-empts the `.last_clean_exit` marker write at the top of
+`Daemon.stop()`. Operators tuning a less-loaded host MAY drop to 120s
+once they confirm vault pushes complete in <30s. **DO NOT** lower
+below 60s — the previous phase-5b 35s cap was the source of "spurious
+catchup recap" bugs (clean exit marker pre-empted by SIGKILL → next
+boot misclassified as crash → autonomous recap fires).
+
+### Rolling back render_doc
+
+Set `RENDER_DOC_ENABLED=false` in
+`~/.config/0xone-assistant/.env` and `docker compose restart
+0xone-assistant`. Subsystem won't construct, the @tool stays
+unregistered, phases 1-8 traffic continues.
+
+### Audit log location + rotation
+
+`~/.local/share/0xone-assistant/run/render-doc-audit.jsonl` (durable
+on the bind mount; **not** tmpfs despite the `run/` directory name).
+Rotation: date-stamped at `audit_log_max_size_mb` (default 10 MB) →
+`<path>.<YYYYMMDD-HHMMSS-mmm>` (millisecond suffix added in fix-pack
+F12 to handle parallel-render rotation collisions); keep last 5
+rotated siblings, prune the rest. Reading: `jq -c .` per row.
+
+### Pandoc CVE triage flow
+
+Trivy may flag pandoc / libgmp10 CVEs over time. Bookworm-security
+fixes land in apt; refresh via `docker build --pull` before next
+release. Persistent CVE noise: disable language scan or add an
+explicit allowlist in `.github/workflows/docker.yml` after triage.
 
 ## Phase 6 — Subagent infrastructure
 

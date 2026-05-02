@@ -48,6 +48,8 @@ skills/*
 !skills/task/**
 !skills/vault/
 !skills/vault/**
+!skills/render_doc/
+!skills/render_doc/**
 
 # Tools installed with skills (only ping is repo-shipped).
 tools/*

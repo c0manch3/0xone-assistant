@@ -1,32 +1,22 @@
+# Phase 9 — description v2 (REJECTED)
+
+Rejected on 2026-05-02 after researcher pass surfaced 2 BLOCKING
+issues (URLFetchingError silently swallowed; obsolete apt deps) +
+pandoc 2.17 vs 3.x version drift + image budget recalibration.
+See `research-findings.md` and `description.md` (v3) for resolution.
+
+---
+
 # Phase 9 — render_doc: PDF / DOCX / XLSX генерация по запросу модели
 
-> **Spec v3 — closes devil w1 + w2 + researcher findings; adds
-> skills/render_doc/SKILL.md** as Cyrillic-trigger discoverability layer.
-> Owner-frozen decisions: stay with **pandoc** (NOT mistune+python-docx
-> pure-Python alternative); image budget bumped from ≤95 MB to **≤250 MB**
-> (pandoc Haskell binary alone is ~164 MB on bookworm). v2→v3 changes
-> documented в §11 «Researcher closures applied».
->
-> Spec v2 (REJECTED) archived as `description-v2-rejected.md` after
-> researcher pass surfaced 2 BLOCKING issues (R1.2 `URLFetchingError`
-> silently swallowed by WeasyPrint; R1.4 obsolete apt deps `libcairo2` +
-> `libgdk-pixbuf2.0-0` not required since WeasyPrint v53 + missing
-> `libharfbuzz-subset0`) plus pandoc version drift (spec assumed 3.x;
-> Debian bookworm ships **2.17.1.1**) and image budget recalibration
-> (pandoc alone exceeds v2 ≤95 MB cap by 70 MB).
->
 > Spec v2 — closes devil w1 (5 CRIT + 6 HIGH + 7 MED) + devil w2
 > (1 CRIT + 2 HIGH + 5 MED + 4 LOW). LOW judgements from w1 documented
-> в §9; w2 closures documented в §10; researcher closures в §11. Owner-
-> frozen scope (3 формата, no templates, no multi-sheet xlsx, no
-> backwards-compat). Архитектура повторяет phase-8 vault_sync: опт-ин
-> subsystem package под `src/assistant/render_doc/`, единственный MCP
-> @tool `render_doc` под отдельной MCP-группой `mcp__render_doc__`,
-> conditional bridge wiring через `render_doc_tool_visible` kwarg по
-> образцу `vault_tool_visible`. **NEW в v3**: SDK-discovered SKILL.md
-> file `skills/render_doc/SKILL.md` (mirror phase-8 `skills/vault/SKILL.md`)
-> attaches Cyrillic triggers («сделай PDF», «сгенерь docx», «дай excel
-> таблицу») + usage hints для модели; см. §3.7.
+> в §9; w2 closures documented в §10. Owner-frozen scope (3 формата, no
+> templates, no multi-sheet xlsx, no backwards-compat). Архитектура
+> повторяет phase-8 vault_sync: опт-ин subsystem package под
+> `src/assistant/render_doc/`, единственный MCP @tool `render_doc` под
+> отдельной MCP-группой `mcp__render_doc__`, conditional bridge wiring
+> через `render_doc_tool_visible` kwarg по образцу `vault_tool_visible`.
 > Phase 9 знакомит бота с outbound document delivery через
 > `aiogram.Bot.send_document` — раньше outbound media-канал не
 > существовал (phase 6a — это **inbound** документы, см. §Развилки Q1),
@@ -43,12 +33,9 @@
 >   DOCX zipfile parse) проверяются в test container c real pandoc +
 >   real WeasyPrint, не только binary-presence side.
 > - Dockerfile runtime stage расширяется apt-пакетами (`pandoc`,
->   `libpango-1.0-0`, `libpangoft2-1.0-0`, `libharfbuzz-subset0`,
->   `fonts-dejavu-core` — **researcher R1.4 closure**: WeasyPrint 63+
->   uses pure-Pango rendering, `libcairo2` + `libgdk-pixbuf2.0-0`
->   NOT required; `libharfbuzz-subset0` REQUIRED для PDF font
->   subsetting); image size budget зашит в §Риск + CI-gate (Wave A A8,
->   MED-7 closure; v3 budget recalibrated 95 → 250 MB).
+>   `libcairo2`, `libpango-1.0-0`, `libpangoft2-1.0-0`,
+>   `libgdk-pixbuf2.0-0`, `fonts-dejavu-core`); image size budget зашит в
+>   §Риск + CI-gate (Wave A A8, MED-7 closure).
 > - Auth = Claude OAuth ТОЛЬКО. Никакого `ANTHROPIC_API_KEY`.
 > - Никаких backwards-compat shims; spec coherent end-to-end.
 >
@@ -142,110 +129,6 @@
 >   structure +0 (already counted в B3/B4). Total v2 = 70.
 > - Новые AC: AC#21a (cumulative drain), AC#29 (RSS observer),
 >   AC#14j (inline math survives variant subtraction).
->
-> v2→v3 deltas (researcher findings closures + skills/, high-level):
->
-> - **R1.2 (BLOCKING)**: §2.6 step 4 переписан — `URLFetchingError`
->   (extends IOError, swallowed internally by WeasyPrint → render
->   continues with placeholder) replaced with `FatalURLFetchingError`
->   (extends `BaseException`, propagates and aborts render). Migrated
->   from legacy `def fetcher(url, timeout)` form (deprecated в
->   WeasyPrint 68.0; removed в 69.0) to `URLFetcher` subclass form
->   `class SafeURLFetcher(URLFetcher): def fetch(self, url, headers=None)`.
->   Pin `weasyprint>=63,<70` retained, with comment в pyproject.toml
->   explaining `<70` because legacy `def fetcher` removed в 69.0. AC#16
->   semantics tightened: render now FAILS (no silent fall-through) when
->   adversarial fetch attempted; envelope returns
->   `render_failed_input_syntax` + `error="weasyprint-url-fetch-blocked"`.
-> - **R1.4 (BLOCKING)**: §3 Wave A apt list rewritten. DROPPED
->   `libcairo2` + `libgdk-pixbuf2.0-0` (NOT required by WeasyPrint
->   63+; pure-Pango rendering, image decoding via Pillow). ADDED
->   `libharfbuzz-subset0` (REQUIRED for embedded-font subsetting в
->   output PDF). Final apt list: `pandoc`, `libpango-1.0-0`,
->   `libpangoft2-1.0-0`, `libharfbuzz-subset0`, `fonts-dejavu-core`.
->   §6 dep size estimates rewritten with bookworm-verified data.
-> - **R1.1 (clarification)**: §2.6 markdown variant string already
->   correct в v2; researcher confirmed `tex_math_single_backslash` is
->   silent no-op (not enabled by default in `markdown` flavour) but
->   harmless. Researcher recommended adding `-yaml_metadata_block`
->   to close YAML frontmatter smuggling surface. v3 ADDS this
->   subtraction. New variant string:
->   `markdown-raw_html-raw_tex-raw_attribute-tex_math_dollars-tex_math_single_backslash-yaml_metadata_block`.
->   Wave A spike обязан empirically verify subtraction effectiveness
->   per researcher's `pandoc -f 'markdown-raw_html' -t html5` recipe.
-> - **R1.3 (Closed-applied)**: §2.5 `TelegramAdapter.send_document`
->   local var renamed `file → document` (matches aiogram parameter
->   name + avoids Python builtin shadow); explicit kw-args в
->   `bot.send_document(chat_id=chat_id, document=document, caption=
->   caption)`.
-> - **Pandoc version (Closed-modified)**: §2.6 wording «current
->   pandoc 3.x» replaced with «pandoc as packaged on Debian bookworm
->   runtime base image (currently **pandoc 2.17.1.1**)». Researcher
->   verified extension behaviour identical between 2.17 and 3.9 for
->   our usage. Markdown variant flag syntax confirmed valid for
->   pandoc 2.17 (subtraction syntax `-EXT` documented since pandoc
->   2.0). Wave A A3 spike adds `pandoc --list-extensions=markdown |
->   grep -E 'raw_html|raw_tex|raw_attribute|tex_math_dollars|
->   yaml_metadata_block'` verification step (must show literal
->   `-extension_name` lines for each subtracted extension AFTER
->   subtraction applied).
-> - **Image size budget (Closed-modified, owner-frozen)**: pandoc
->   apt package alone is **~164 MiB** installed-size on bookworm
->   amd64 (researcher R2.11 verified via packages.debian.org). v2
->   ≤95 MB budget impossible. v3 recalibrates to **≤250 MB** apt
->   delta. CI gate threshold raised 120 MB → **300 MB** (allows
->   headroom для transitive deps). §6 size table rewritten with
->   per-package bookworm numbers. Mitigation reword: «final layer
->   size ≤250 MB; current GHCR image ~400 MB → expected ~620-650 MB;
->   acceptable для single-user private repo». Owner-decision Q1
->   (R2.11 «pandoc vs all-Python pivot») — DECIDED: keep pandoc; see
->   §11 R2.11 closure rationale.
-> - **R2.9 (Closed-honest)**: WeasyPrint memory profile community
->   reports range 500MB-2GB для 50-page docs. v2 validator warned
->   at 200 + concurrent×400 MB → 1 GB threshold. v3 keeps validator
->   formula but adds prose в §6 «document as per-render RSS
->   observation gap; coder phase adds RSS gauge callback per AC#29;
->   if owner sees OOM in production, reduce `pdf_max_bytes` or
->   `max_input_bytes`». No code change in v3.
-> - **R2.12 (Closed-confirmed)**: AC#15a's `b"%PDF-"` magic + `b"%%EOF"`
->   trailer check confirmed correct for WeasyPrint output by
->   researcher (PDF spec ISO 32000-1 mandates these markers; cross-
->   version stable). v3 explicitly notes 5-byte prefix (`%PDF-`),
->   NOT 8-byte (`%PDF-1.7`), to survive PDF version bumps.
-> - **R3.13 (Closed-noted)**: researcher recommended either custom
->   regex or mistune table extension for §2.8 markdown_tables.py.
->   v3 KEEPS custom regex (owner-frozen: no new dep) and adds
->   researcher-mandated test coverage (≥10 cases: escaped pipes,
->   alignment markers, ragged rows, leading/trailing whitespace).
->   §3 Wave B B1 test target raised from 5 cases → ≥10.
-> - **NEW §3.7 «Skills discoverability layer»**: phase 9 ships
->   `skills/render_doc/SKILL.md` (mirror phase-8 `skills/vault/SKILL.md`
->   structure). Frontmatter `name: render_doc`, `description:
->   Generate PDF/DOCX/XLSX documents from markdown content...`,
->   `allowed-tools: ["mcp__render_doc__render_doc"]`. Body sections:
->   когда использовать (Cyrillic triggers list), как использовать,
->   ограничения (concentrate из §5), не вызывай (anti-patterns).
->   File auto-discovered by Claude SDK at boot via
->   `setting_sources=["project"]` + `cwd` pattern (phase 2
->   architecture invariant). NEW AC#30.
-> - **§11 NEW «Researcher closures applied»**: enumerates all
->   researcher findings + status pointers per spec-section.
-> - **§5 Явно НЕ #20 NEW**: README cleanup deferred phase 10
->   (`plan/README.md` describes obsolete CLI-per-tool architecture
->   while phases 4-8 pivoted к @tool MCP server pattern; phase 9
->   follows current pattern; cleanup non-blocking).
-> - Test count budget: 70 (v2) → **~75** (v3). Net +5: Wave A spike
->   gets `pandoc --list-extensions` empirical check (+1 dev test);
->   Wave B B1 markdown_tables parser cases ≥10 (+~3 net new from
->   v2's ~7); Wave B B4 `safe_url_fetcher` test target updated
->   (FatalURLFetchingError raise + abort assertion) — same test
->   count, behavior tightened. Skills SKILL.md presence test (+1
->   D-test). v3 = 75 tests.
-> - Новые AC: AC#14 (+ AC#14a–AC#14i sub-cases) reworded
->   (FatalURLFetchingError abort semantics; render fails rather than
->   placeholder fallthrough); AC#15a threshold 120 MB → 300 MB
->   (R2.11); AC#30 NEW (skills/render_doc/SKILL.md present + valid
->   frontmatter).
 
 ## 1. Цель
 
@@ -657,17 +540,8 @@ async def send_document(self, chat_id, path, *, caption, suggested_filename):
             "файл слишком большой для Telegram (>20MB)",
         )
         return
-    # R1.3 closure: rename local `file → document` to match aiogram
-    # parameter name `bot.send_document(document=...)` AND avoid
-    # shadowing Python's `file` builtin. Pass kw-args explicitly
-    # (belt-and-suspenders: survives any future aiogram 4
-    # parameter reordering).
-    document = FSInputFile(path, filename=suggested_filename)
-    await self._bot.send_document(
-        chat_id=chat_id,
-        document=document,
-        caption=caption,
-    )
+    file = FSInputFile(path, filename=suggested_filename)
+    await self._bot.send_document(chat_id, file, caption=caption)
 ```
 
 Размер cap'ится `TELEGRAM_DOC_MAX_BYTES = 20 * 1024 * 1024` (тот же,
@@ -747,20 +621,12 @@ Yandex shipped.
    чтобы sweeper их не удалял до завершения; cleaned at staging-step
    exit + boot-time unconditional cleanup из MED-4 closure).
 2. `asyncio.create_subprocess_exec("pandoc", "-f",
-   "markdown-raw_html-raw_tex-raw_attribute-tex_math_dollars-tex_math_single_backslash-yaml_metadata_block",
+   "markdown-raw_html-raw_tex-raw_attribute-tex_math_dollars-tex_math_single_backslash",
    "-t", "html5", "-o", "<staging_html>", "<staging_md>",
    env=<scoped>, ...)` с timeout `pdf_pandoc_timeout_s` (default 20s).
    Argv-form, не shell. `env=` — whitelist-only (см. §2.11 HIGH-1 closure).
-   **Pandoc version note** (R-Pandoc closure): runtime image
-   (Debian bookworm) ships **pandoc 2.17.1.1-2~deb12u1**, NOT 3.x.
-   Researcher verified subtraction syntax `markdown-EXT` valid since
-   pandoc 2.0; extension behaviour identical between 2.17 and 3.9 for
-   our usage. Wave A A3 spike runs `pandoc --list-extensions=markdown |
-   grep -E 'raw_html|raw_tex|raw_attribute|tex_math_dollars|yaml_metadata_block'`
-   AND verifies output shows literal `-EXT` lines (each subtracted
-   extension prefixed with `-`) AFTER subtraction applied.
-   **Markdown variant choice** (CRIT-2 + Q7 + W2-MED-1 + R1.1):
-   `markdown-raw_html-raw_tex-raw_attribute-tex_math_dollars-tex_math_single_backslash-yaml_metadata_block`
+   **Markdown variant choice** (CRIT-2 + Q7 + W2-MED-1):
+   `markdown-raw_html-raw_tex-raw_attribute-tex_math_dollars-tex_math_single_backslash`
    subtracts:
    - `raw_html` — strips inline `<script>`, `<iframe>`, `<base>`,
      `<link>`, `<svg>`, `<object>`, `<embed>`, etc.
@@ -781,34 +647,12 @@ Yandex shipped.
      `$E=mc^2$` glyph string, not MathML rendering).
    - **W2-MED-1**: `tex_math_single_backslash` — disables alternate
      LaTeX delimiter `\(...\)`. Mirrors `tex_math_dollars` decision
-     for consistency. **R1.1 note**: researcher confirmed
-     `tex_math_single_backslash` is **not enabled by default** in
-     pandoc's `markdown` flavour (only in `gfmExtensions` /
-     `commonmarkExtensions`); subtracting it is a silent no-op but
-     harmless. v3 keeps the subtraction defensively (documents
-     intent; survives if owner ever switches flavour).
-   - **R1.1 NEW**: `yaml_metadata_block` — disables YAML frontmatter
-     parsing at file start. Default-enabled in markdown flavour;
-     allows `title:`, `author:`, `header-includes:` etc. With
-     `raw_html` stripped, `header-includes: <script>...</script>`
-     won't render scripts but might confuse PDF metadata.
-     Defence-in-depth: explicit subtraction closes a small
-     smuggling surface.
+     for consistency.
 
-   Researcher Wave A spike обязан **эмпирически verify**, что
-   pandoc strips эти конструкции:
-   ```bash
-   echo '<script>alert(1)</script>' | pandoc -f 'markdown-raw_html' -t html5
-   # Expected: literal escaped text, NOT <script> tag.
-   echo '$E=mc^2$' | pandoc -f 'markdown-tex_math_dollars' -t html5
-   # Expected: literal '$E=mc^2$', NOT MathML.
-   echo '---\ntitle: x\n---\n# real' | pandoc -f 'markdown-yaml_metadata_block' -t html5
-   # Expected: literal `---\ntitle: x\n---` лimb, NOT title-stripped output.
-   ```
-   Sample fetch-injection inputs (extracted to A3 spike):
-   `<iframe src="file:///etc/passwd">`, `<base href="file:///etc/">`,
-   `<svg><image href="file://..."/>`, inline math `$x^2$`,
-   `\textbf{...}` raw TeX block.
+   Researcher pass обязан **эмпирически verify** в Wave A spike, что
+   pandoc strips эти конструкции (sample injections: `<iframe
+   src="file:///etc/passwd">`, `<base href="file:///etc/">`,
+   `<svg><image href="file://..."/>`, inline math `$x^2$`).
 
 3. Read HTML, передаём в `weasyprint.HTML(string=html,
    base_url="<staging_dir>", url_fetcher=safe_url_fetcher).
@@ -816,67 +660,27 @@ Yandex shipped.
    не блочить event loop. **NOTE — `asyncio.to_thread`
    uncancellable**: см. §2.12 (iii) honesty paragraph.
 
-4. **CRIT-2 closure — `SafeURLFetcher`** (W2-MED-2 tightened +
-   **R1.2 BLOCKING**):
-
-   **R1.2 fix history.** v2 used `URLFetchingError` (extends
-   `IOError`). Researcher verified WeasyPrint **catches `IOError`
-   internally** in `weasyprint/urls.py` — render emits warning and
-   continues with placeholder/empty resource. Net effect: PDF still
-   renders successfully (no security risk because URL never fetched),
-   BUT v2's audit/test claim «render aborts on URL access» is FALSE
-   for the IOError variant. v3 switches to `FatalURLFetchingError`
-   (extends `BaseException`, propagates and aborts render — the
-   correct semantic for «render must fail when adversarial fetch
-   attempted»).
-
-   v3 also migrates from legacy `def fetcher(url, timeout)` form
-   (deprecated WeasyPrint 68.0; **removed 69.0**) to `URLFetcher`
-   subclass form. Pin `weasyprint>=63,<70` retained — explicit
-   pyproject.toml comment documents `<70` because legacy fn-form
-   removed in 69.0.
+4. **CRIT-2 closure — `safe_url_fetcher`** (W2-MED-2 tightened):
 
    ```python
-   from weasyprint.urls import URLFetcher, FatalURLFetchingError
+   from weasyprint.urls import URLFetchingError
 
-   class SafeURLFetcher(URLFetcher):
+   def safe_url_fetcher(url: str, timeout: int = 5):
        """WeasyPrint URL fetcher: deny EVERYTHING (including data:).
+       Mirrors WeasyPrint's default fetcher signature so it slots in
+       via url_fetcher= kwarg.
 
-       Subclasses `URLFetcher` (forward-compat to WeasyPrint 69.0+
-       which removes the legacy `def fetcher(url, timeout)` shape).
-       Raises `FatalURLFetchingError` (extends `BaseException`) so
-       WeasyPrint **aborts render** rather than silently swallowing
-       the IOError variant.
-
-       v1 wording allowed data:image/* URIs; v2 W2-MED-2 closure
-       dropped this allowlist entirely. §5 #3 lists embedded images
-       of any kind (external + inline data:) as out-of-scope. Inline
-       image embedding is image embedding regardless of transport.
-       If owner eventually wants charts in PDFs — phase 10 reopens
-       with deliberate scheme allowlist.
+       v1 wording allowed data:image/* URIs; v2 W2-MED-2 closure drops
+       this allowlist entirely. §5 #3 lists embedded images of any
+       kind (external + inline data:) as out-of-scope. Inline image
+       embedding is image embedding regardless of transport. If owner
+       eventually wants charts in PDFs — phase 10 reopens with
+       deliberate scheme allowlist.
        """
-
-       def fetch(self, url: str, headers: dict[str, str] | None = None):
-           raise FatalURLFetchingError(
-               f"render_doc: all url-fetches blocked "
-               f"(got url={url[:64]!r})"
-           )
+       raise URLFetchingError(
+           f"render_doc: all url-fetches blocked (got url={url[:64]!r})"
+       )
    ```
-
-   **Wiring**: `weasyprint.HTML(string=html, base_url=staging_dir,
-   url_fetcher=SafeURLFetcher())` (instantiate per-render — class
-   carries no state in v3).
-
-   **Render abort semantics** (R1.2 + AC#14 reword): when adversarial
-   `content_md` triggers a fetch attempt, WeasyPrint propagates
-   `FatalURLFetchingError`. PDF renderer body wraps `write_pdf` in
-   `try/except FatalURLFetchingError` → maps to envelope
-   `{ok: False, reason: "render_failed_input_syntax", error:
-   "weasyprint-url-fetch-blocked"}`. Audit row records `result=
-   "failed"` + `error="weasyprint-url-fetch-blocked"`. Model branches
-   on `_input_syntax` → can retry with simpler markdown. Caller (model
-   → owner) sees explicit text "не смог отрендерить — встретил
-   blocked URL fetch", не silent placeholder.
 
    This blocks every fetch surface enumerated in CRIT-2 wave 1
    findings (≥9 surfaces) **plus** `data:` URIs (W2-MED-2):
@@ -1515,87 +1319,42 @@ AC#29 NEW — see §4.
 
 ## 3. Задачи (Wave A → B → C → D)
 
-> Test count budget v3: **~75 tests** (v2 был ~70; researcher
-> closures added +5: Wave A `test_phase9_render_doc_binaries.py`
-> expanded с R-Pandoc + R1.2 hierarchy assertions (+2 sub-cases в
-> same file but counted as separate logical tests), Wave B B1
-> `test_markdown_tables_parser.py` expanded ≥10 cases (+~2 net),
-> Wave D `test_phase9_skill_md_present.py` (+1)). Distribution:
-> Wave A 11 (was 9), Wave B 23 (was 21), Wave C 16 (unchanged),
-> Wave D 5 (was 4). v0 был ~31; devil w1 closures добавили ~31 для
-> CRIT-1..5 invariants; w2 closures pushed to ~70; researcher
-> closures pushed to ~75. LOW-6 closure aligned reviewer expectations.
+> Test count budget v2: **~70 tests** (v1 был ~62; devil w2 closures
+> добавили +8). Distribution: Wave A 9, Wave B 21 (+3 from B5/B6
+> expansions), Wave C 16 (+2: ledger lock + RSS observer + cumulative
+> drain budget), Wave D 4 (unchanged). v0 был ~31; devil w1 closures
+> добавили ~31 для CRIT-1..5 invariants; w2 closures pushed to ~70.
+> LOW-6 closure aligned reviewer expectations.
 
-### Wave A — System deps + smoke + skeleton (~770 LOC, 11 тестов)
+### Wave A — System deps + smoke + skeleton (~750 LOC, 9 тестов)
 
 Goal: **«никакой регрессии phase 8 ssh-not-found incident'а»**. Если
 container не поднимается с pandoc или импорт WeasyPrint падает — ловим
 в CI, не на live deploy.
 
 A1. **`deploy/docker/Dockerfile` runtime stage** — добавить apt
-    packages в `RUN apt-get install ...` (R1.4 closure — list
-    rewritten per WeasyPrint official First Steps doc + researcher
-    verification):
-    - `pandoc` (~164 MiB installed-size on bookworm amd64; Haskell
-      runtime),
-    - `libpango-1.0-0` (~520 KiB),
-    - `libpangoft2-1.0-0` (~142 KiB),
-    - `libharfbuzz-subset0` (~2.5 MiB; **REQUIRED** для PDF font
-      subsetting — was MISSING from v2 list),
-    - `fonts-dejavu-core` (~3 MiB; минимальный набор Unicode fonts
-      для кириллицы; без этого WeasyPrint выдаёт квадратики).
-
-    **R1.4 — DROPPED from v2 list**:
-    - `libcairo2` — NOT required by WeasyPrint v53+. WeasyPrint
-      switched к pure-Pango rendering; cairo no longer linked.
-    - `libgdk-pixbuf2.0-0` — NOT required. Image decoding moved to
-      Pillow (already в pyproject.toml from phase 6b).
-
-    Note: `libcairo2` may STILL be pulled transitively via
-    `libpangocairo-1.0-0` dependency chain. Wave A A8 image-size
-    spike measures actual delta with `dpkg-query -W -f='${Installed-
-    Size}\n'` AFTER install rather than relying on direct-size
-    estimates; researcher Q4 explicitly flagged this.
-
+    packages в `RUN apt-get install ...`:
+    - `pandoc`,
+    - `libcairo2`,
+    - `libpango-1.0-0`,
+    - `libpangoft2-1.0-0`,
+    - `libgdk-pixbuf2.0-0`,
+    - `fonts-dejavu-core` (минимальный набор Unicode fonts для
+      кириллицы; без этого WeasyPrint выдаёт квадратики).
     Build-time sanity: `RUN pandoc --version && /opt/venv/bin/python -c
     "import weasyprint; print(weasyprint.__version__)"`.
 
-A2. **`pyproject.toml` deps** (LOW-5 explicit + R1.2 + R2.10):
-    добавить `weasyprint>=63,<70` в `[project] dependencies` array
-    (PEP 621) **с inline comment**:
-
-    ```toml
-    "weasyprint>=63,<70",  # <70 because URLFetcher legacy
-                            # `def fetcher(url, timeout)` form removed
-                            # in v69.0.0 (deprecated in 68.0); v3
-                            # uses URLFetcher subclass form (see §2.6
-                            # SafeURLFetcher).
-    ```
-
+A2. **`pyproject.toml` deps** (LOW-5 explicit): добавить
+    `weasyprint>=63,<70` в `[project] dependencies` array (PEP 621).
     `openpyxl` уже есть. Pandoc — system binary, не Python dep.
     Rebuild lockfile (`uv pip compile` или `uv sync`).
-    CFFI requires Pango bindings provided by Dockerfile apt list (A1);
-    R1.4 closure: cairo NOT required since WeasyPrint v53.
+    CFFI requires cairo/pango bindings provided by Dockerfile apt list (A1).
 
 A3. **`tests/test_phase9_render_doc_binaries.py`** — копия по образцу
     `test_phase8_ssh_binary_available.py`. Тесты:
     - `assert shutil.which("pandoc") is not None`,
     - `import weasyprint` succeeds (запуск smoke probe `WeasyPrint
-      HTML("<p>x</p>").write_pdf(io.BytesIO())`),
-    - **R-Pandoc verification (NEW)**: `subprocess.run(["pandoc",
-      "--list-extensions=markdown-raw_html-raw_tex-raw_attribute-tex_math_dollars-tex_math_single_backslash-yaml_metadata_block"],
-      capture_output=True, text=True)` → assert that output contains
-      lines `-raw_html`, `-raw_tex`, `-raw_attribute`,
-      `-tex_math_dollars`, `-yaml_metadata_block` (each prefixed with
-      `-` confirming subtraction took effect). `-tex_math_single_backslash`
-      may appear OR be absent depending on pandoc default — both
-      acceptable (R1.1 silent no-op note).
-    - **R1.2 verification (NEW)**: from `weasyprint.urls import
-      URLFetcher, FatalURLFetchingError` succeeds; `issubclass(
-      FatalURLFetchingError, BaseException)` AND NOT
-      `issubclass(FatalURLFetchingError, IOError)` (sanity-checks
-      researcher's hierarchy claim against actual installed
-      WeasyPrint version).
+      HTML("<p>x</p>").write_pdf(io.BytesIO())`).
 
 A4. **`src/assistant/render_doc/` package skeleton** — пустые модули
     с docstrings + class signatures (no impl yet). `__init__.py`
@@ -1622,49 +1381,19 @@ A7. **Tests**:
       (sys.modules monkeypatch → docx still works via pandoc, HIGH-5),
     - `test_render_doc_disabled_when_settings_off.py`.
 
-A8. **NEW (MED-7 closure + R2.11 recalibrated) —
-    `.github/workflows/docker-image-size-check.yml`**:
+A8. **NEW (MED-7 closure) — `.github/workflows/docker-image-size-check.yml`**:
     builds Docker runtime image, compares `docker images --format
-    '{{.Size}}'` vs prior `:main` tag. Fails PR if delta > **300 MB**
-    (was 120 MB в v2; raised per R2.11 — pandoc alone ~164 MB +
-    transitive deps). Reference value (measured during researcher
-    Wave A spike) documented в PR description.
+    '{{.Size}}'` vs prior `:main` tag. Fails PR if delta > 120 MB.
+    Reference value (measured during researcher pass) documented в PR
+    description. Wave A spike (researcher) обязан зафиксировать exact
+    MB delta и обновить §6 size estimates с измеренным числом.
 
-    Spike script (extends v2 wording): post-build run
-    `dpkg-query -W -f='${Installed-Size}\n' pandoc libpango-1.0-0
-    libpangoft2-1.0-0 libharfbuzz-subset0 fonts-dejavu-core` on the
-    container, sum + log; this is the «direct deps installed size»
-    contribution. Then `du -sh /var/cache/apt/archives` для cache
-    contribution. Subtract from total `docker image inspect <hash>
-    --format '{{.Size}}'` to verify estimate.
-
-### Wave B — Renderers + @tool + audit (~1130 LOC, 23 теста)
+### Wave B — Renderers + @tool + audit (~1100 LOC, 18 тестов)
 
 B1. **`render_doc/markdown_tables.py`** — pipe-table parser. Pure
-    python regex; no external dep (R3.13: alternatives mistune /
-    markdown-it considered; researcher recommendation accepted owner-
-    frozen choice of custom regex для simplicity + zero new dep).
-    Reject malformed (no separator row, mismatched col count).
-    Returns specific error codes: `markdown-no-tables`,
-    `markdown-multi-table`, `markdown-malformed`.
-
-    **R3.13 closure — test target raised**: `test_markdown_tables_
-    parser.py` MUST cover **≥10 unit-test cases**:
-    1. Single happy-path table with header + 2 rows,
-    2. Empty `content_md` → `markdown-no-tables`,
-    3. Markdown without table syntax → `markdown-no-tables`,
-    4. Two tables → `markdown-multi-table`,
-    5. Header row but no separator → `markdown-malformed`,
-    6. Mismatched column count between header + body → `markdown-malformed`,
-    7. Escaped pipe `\|` inside cell — preserved literally,
-    8. Leading/trailing whitespace per cell — stripped,
-    9. Alignment markers (`:---`, `---:`, `:---:`) — accepted, alignment
-       optional metadata,
-    10. Ragged row (fewer cells than header) — reject OR pad-with-empty
-        (decide; v3 default: reject as `markdown-malformed` для strict
-        contract; coder phase may relax),
-    11. Cyrillic content в cells — accepted,
-    12. Empty cells (`| | |`) — accepted as empty strings.
+    python regex; no external dep. Reject malformed (no separator
+    row, mismatched col count). Returns specific error codes:
+    `markdown-no-tables`, `markdown-multi-table`, `markdown-malformed`.
 
 B2. **`render_doc/xlsx_renderer.py`** — openpyxl `write_only=True`
     impl (HIGH-4). Tests: single-table → 1 sheet, header bold (via
@@ -1688,20 +1417,11 @@ B3. **`render_doc/docx_renderer.py`** — pandoc subprocess wrapper с
     guaranteeing pandoc + cairo + DejaVu).
 
 B4. **`render_doc/pdf_renderer.py`** — pandoc → HTML5 →
-    WeasyPrint(url_fetcher=SafeURLFetcher()) (**R1.2 closure**:
-    URLFetcher subclass form, NOT legacy `def fetcher` form).
-    `SafeURLFetcher.fetch` raises `FatalURLFetchingError` (extends
-    `BaseException`) so WeasyPrint **aborts render** (was: v2
-    `URLFetchingError` extending IOError → silently swallowed).
-    Renderer body wraps `write_pdf` в `try/except
-    FatalURLFetchingError` → maps to `render_failed_input_syntax` +
-    `error="weasyprint-url-fetch-blocked"`. Drop `data:` allowlist
-    entirely (W2-MED-2 closure: CRIT-2 + §5 #3 alignment). Tests
+    WeasyPrint(url_fetcher=safe_url_fetcher).
+    `safe_url_fetcher` reject'ит ВСЁ (W2-MED-2 closure: dropped
+    `data:` allowlist entirely; CRIT-2 + §5 #3 alignment). Tests
     parametrise по 9 fetch surfaces из AC#14a–AC#14i (data: now part
-    of AC#14h wording); each test asserts `pytest.raises(
-    FatalURLFetchingError)` direct from `WeasyPrint.HTML(...).
-    write_pdf()` AND `RenderResult.reason == "render_failed_input_
-    syntax"` from end-to-end render.
+    of AC#14h NEW wording).
     **W2-MED-5 acceptance** (NEW): `test_pdf_renderer_integration.py`
     (`requires_pandoc + requires_weasyprint_runtime` marks) renders
     3-paragraph markdown with 2-row table + Cyrillic text → output PDF
@@ -1949,16 +1669,7 @@ C7. **Tests** (v2 = 16 tests, +2 from v1):
       v2 mandate: skip field when subsystem absent — keeps log
       schema clean; emit `=0` when subsystem present с empty ledger).
 
-C8. **NEW в v3 — `skills/render_doc/SKILL.md`** (researcher closure +
-    owner-frozen scope). Author SKILL.md per §3.7 content
-    specification (frontmatter `name: render_doc` + `description` +
-    `allowed-tools: ["mcp__render_doc__render_doc"]`; body sections:
-    Когда использовать, Триггеры (Cyrillic), Как использовать,
-    Ограничения, Не вызывай). Mirrors phase-8 `skills/vault/SKILL.md`
-    structure. ~80 LOC. No test in C8 itself; AC#30 covered by D2
-    test in Wave D.
-
-### Wave D — render_doc-only audit rotation + skills SKILL.md test (~200 LOC, 5 тестов)
+### Wave D — render_doc-only audit rotation (~150 LOC, 4 теста)
 
 > v0 предлагал 2 carry-overs (vault_sync audit refactor + host-key
 > drift CI). Devil w1 LOW-2 + LOW-3 закрылись:
@@ -1974,25 +1685,11 @@ D1. **`render_doc/audit.py` date-stamped rotation** (Wave D-only
     scope). Implementation в B5 уже включает date-stamped rotation;
     Wave D добавляет ТОЛЬКО dedicated tests + Dockerfile static check.
 
-D2. **NEW в v3 — `tests/test_phase9_skill_md_present.py`** —
-    validates `skills/render_doc/SKILL.md` против AC#30 invariants.
-    Parses frontmatter as YAML; asserts `name == "render_doc"`,
-    `description` non-empty + contains «PDF» / «DOCX» / «XLSX»,
-    `allowed-tools == ["mcp__render_doc__render_doc"]`. Reads body,
-    asserts presence of Cyrillic trigger phrases (regex any-of «сделай
-    PDF», «сгенерь docx», «дай excel таблицу», «сделай отчёт»),
-    presence of MCP tool reference, presence of «Не вызывай» anti-
-    pattern section. SKILL.md content authored в Wave C C8.
-
 D-tests:
 - `test_audit_date_stamped_rotation.py` (только render_doc/audit.py),
 - `test_audit_keep_last_n.py`,
 - `test_phase9_dockerfile_apt_packages_present.py` (build-time grep
-  по Dockerfile lines as static check; updated regex per R1.4 — must
-  find `pandoc`, `libpango-1.0-0`, `libpangoft2-1.0-0`,
-  `libharfbuzz-subset0`, `fonts-dejavu-core`; must NOT find
-  `libcairo2`, `libgdk-pixbuf2.0-0`),
-- `test_phase9_skill_md_present.py` (NEW v3, AC#30).
+  по Dockerfile lines as static check).
 
 **Defer to phase 10** (намеренно НЕ включаем):
 - vault_sync/audit.py date-stamped refactor (LOW-2),
@@ -2069,108 +1766,10 @@ catches. AC#17b NEW.
 explicit override changes to existing fixtures. Verified by running
 the full pre-phase-9 test suite against post-C1 codebase.
 
-### 3.7 Skills discoverability layer (NEW в v3, owner-frozen scope)
-
-Phase 9 ships `skills/render_doc/SKILL.md` as the Cyrillic-trigger
-discoverability layer for the `mcp__render_doc__render_doc` MCP @tool.
-Mirrors phase-8 `skills/vault/SKILL.md` template (frontmatter +
-trigger phrases + usage hints + anti-patterns). File auto-discovered
-by Claude SDK at boot via `setting_sources=["project"]` + `cwd`
-pattern (phase 2 architecture invariant; see CLAUDE.md).
-
-**Why a SKILL.md and not just the @tool docstring?** The @tool
-description (see §2.4 `@tool(...)` decorator string) is consumed by
-the SDK as part of `tools` array and the model sees it as «here is a
-tool you can use». But model prompt-attribution в Cyrillic is weaker
-when triggers like «сгенерь docx» are buried в the English docstring.
-SKILL.md adds a separate prompt-injection surface: the SDK assembles
-discovered SKILL.md frontmatter + body into the system prompt before
-the conversation, so Cyrillic trigger phrases get higher attention
-weight when the model parses owner's Russian request. Phase-8 vault
-SKILL.md established this pattern empirically (owner-tested «запушь
-вольт» trigger reliably calls `vault_push_now`).
-
-**File path**: `skills/render_doc/SKILL.md` (workspace-relative, NOT
-inside `src/` — workspace `cwd` discovery convention).
-
-**Frontmatter** (YAML):
-
-```yaml
----
-name: render_doc
-description: 'Generate PDF/DOCX/XLSX documents from markdown content. Owner-facing reports, tables, summaries that benefit from formatted typography (PDF), Word-compatible editing (DOCX), or spreadsheet review (XLSX). Triggers: «сделай PDF», «сгенерь docx», «дай excel таблицу», «сделай отчёт».'
-allowed-tools: ["mcp__render_doc__render_doc"]
----
-```
-
-**Body** (Russian/Cyrillic for trigger sections, English for code
-identifiers per CLAUDE.md style):
-
-Section structure (mirrors phase-8 vault SKILL.md):
-
-1. **Когда использовать** — Cyrillic prose explaining the model
-   should call `render_doc` whenever owner asks for a file, отчёт,
-   таблицу, document to forward / save outside the chat.
-2. **Триггеры (Cyrillic)** — bulleted list of trigger phrases:
-   «сделай PDF», «сгенерь docx», «дай excel таблицу», «сделай отчёт
-   по vault», «excel из заметок», «word документ», «pdf отчёт»,
-   «генерируй документ», «выгрузи в файл».
-3. **Как использовать** — concrete invocation hint: «вызови
-   `mcp__render_doc__render_doc(content_md=..., format="pdf"|"docx"|"xlsx",
-   filename="...")`; markdown пишешь сам, бот доставит файл в
-   Telegram автоматически». Mention что filename optional.
-4. **Ограничения** — concentrate из §5 «Явно НЕ»:
-   - no templates / branding / header-footer,
-   - no multi-sheet xlsx (single markdown table per call),
-   - no embedded images of any kind (data: URIs blocked too),
-   - `content_md` ≤ 1 MiB,
-   - output ≤ 25 MiB PDF / 10 MiB DOCX/XLSX (Telegram cap),
-   - 3 forматs only: pdf / docx / xlsx (PPTX, ODT, EPUB out of scope).
-5. **Не вызывай** — anti-patterns:
-   - Для логирования / saving notes: используй `memory_*` @tools
-     (phase 4),
-   - Для скачивания внешних файлов: используй `WebFetch`,
-   - Для синхронизации vault: используй `vault_push_now` (phase 8),
-   - Для voice/audio выгрузок: NOT supported в phase 9.
-
-**Spec-level deliverable**: §3.7 only LISTS the file as part of
-phase 9 scope. The actual SKILL.md content is created в coder phase
-(Wave C task C8 NEW). Spec wording above is the **content
-specification** for the coder, NOT the file body itself.
-
-**Wave C C8 NEW**: «Author `skills/render_doc/SKILL.md` per §3.7
-content spec». LOC budget ~80 lines (frontmatter + 5 body sections).
-No tests in C8 itself; AC#30 covered by D-test
-`test_phase9_skill_md_present.py` (Wave D).
-
-**Wave D D2 NEW**: `test_phase9_skill_md_present.py` (D-test) —
-parses `skills/render_doc/SKILL.md` frontmatter + body, asserts AC#30
-invariants.
-
-**Test count budget update**: Wave C count unchanged (16 tests; C8
-adds no test). Wave D count 4 → 5 (D2 added). Total v3 test count
-70 (v2) + 5 = **75** tests.
-
-**LOC budget update**: Wave C 750 LOC (v2) + ~80 LOC (SKILL.md) =
-~830 LOC; Wave D 150 LOC + ~50 LOC test = ~200 LOC.
-
-**Cyrillic trigger empirical verification (live owner smoke,
-post-deploy)**: owner sends в Telegram «сделай PDF отчёт по vault» →
-`render_doc(format="pdf", ...)` invocation visible в structured logs
-(`event=render_doc_started`); compare против baseline pre-SKILL.md
-behaviour to confirm trigger attribution is improved (researcher
-recommends instrumenting via `event=mcp_tool_invocation_skill_match`
-hook if SDK exposes; otherwise observational baseline).
-
 ## 4. Критерии готовности
 
 > v0 имел AC#1..#18. v1 расширил до AC#1..#28 (новые ACs #19–#28
-> mapped к devil w1 closures). v2 добавил AC#14j, AC#17b, AC#21a,
-> AC#29 (devil w2 closures, total 32). v3 добавил AC#30 (skills
-> SKILL.md presence, researcher closure) — total 33; AC#14
-> (+ AC#14a–AC#14i sub-cases) reworded для FatalURLFetchingError
-> abort semantics (R1.2); AC#15a threshold raised 120 MB → 300 MB
-> (R2.11).
+> mapped к devil w1 closures).
 
 **AC#1 — happy-path PDF**. Owner: «сгенерь PDF отчёт по последним
 заметкам». Модель → `memory_search` → `render_doc(format="pdf",
@@ -2263,17 +1862,12 @@ TELEGRAM_DOC_MAX_BYTES` → text fallback «файл слишком большо
 Telegram»; sweeper удалит файл по TTL. v1 validator делает этот path
 теоретическим (pdf_max_bytes ≤ 20 MiB).
 
-**AC#14 — markdown injection blocked at fetch layer (CRIT-2 anchor +
-R1.2 reworded)**.
-content_md с adversarial fetch attempts → `SafeURLFetcher.fetch`
-raises `FatalURLFetchingError` (extends `BaseException`) → WeasyPrint
-**aborts render** (was: v2 `URLFetchingError` extending IOError →
-silently swallowed with placeholder). Renderer body catches → returns
-envelope `{ok: False, reason: "render_failed_input_syntax", error:
-"weasyprint-url-fetch-blocked"}`. Audit row written с
-`result="failed"` + `error="weasyprint-url-fetch-blocked"`. Model
-видит explicit failure (not silent placeholder), branches retry с
-clean markdown. AC#14 разбит на 9 sub-cases:
+**AC#14 — markdown injection blocked at fetch layer (CRIT-2 anchor)**.
+content_md с adversarial fetch attempts → `safe_url_fetcher` reject'ит
+**ВСЕ** не-`data:` схемы; `data:` URI с не-image MIME — reject.
+WeasyPrint fall-through на пустой content. В финальном PDF ничего не
+leak'нуто. Audit row пишется с пометкой что fetch_url был заблокирован
+(для post-mortem). AC#14 разбит на 9 sub-cases:
 
 - **AC#14a** — `<img src="file:///etc/passwd">` blocked.
 - **AC#14b** — CSS `@import url("file:///etc/shadow")` blocked.
@@ -2294,11 +1888,10 @@ clean markdown. AC#14 разбит на 9 sub-cases:
 `test_phase9_render_doc_binaries.py` зелёный в test container.
 Удаление `pandoc` из Dockerfile → CI идёт red БЕЗ deploy.
 
-**AC#15a — image size delta CI gate (MED-7 + R2.11 recalibrated)**.
-CI step `docker-image-size-check.yml` builds runtime image, comparing
-с `:main`. Delta > **300 MB** → CI red, PR blocked (was 120 MB в v2;
-raised per R2.11 — pandoc alone is ~164 MB on bookworm). Reference
-value documented after Wave A spike per A8.
+**AC#15a — image size delta CI gate (MED-7 NEW)**. CI step
+`docker-image-size-check.yml` builds runtime image, comparing с
+`:main`. Delta > 120 MB → CI red, PR blocked. Reference value
+documented after Wave A spike.
 
 **AC#16 — @tool gated by `render_doc_tool_visible`**. Picker / audio
 bridges не видят `mcp__render_doc__render_doc` в allowed_tools.
@@ -2413,25 +2006,6 @@ observer log line emitted while subsystem is enabled includes field
 - subsystem enabled, empty ledger: `render_doc_inflight=0`,
 - subsystem enabled, 2 in-flight artefacts: `render_doc_inflight=2`.
 
-**AC#30 — skills/render_doc/SKILL.md present and valid (NEW v3,
-researcher closure)**. After Wave C lands `skills/render_doc/SKILL.md`
-(see §3.7), test asserts:
-- file exists at `skills/render_doc/SKILL.md`,
-- frontmatter parses as valid YAML with required keys: `name:
-  render_doc`, `description: <non-empty str>`, `allowed-tools:
-  ["mcp__render_doc__render_doc"]`,
-- body contains Cyrillic trigger phrases: at least one of «сделай
-  PDF», «сгенерь docx», «дай excel таблицу», «сделай отчёт»,
-- body contains MCP tool reference `mcp__render_doc__render_doc`
-  with usage hint covering all 3 formats (pdf/docx/xlsx),
-- body contains anti-pattern section («Не вызывай») warning against
-  using render_doc для logging (memory_*) или downloading
-  (WebFetch).
-Live owner-smoke verification (NOT gated by automated test): owner
-sends «сделай PDF отчёт по последним заметкам vault» в Telegram → бот
-вызывает `render_doc(format="pdf", ...)` → SKILL.md trigger
-attribution measurable via Claude SDK skill-invocation logs.
-
 ## 5. Явно НЕ в phase 9
 
 1. **Templates / branding / header-footer**. Голый markdown rendering.
@@ -2490,15 +2064,6 @@ attribution measurable via Claude SDK skill-invocation logs.
     is left-to-right (broken UX). v2 explicitly out-of-scope; phase
     11+ adds CSS direction injection if owner uses RTL languages.
     No code or test change in v2.
-20. **`plan/README.md` cleanup** (NEW в v3, researcher Q acknowledgement
-    closure). `plan/README.md` describes obsolete CLI-per-tool
-    architecture from pre-phase-3 era while phases 4-8 pivoted к @tool
-    MCP server pattern (memory @tool, scheduler @tool, vault @tool,
-    render_doc @tool). Phase 9 follows current pattern and continues
-    the @tool architecture. README cleanup non-blocking для phase 9
-    delivery; deferred to phase 10 along с других phase-10 backlog
-    (host-key drift CI, vault_sync audit unification helper). No spec
-    or test change в phase 9.
 
 ## 6. Зависимости
 
@@ -2529,49 +2094,18 @@ attribution measurable via Claude SDK skill-invocation logs.
   добавляет mcp_server registration + ArtefactBlock yield path.
 - **External Python deps (новые):**
   - `weasyprint>=63,<70` — PDF rendering. CFFI-backed; pyproject pin
-    разумный; bookworm wheel поддерживает Python 3.12. **R1.2 + R2.10
-    note**: `<70` because legacy `def fetcher(url, timeout)` form
-    removed в 69.0 (deprecated 68.0). v3 uses `URLFetcher` subclass
-    form (forward-compat to 69.0+) but pin still excludes 69.0
-    pending real-world testing of subclass API stability.
-- **External system deps (новые apt пакеты в Dockerfile runtime; R1.4
-  closure: list verified against WeasyPrint official First Steps
-  doc + bookworm packages metadata; sizes from packages.debian.org
-  amd64):**
-  - `pandoc` — **~164 MiB** installed-size (was estimated ~85 MB в
-    v2; researcher R2.11 verified actual via Debian metadata; Haskell
-    static binary dominates),
-  - `libpango-1.0-0` — ~520 KiB,
-  - `libpangoft2-1.0-0` — ~142 KiB,
-  - `libharfbuzz-subset0` — ~2.5 MiB (NEW в v3 list; R1.4: REQUIRED
-    для PDF font subsetting; was MISSING from v2),
-  - `fonts-dejavu-core` — ~3 MiB.
-
-  **DROPPED from v3** (R1.4 closure): `libcairo2` (~1 MB) and
-  `libgdk-pixbuf2.0-0` (~1 MB) — NOT required by WeasyPrint v53+.
-
-  **Direct apt install size**: ~175 MiB (pandoc dominates; ~94% of
-  total).
-
-  **Transitive deps (estimate, researcher Q4 flagged uncertain)**:
-  ~10-45 MiB additional (`libcairo2` may still come in via
-  `libpangocairo-1.0-0`; `libfontconfig1`, `libfreetype6`,
-  `libgraphite2-3`, `libpixman-1-0` etc. — bookworm dpkg cache
-  contribution).
-
-  **Total estimated image size delta ≤ 250 MiB** (was ≤ 95 MiB в v2;
-  bumped per researcher R2.11 BLOCKING + owner-frozen decision to
-  keep pandoc rather than pivot к python-only stack). Layer
-  contribution ~200-220 MiB after dpkg metadata + apt cache cleanup.
-
-  Current GHCR image ~400 MB → expected post-phase-9 ~620-650 MB.
-  Acceptable для single-user private repo (deployment economics
-  unchanged: only outbound bandwidth on `docker pull`, owner's VPS
-  has 50 GB disk).
-
-  MED-7 closure: Wave A A8 spike обязан зафиксировать **measured**
-  delta and update это число; CI gate threshold raised 120 MB →
-  **300 MB** (allows headroom для observed transitive deps).
+    разумный; bookworm wheel поддерживает Python 3.12.
+- **External system deps (новые apt пакеты в Dockerfile runtime):**
+  - `pandoc` (~85 MB на bookworm),
+  - `libcairo2` (~1 MB),
+  - `libpango-1.0-0` (~1 MB),
+  - `libpangoft2-1.0-0` (<1 MB),
+  - `libgdk-pixbuf2.0-0` (~1 MB),
+  - `fonts-dejavu-core` (~3 MB).
+  Total estimated image size delta ≤ 95 MB (apt-cache contribution
+  + dpkg metadata typically 1.5–2× → ≤ 150 MB layer). MED-7 closure:
+  Wave A A8 spike обязан зафиксировать **measured** delta and update
+  это число; CI gate threshold 120 MB.
 - **Performance — pandoc / WeasyPrint cold-start (W2-LOW-2)**:
   - `pandoc` 2.17.x на Debian bookworm: cold-start latency
     **~150-300ms** (Haskell runtime init); warm-call ~50ms. v2 PDF
@@ -3025,277 +2559,3 @@ because:
   missed otherwise.
 - Cumulative drain budget honesty paragraph (W2-HIGH-1) closes the
   «we'll figure it out at deploy» trap.
-
-## 11. Closures applied (researcher findings)
-
-> Each researcher finding listed with ID + status + spec-section
-> pointer. Researcher pass on 2026-05-02 verified Tier 1 (3 PASS,
-> 4 FAIL/PARTIAL); Tier 2/3 advisory. v3 closes BLOCKING issues
-> (R1.2, R1.4) и applies Tier 2/3 recommendations where compatible
-> с owner-frozen scope.
-
-### Tier 1 — BLOCKING (FAIL / PARTIAL FAIL)
-
-- **R1.2 — `URLFetchingError` does NOT propagate (BLOCKING)** —
-  **Closed-modified**.
-  §2.6 step 4 переписан. v2 used `URLFetchingError` (extends
-  `IOError`), which WeasyPrint **catches internally** — render
-  emits warning and continues с placeholder. Net effect: PDF
-  renders successfully (no security risk; URL never fetched), BUT
-  v2's audit/test claim «render aborts on URL access» FALSE.
-  v3 switches к `FatalURLFetchingError` (extends `BaseException`,
-  propagates and aborts render). Migrated from legacy `def
-  fetcher(url, timeout)` form (deprecated WeasyPrint 68.0; removed
-  69.0) к `URLFetcher` subclass form (forward-compat). Pin
-  `weasyprint>=63,<70` retained с inline comment в pyproject.toml
-  (§3 A2). AC#14 (and AC#14a–AC#14i sub-cases) reworded: render now
-  FAILS на adversarial fetch с `render_failed_input_syntax` +
-  `error="weasyprint-url-fetch-blocked"` (was silent placeholder в
-  v2). Wave A A3 spike adds direct verification:
-  `from weasyprint.urls import URLFetcher, FatalURLFetchingError;
-  assert issubclass(FatalURLFetchingError, BaseException)` AND NOT
-  `IOError`. Wave B B4 test target updated к
-  `pytest.raises(FatalURLFetchingError)` direct.
-
-- **R1.4 — apt deps stale (BLOCKING)** — **Closed**.
-  §3 Wave A A1 list rewritten. v2 listed `libcairo2` and
-  `libgdk-pixbuf2.0-0` which are NOT required since WeasyPrint v53
-  (pure-Pango rendering; image decoding via Pillow). Missing:
-  `libharfbuzz-subset0` (REQUIRED для PDF font subsetting).
-
-  **DROPPED**: `libcairo2`, `libgdk-pixbuf2.0-0`.
-  **KEPT**: `pandoc`, `libpango-1.0-0`, `libpangoft2-1.0-0`,
-  `fonts-dejavu-core`.
-  **ADDED**: `libharfbuzz-subset0`.
-
-  Source: WeasyPrint official First Steps doc
-  <https://doc.courtbouillon.org/weasyprint/stable/first_steps.html>.
-
-  §6 Зависимости size table rewritten with bookworm-verified
-  per-package data (researcher Q4 flagged transitive deps may
-  still pull libcairo2 via libpangocairo-1.0-0 — Wave A A8 spike
-  обязан empirically measure via `dpkg-query -W`).
-
-- **R-Pandoc — Pandoc version on bookworm = 2.17, not 3.x** —
-  **Closed-modified**.
-  §2.6 step 2 wording corrected: «as packaged on Debian bookworm
-  runtime base image (currently **pandoc 2.17.1.1-2~deb12u1**)»;
-  drops «current pandoc 3.x» phrasing. Researcher verified
-  extension behaviour identical between 2.17 and 3.9 для our
-  usage; subtraction syntax `markdown-EXT` valid since pandoc 2.0.
-  Wave A A3 spike adds explicit `pandoc --list-extensions=
-  markdown-...` verification step (must show literal `-EXT` lines
-  for each subtracted extension AFTER subtraction applied — closes
-  the «pandoc silently no-ops invalid subtraction» trap that
-  researcher R1.1 surfaced).
-
-- **R2.11 — Image size budget (BLOCKING; bumped per owner-frozen
-  decision)** — **Closed-modified**.
-  v2 budgeted ≤95 MB apt delta; researcher verified pandoc alone
-  is **~164 MiB** installed-size on bookworm amd64 (packages.
-  debian.org metadata). Direct apt sum ~175 MiB; with transitive
-  deps + dpkg metadata + apt cache ~200-220 MiB layer.
-
-  **Owner-frozen decision**: keep pandoc (not pivot к python-only
-  stack with `python-docx` + `markdown`/`mistune`). Rationale:
-  DOCX quality matters; pandoc native DOCX output is structurally
-  correct (proper Word XML, table alignment, paragraph styles)
-  whereas `python-docx` would require manual schema construction
-  для each markdown construct. Pure-Python alternative blast
-  radius too high для phase 9.
-
-  **Budget recalibrated**: ≤95 MB → **≤250 MB** apt delta. CI gate
-  threshold raised 120 MB → **300 MB** (Wave A A8 + AC#15a).
-  Mitigation reword in §7 Risk row: «final layer size ≤250 MB;
-  current GHCR image ~400 MB → expected ~620-650 MB; acceptable
-  для single-user private repo».
-
-### Tier 1 — PASS (verified, no spec change)
-
-- **R1.1 — Pandoc markdown variant flags (PASS-partial)** —
-  **Closed (modification applied)**.
-  Researcher confirmed `markdown-EXT` subtraction syntax valid;
-  identified `tex_math_single_backslash` as silent no-op (not
-  default-enabled in markdown flavour). v3 keeps the subtraction
-  defensively (документirует intent). Researcher recommended
-  ALSO subtracting `-yaml_metadata_block` to close YAML
-  frontmatter smuggling surface — v3 ADDS this. New variant string:
-  `markdown-raw_html-raw_tex-raw_attribute-tex_math_dollars-tex_math_single_backslash-yaml_metadata_block`.
-  Wave A spike obligated to empirically verify в `pandoc` 2.17
-  (not just trust the doc) per researcher Q2 recipe (§11 R1.1
-  reference).
-
-- **R1.3 — aiogram FSInputFile + Bot.send_document (PASS-partial)** —
-  **Closed (modification applied)**.
-  §2.5 `TelegramAdapter.send_document` local var renamed
-  `file → document` (matches aiogram parameter name `bot.
-  send_document(document=...)` AND avoids Python builtin shadow);
-  пassed kw-args explicitly. Belt-and-suspenders survives any
-  future aiogram 4 parameter reordering.
-
-- **R1.5 — openpyxl 3.1.x: header bold + write_only (PASS)** —
-  **No change**. Spec already correct; researcher confirmed
-  `Font(bold=True)` constructor + `WriteOnlyCell.font = Font(...)`
-  + column-width auto-fit skipped в write_only mode (acknowledged
-  ограничение).
-
-- **R1.6 — `asyncio.to_thread` cancellability (PASS)** —
-  **No change**. Spec §2.12 (iii) honesty paragraph accurate.
-  Researcher considered `concurrent.futures.ProcessPoolExecutor`
-  alternative: cons (cold-start, IPC, fontconfig re-warm)
-  outweigh pros. Spec choice correct.
-
-- **R1.7 — Pandoc subprocess signal propagation (PASS)** —
-  **No change**. Spec §2.12 (ii) signal recipe (SIGTERM →
-  grace → SIGKILL) is canonical pattern. Verified against
-  Python 3.12 subprocess docs.
-
-### Tier 2 — Advisory (applied)
-
-- **R2.8 — Pandoc cold-start latency (PASS)** —
-  **No change**. Researcher could not precisely benchmark without
-  hardware; spec §LOW-2 estimate 200-400ms consistent с community
-  benchmarks (jgm/pandoc#4226 shows ~250ms на pandoc 2.0). Coder
-  phase verifies via `timeit` per existing W2-LOW-2 closure.
-
-- **R2.9 — WeasyPrint memory profile (PASS-tightened)** —
-  **Closed-honest** (no validator change in v3).
-  Researcher verified community reports range 500MB-2GB для
-  50-page docs. v2 validator formula `200 + concurrent×400 MB`
-  retained as warning threshold (not error). Prose добавлена в
-  §6: «document as per-render RSS observation gap; coder phase
-  adds RSS gauge callback per AC#29; if owner sees OOM in
-  production, reduce `pdf_max_bytes` или `max_input_bytes`».
-  Researcher also recommended bumping per-slot estimate 400→700 MB
-  для better worst-case match — v3 NOT applied because validator
-  is warning-only; tightening would force unnecessary `concurrent=1`
-  on default 1 GB VPS.
-
-- **R2.10 — WeasyPrint pin range (PASS)** —
-  **Closed**. Pin `>=63,<70` correct. R1.2 covers migration к
-  URLFetcher subclass form within pin range. Pyproject inline
-  comment documents `<70` rationale (§3 A2).
-
-- **R2.11 — Docker layer size delta (FAIL)** — covered by
-  «R2.11 Image size budget» row above (Tier 1 BLOCKING per owner-
-  frozen decision treatment).
-
-- **R2.12 — PDF magic bytes check (PASS-clarified)** —
-  **Closed**. AC#15a's check `b"%PDF-"` (5-byte prefix) +
-  `b"%%EOF"` trailer confirmed correct по PDF 1.7 spec
-  (ISO 32000-1). v3 explicitly notes 5-byte prefix (NOT 8-byte
-  `%PDF-1.7`) to survive PDF version bumps в WeasyPrint output.
-  No code change; AC wording tightened.
-
-### Tier 3 — Sanity (applied)
-
-- **R3.13 — Markdown table parser (recommendation)** —
-  **Closed (test-target raised)**.
-  Researcher recommended either custom regex (with ≥10 unit-test
-  cases для CommonMark edge cases) OR mistune table extension
-  (~100 KB pure-Python, MIT). Owner-frozen choice: custom regex
-  (zero new dep). v3 raises B1 test target from 5 cases → ≥10
-  with explicit enumeration: escaped pipes, alignment markers,
-  ragged rows, leading/trailing whitespace, Cyrillic, empty cells,
-  multi-table, no-tables, malformed-no-separator, mismatched
-  col-count.
-
-- **R3.14 — Audit log truncation at 256 codepoints (PASS)** —
-  **No change**. Python `str` indexing IS codepoint-based. UTF-8
-  byte-cost up to 4× codepoint count for emoji acknowledged;
-  spec doesn't claim fixed-byte rows so no audit infra change
-  needed.
-
-- **R3.15 — `uuid.uuid4()` for staging filenames (PASS)** —
-  **No change**. 122-bit random; collision probability negligible.
-  `secrets.token_hex(16)` would be marginally tighter but
-  difference academic for staging files <30s lifetime. Spec
-  choice correct.
-
-### Owner-frozen / deferred
-
-- **Researcher Q1 — pandoc vs python-only pivot** —
-  **DECIDED keep pandoc** (owner-frozen). Rationale в R2.11
-  closure above. Phase 10 may revisit if disk economics change или
-  все-Python alternative quality (DOCX construction) verified
-  acceptable.
-
-- **Researcher Q2 — pandoc subtraction empirical verification** —
-  **Closed (Wave A A3 spike adds explicit assertion)**. v3 Wave A
-  A3 expanded to run `pandoc --list-extensions=markdown-...` AND
-  verify output AFTER subtraction; closes the «pandoc silently
-  no-ops on invalid subtraction» trap.
-
-- **Researcher Q3 — `_artefacts_lock` TOCTOU between
-  mark_delivered + sweeper** —
-  **Closed by W2-HIGH-2 closure** (predates researcher pass).
-  §2.13 «Lock acquisition discipline» mandates all three
-  mutations (register / mark_delivered / sweep) acquire the lock.
-  Sweep iterates snapshot-under-lock, unlinks outside, pops
-  under-lock — TOCTOU window closed.
-
-- **Researcher Q4 — apt Installed-Size accuracy уточнение** —
-  **Closed (Wave A A8 spike measures actual)**. Wave A A8 image-
-  size CI gate runs `dpkg-query -W -f='${Installed-Size}\n' …`
-  AFTER install rather than relying on direct-size estimates
-  alone; estimate vs measured comparison reported в PR description.
-
-### NEW addition — skills/render_doc/SKILL.md
-
-- **NEW в v3 — `skills/render_doc/SKILL.md`** —
-  **Closed (Wave C C8 + Wave D D2)**.
-  Discoverability layer для `mcp__render_doc__render_doc` MCP
-  @tool. Cyrillic triggers («сделай PDF», «сгенерь docx», «дай
-  excel таблицу», «сделай отчёт») surface render_doc capability к
-  модели at higher prompt-attribution weight than the @tool
-  description alone. Mirror phase-8 `skills/vault/SKILL.md`
-  template structure. File auto-discovered by Claude SDK via
-  `setting_sources=["project"]` + `cwd` pattern.
-
-  Wave C C8 authors `skills/render_doc/SKILL.md` per §3.7 content
-  spec (~80 LOC). Wave D D2 adds `tests/test_phase9_skill_md_
-  present.py` (validates frontmatter + body via AC#30).
-
-- **README outdate acknowledgement** — **Deferred-phase-10**.
-  `plan/README.md` describes obsolete CLI-per-tool architecture
-  while phases 4-8 pivoted к @tool MCP server pattern (memory,
-  scheduler, vault, render_doc all use @tool decorator + MCP
-  server). Phase 9 follows current pattern. README cleanup
-  non-blocking; deferred к phase 10 along with host-key drift CI,
-  vault_sync audit unification helper. §5 #20 NEW.
-
-### Devil + researcher recommendations REJECTED in v3
-
-- **«Bump per-slot RSS estimate 400→700 MB в settings validator»**
-  (R2.9) — **Modified, not applied**. Validator is warning-only;
-  tightening would force `concurrent=1` on default 1 GB VPS owner
-  may not be hitting OOM. Honesty prose added к §6 instead;
-  AC#29 RSS gauge callback (W2-LOW-1 already in v2) gives owner
-  observability to reduce caps if real-world OOM observed.
-
-- **«Pivot к python-only docx generation (drop pandoc, use
-  `python-docx`)»** (R2.11 mitigation option 2) — **REJECTED**
-  per owner-frozen decision. DOCX quality matters; pandoc native
-  DOCX output is well-formed Word XML; `python-docx` requires
-  manual XML construction для each markdown construct (tables,
-  headings, fenced code, lists) — phase-9-blast-radius too high.
-
-### Summary
-
-**v2 → v3 spec delta**: ~470 spec lines added (researcher closures
-+ skills section + tightened apt deps + bigger size table); +5 tests
-(Wave A R-Pandoc/R1.2 verifications +2; Wave B B1 markdown_tables
-≥10 cases +~2 net; Wave D SKILL.md presence +1). Test count: 70 (v2)
-→ **75 (v3)**. AC count: 32 (v2) → **33 (v3; added AC#30)**. AC#14 +
-AC#14 (+ sub-cases AC#14a–AC#14i) reworded для
-FatalURLFetchingError abort semantics. AC#15a
-threshold raised 120 MB → 300 MB.
-
-**Convergence outlook v3**: 4-reviewer wave should still pass в 1-2
-passes (closures are paragraph-localised). BLOCKING researcher
-findings (R1.2 silent fall-through; R1.4 stale apt deps) addressed
-at spec level, NOT deferred к coder phase — the security-test-claim
-gap (R1.2) and ship-time apt-deps gap (R1.4) are the two highest-cost
-defects to surface late. Both now anchored in tests (Wave A A3
-direct hierarchy assertion; Wave A A8 + Wave D dockerfile-grep static
-check) so coder phase has hard gates.

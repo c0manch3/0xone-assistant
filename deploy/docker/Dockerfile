@@ -141,7 +141,34 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         openssh-client \
         tini \
         passwd \
+        pandoc \
+        libpango-1.0-0 \
+        libpangoft2-1.0-0 \
+        libharfbuzz-subset0 \
+        fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
+
+# Phase 9 (R-Pandoc + R1.4 closures): build-time sanity for the
+# render_doc subsystem. ``pandoc --version`` confirms the binary is on
+# PATH; the ``--list-extensions`` grep verifies the markdown variant
+# subtraction syntax we rely on (each subtracted extension MUST appear
+# prefixed with ``-`` in the resolved extension list — closes the
+# "pandoc silently no-ops on invalid subtraction" trap that researcher
+# R-Pandoc surfaced). The variant-subtraction grep includes
+# ``tex_math_single_backslash`` per fix-pack closure of W3-LOW-2.
+#
+# Fix-pack F9 (DM-2 / DH-1): exercise the FULL WeasyPrint pipeline at
+# build time — not just ``import weasyprint``. ``HTML(...).write_pdf()``
+# triggers cffi binding load, libpango / libharfbuzz / libgobject
+# dlopen, font-subsetting, AND a real PDF byte-stream emit. Catches
+# every dlopen failure mode + a Cyrillic font-coverage regression at
+# build, not at first runtime render.
+RUN pandoc --version \
+    && pandoc --list-extensions=markdown-raw_html-raw_tex-raw_attribute-tex_math_dollars-tex_math_single_backslash-yaml_metadata_block \
+        | grep -E '^-(raw_html|raw_tex|raw_attribute|tex_math_dollars|tex_math_single_backslash|yaml_metadata_block)$' \
+    && /opt/venv/bin/python -c "import weasyprint; print('weasyprint', weasyprint.__version__)" \
+    && /opt/venv/bin/python -c "from weasyprint import HTML; data = HTML(string='<p>Привет</p>').write_pdf(); assert isinstance(data, (bytes, bytearray)) and data.startswith(b'%PDF-') and b'%%EOF' in data[-256:], data[:32]; print('weasyprint render probe ok', len(data))" \
+    && rm -f /tmp/probe.pdf
 
 # Mirror non-root user from base stage. Use absolute paths because
 # slim-bookworm puts useradd/groupadd in /usr/sbin which is NOT on the

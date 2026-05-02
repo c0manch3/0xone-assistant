@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json as _json
 from collections.abc import AsyncIterable, AsyncIterator
+from pathlib import Path
 from typing import Any, Literal, cast
 
 from claude_agent_sdk import (
@@ -12,6 +14,9 @@ from claude_agent_sdk import (
     HookMatcher,
     ResultMessage,
     SystemMessage,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
 )
 from claude_agent_sdk import (
     query as _raw_query,
@@ -33,11 +38,16 @@ from assistant.bridge.skills import (
 )
 from assistant.config import Settings
 from assistant.logger import get_logger
+from assistant.render_doc import ArtefactBlock
 from assistant.tools_sdk.installer import (
     INSTALLER_SERVER,
     INSTALLER_TOOL_NAMES,
 )
 from assistant.tools_sdk.memory import MEMORY_SERVER, MEMORY_TOOL_NAMES
+from assistant.tools_sdk.render_doc import (
+    RENDER_DOC_SERVER,
+    RENDER_DOC_TOOL_NAMES,
+)
 from assistant.tools_sdk.scheduler import (
     SCHEDULER_SERVER,
     SCHEDULER_TOOL_NAMES,
@@ -91,6 +101,108 @@ type HookEventName = Literal[
 ]
 
 
+def _parse_render_doc_artefact_block(
+    block: ToolResultBlock,
+    *,
+    artefact_root: Path | None = None,
+) -> ArtefactBlock | None:
+    """Phase 9 §2.5 / MED-5 / MED-6 — parse the render_doc envelope
+    from a :class:`ToolResultBlock` content payload.
+
+    Returns ``None`` (graceful degradation) when:
+
+      - ``content`` is None or empty.
+      - First content item isn't shaped like a JSON-stringified text
+        block.
+      - Envelope ``schema_version != 1`` (MED-6 — log warning + skip).
+      - ``ok=False`` or ``kind != "artefact"`` (failed render — model
+        sees the text envelope, owner sees no file).
+
+    Fix-pack F3 (CR-1 + CR-4 path-traversal defense): when
+    ``artefact_root`` is provided, the parsed ``path`` is resolved and
+    must live under it (and outside ``.staging``). A misbehaving @tool
+    body emitting ``path=/etc/passwd`` or a future SDK envelope
+    confusion would otherwise be passed verbatim to
+    ``adapter.send_document``. The handler does the same check —
+    defense in depth, both layers must fail for an escape to land.
+    """
+    content = block.content
+    if not content:
+        return None
+    # Content is ``str | list[dict]`` per SDK; for tool results from
+    # MCP @tool returns it's the list[dict] form with one ``text``
+    # block carrying the JSON-stringified envelope.
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list) and content:
+        first = content[0]
+        if not isinstance(first, dict):
+            return None
+        text_value = first.get("text")
+        if not isinstance(text_value, str):
+            return None
+        text = text_value
+    else:
+        return None
+    try:
+        envelope = _json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(envelope, dict):
+        return None
+    schema = envelope.get("schema_version")
+    if schema != 1:
+        log.warning(
+            "render_doc_envelope_unknown_schema_version",
+            received_version=schema,
+            tool_use_id=block.tool_use_id,
+        )
+        return None
+    if not envelope.get("ok") or envelope.get("kind") != "artefact":
+        return None
+    path_str = envelope.get("path")
+    fmt = envelope.get("format")
+    suggested = envelope.get("suggested_filename")
+    if not isinstance(path_str, str) or not isinstance(fmt, str):
+        return None
+    if not isinstance(suggested, str):
+        return None
+    parsed_path = Path(path_str)
+    # F3: path-traversal defense (CR-4). Drop on resolve failure or
+    # any escape from the configured artefact root.
+    if artefact_root is not None:
+        try:
+            resolved = parsed_path.resolve()
+        except OSError as resolve_exc:
+            log.warning(
+                "render_doc_path_resolve_failed",
+                path=path_str,
+                error=repr(resolve_exc),
+            )
+            return None
+        staging_root = artefact_root / ".staging"
+        if (
+            not resolved.is_relative_to(artefact_root)
+            or resolved.is_relative_to(staging_root)
+        ):
+            log.error(
+                "artefact_path_traversal_blocked",
+                path=path_str,
+                artefact_root=str(artefact_root),
+                tool_use_id=block.tool_use_id,
+            )
+            return None
+    tool_use_id = envelope.get("tool_use_id")
+    if not isinstance(tool_use_id, str):
+        tool_use_id = block.tool_use_id
+    return ArtefactBlock(
+        path=parsed_path,
+        fmt=fmt,
+        suggested_filename=suggested,
+        tool_use_id=tool_use_id,
+    )
+
+
 class ClaudeBridgeError(RuntimeError):
     """Raised for any failure of the underlying SDK call.
 
@@ -121,6 +233,8 @@ class ClaudeBridge:
         agents: dict[str, AgentDefinition] | None = None,
         max_concurrent_override: int | None = None,
         vault_tool_visible: bool = False,
+        render_doc_tool_visible: bool = False,
+        render_doc_artefact_root: Path | None = None,
     ) -> None:
         """Phase 6 (research RQ1 + RQ2): ``extra_hooks`` is a dict
         keyed by SDK hook event name (``"SubagentStart"``,
@@ -163,6 +277,19 @@ class ClaudeBridge:
         self._extra_hooks = extra_hooks or {}
         self._agents = agents
         self._vault_tool_visible = vault_tool_visible
+        self._render_doc_tool_visible = render_doc_tool_visible
+        # Phase 9 fix-pack F3 (CR-4 path-traversal defense): resolved
+        # artefact root used by ``_parse_render_doc_artefact_block`` to
+        # reject envelopes whose ``path`` escapes the configured dir.
+        if render_doc_artefact_root is not None:
+            try:
+                self._render_doc_artefact_root: Path | None = (
+                    render_doc_artefact_root.resolve()
+                )
+            except OSError:
+                self._render_doc_artefact_root = None
+        else:
+            self._render_doc_artefact_root = None
 
     # ------------------------------------------------------------------
     # Options assembly
@@ -253,6 +380,14 @@ class ClaudeBridge:
         if self._vault_tool_visible:
             allowed_tools.extend(VAULT_TOOL_NAMES)
             mcp_servers["vault"] = VAULT_SERVER
+        # Phase 9: conditional render_doc @tool registration. Mirrors
+        # the vault gate — owner bridge passes
+        # ``render_doc_tool_visible=settings.render_doc.enabled and not
+        # subsystem.force_disabled``; picker / audio bridges keep the
+        # default ``False`` so the @tool never leaks. AC#16.
+        if self._render_doc_tool_visible:
+            allowed_tools.extend(RENDER_DOC_TOOL_NAMES)
+            mcp_servers["render_doc"] = RENDER_DOC_SERVER
         opts_kwargs: dict[str, Any] = {
             "cwd": str(pr),
             "setting_sources": ["project"],
@@ -385,6 +520,16 @@ class ClaudeBridge:
             }
 
         last_model: str | None = None
+        # Phase 9 (CRIT-1 / MED-5): track tool_use_id → tool name so we
+        # can identify render_doc tool_results when they arrive on
+        # UserMessage envelopes. Render_doc results carry the artefact
+        # envelope; we yield :class:`ArtefactBlock` AFTER the
+        # ToolResultBlock so the handler can flush in iteration order
+        # (CRIT-1). The map is per-call (live for the duration of this
+        # single ``ask`` invocation); SDK's tool_use_id contract
+        # guarantees uniqueness within one conversation, but we
+        # defensively log on collision (last-write-wins).
+        render_doc_tool_use_ids: set[str] = set()
         timeout_s = (
             timeout_override
             if timeout_override is not None
@@ -417,7 +562,48 @@ class ClaudeBridge:
                             last_model = getattr(message, "model", None) or last_model
                             for block in message.content:
                                 log.debug("block_received", type=type(block).__name__)
+                                # Phase 9 (CRIT-1): track render_doc
+                                # ToolUseBlock ids so a later
+                                # ToolResultBlock can be paired with
+                                # its tool name.
+                                if (
+                                    isinstance(block, ToolUseBlock)
+                                    and block.name
+                                    in RENDER_DOC_TOOL_NAMES
+                                ):
+                                    render_doc_tool_use_ids.add(block.id)
                                 yield block
+                            continue
+                        if isinstance(message, UserMessage):
+                            # Phase 9: UserMessage envelopes carry
+                            # ToolResultBlocks back to the model from
+                            # any tool invocation. The handler's
+                            # classify_block treats them as user-role
+                            # blocks (B5). Yield each block so the
+                            # handler persists it; for render_doc
+                            # tool_results, also yield an
+                            # :class:`ArtefactBlock` IMMEDIATELY
+                            # AFTER so the handler's pending list
+                            # preserves iteration order (CRIT-1).
+                            content = message.content
+                            if isinstance(content, list):
+                                for block in content:
+                                    yield block
+                                    if (
+                                        isinstance(block, ToolResultBlock)
+                                        and block.tool_use_id
+                                        in render_doc_tool_use_ids
+                                    ):
+                                        artefact = (
+                                            _parse_render_doc_artefact_block(
+                                                block,
+                                                artefact_root=(
+                                                    self._render_doc_artefact_root
+                                                ),
+                                            )
+                                        )
+                                        if artefact is not None:
+                                            yield artefact
                             continue
                         if isinstance(message, ResultMessage):
                             usage = message.usage or {}

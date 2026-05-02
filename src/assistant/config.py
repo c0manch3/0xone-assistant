@@ -389,6 +389,114 @@ class ObservabilitySettings(BaseSettings):
     rss_interval_s: float = 60.0
 
 
+class RenderDocSettings(BaseSettings):
+    """Phase 9 ``render_doc`` subsystem knobs (``RENDER_DOC_`` env prefix).
+
+    Mounted on :class:`Settings` as ``settings.render_doc``. Mirrors
+    :class:`VaultSyncSettings` shape; opt-in via ``enabled`` (default
+    ``True`` per spec §2.9 — owner explicitly asked for this feature
+    in scope).
+
+    Cross-field validators (W2-MED-3 + LOW-4 + W2-HIGH-1):
+
+      - ``tool_timeout_s`` must accommodate worst-case PDF pipeline
+        (``pdf_pandoc_timeout_s + pdf_weasyprint_timeout_s``).
+      - All format size caps must be ``<= 20 MiB`` (Telegram cap).
+      - ``render_drain_timeout_s`` must accommodate worst-case PDF
+        pipeline UNLESS explicitly set to 0 (no-drain opt-out per
+        W2-MED-3 NOTE in spec §2.9).
+      - ``pandoc_sigterm_grace_s + pandoc_sigkill_grace_s`` must fit
+        inside ``render_drain_timeout_s`` (else SIGKILL cleanup races
+        ``_bg_tasks`` cancel).
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="RENDER_DOC_",
+        env_file=[_user_env_file(), Path(".env")],
+        extra="ignore",
+    )
+    enabled: bool = True
+    artefact_dir: Path | None = None
+    artefact_ttl_s: int = 600
+    sweep_interval_s: int = 60
+    cleanup_threshold_s: int = 86400
+    max_input_bytes: int = 1_048_576
+    tool_timeout_s: int = 60
+    render_max_concurrent: int = 2
+    audit_log_max_size_mb: int = 10
+    audit_log_keep_last_n: int = 5
+    pdf_pandoc_timeout_s: int = 20
+    pdf_weasyprint_timeout_s: int = 30
+    pdf_max_bytes: int = 20 * 1024 * 1024
+    docx_pandoc_timeout_s: int = 15
+    docx_max_bytes: int = 10 * 1024 * 1024
+    xlsx_max_rows: int = 5000
+    xlsx_max_cols: int = 50
+    xlsx_max_bytes: int = 10 * 1024 * 1024
+    render_drain_timeout_s: float = 20.0
+    pandoc_sigterm_grace_s: float = 5.0
+    pandoc_sigkill_grace_s: float = 5.0
+    audit_field_truncate_chars: int = 256
+
+    @model_validator(mode="after")
+    def _validate_render_doc_consistency(self) -> RenderDocSettings:
+        if self.tool_timeout_s < (
+            self.pdf_pandoc_timeout_s + self.pdf_weasyprint_timeout_s
+        ):
+            raise ValueError(
+                "tool_timeout_s must be >= pdf_pandoc_timeout_s + "
+                "pdf_weasyprint_timeout_s; otherwise PDF pipeline "
+                "cannot fit worst-case"
+            )
+        if self.render_max_concurrent < 1:
+            raise ValueError("render_max_concurrent must be >= 1")
+        for fmt, cap in (
+            ("pdf_max_bytes", self.pdf_max_bytes),
+            ("docx_max_bytes", self.docx_max_bytes),
+            ("xlsx_max_bytes", self.xlsx_max_bytes),
+        ):
+            if cap > 20 * 1024 * 1024:
+                raise ValueError(
+                    f"{fmt} must be <= 20 MiB (Telegram send_document "
+                    "cap)"
+                )
+        # W2-MED-3: render_drain must accommodate worst-case PDF
+        # pipeline UNLESS explicit-zero opt-out. The DEFAULT drain
+        # (20s) is deliberately undersized vs the default PDF pipeline
+        # sum (50s) to fit the cumulative ``Daemon.stop`` budget per
+        # W2-HIGH-1 honesty paragraph in spec §2.12 (iii); this is an
+        # accepted residual risk (orphan WeasyPrint thread on
+        # mid-render stop). The validator therefore distinguishes
+        # owner-set values (logical-error: reject) from the default
+        # (intentional trade-off: accept).
+        owner_set_drain = (
+            "render_drain_timeout_s" in self.model_fields_set
+        )
+        if (
+            owner_set_drain
+            and self.render_drain_timeout_s != 0
+            and self.render_drain_timeout_s < (
+                self.pdf_pandoc_timeout_s + self.pdf_weasyprint_timeout_s
+            )
+        ):
+            raise ValueError(
+                "render_drain_timeout_s must be 0 (explicit no-drain) "
+                "or >= pdf_pandoc_timeout_s + pdf_weasyprint_timeout_s "
+                "when explicitly set"
+            )
+        # Pandoc grace must fit inside drain (zero-drain path skips).
+        if (
+            self.render_drain_timeout_s > 0
+            and self.pandoc_sigterm_grace_s + self.pandoc_sigkill_grace_s
+            > self.render_drain_timeout_s
+        ):
+            raise ValueError(
+                "pandoc_sigterm_grace_s + pandoc_sigkill_grace_s must "
+                "fit inside render_drain_timeout_s"
+            )
+        return self
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=[_user_env_file(), Path(".env")],
@@ -413,6 +521,7 @@ class Settings(BaseSettings):
         default_factory=ObservabilitySettings
     )
     vault_sync: VaultSyncSettings = Field(default_factory=VaultSyncSettings)
+    render_doc: RenderDocSettings = Field(default_factory=RenderDocSettings)
 
     # ------------------------------------------------------------------
     # Phase 6c: voice / audio / URL transcription via Mac mini Whisper.
@@ -545,6 +654,19 @@ class Settings(BaseSettings):
         ``MEMORY_INDEX_DB_PATH`` is unset.
         """
         base = self.memory.index_db_path or (self.data_dir / "memory-index.db")
+        return base.expanduser().resolve()
+
+    @property
+    def artefact_dir(self) -> Path:
+        """Phase 9: TTL-managed ephemeral pool for ``render_doc``
+        artefacts (PDF/DOCX/XLSX).
+
+        Falls back to ``<data_dir>/artefacts`` when
+        ``RENDER_DOC_ARTEFACT_DIR`` is unset; always returns an
+        absolute, user-expanded path. Sweeper + boot cleanup walk
+        this directory plus its ``.staging/`` subdir.
+        """
+        base = self.render_doc.artefact_dir or (self.data_dir / "artefacts")
         return base.expanduser().resolve()
 
     @property

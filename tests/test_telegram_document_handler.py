@@ -78,6 +78,9 @@ class _FakeHandler:
         self,
         msg: IncomingMessage,
         emit: Callable[[str], Awaitable[None]],
+        emit_direct: Callable[[str], Awaitable[None]] | None = None,
+        typing_lifecycle: Any | None = None,
+        flush_text: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.received.append(msg)
         await emit(self.reply_text)

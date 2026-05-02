@@ -1,0 +1,103 @@
+name: docker-image-size-check
+
+# Phase 9 fix-pack F7 (QC-2 / DM-2 — DH-1 image-size CI gate).
+#
+# Spec §4 AC#15a mandates a CI step that builds the runtime image on
+# every PR, compares its compressed size delta vs the ``main`` baseline,
+# and fails when the delta exceeds 300 MB. Without this gate a future
+# apt-list expansion (``libreoffice``, ``texlive-full``, ...) could
+# push the image past sustainable size without any reviewer signal.
+#
+# Compares against ``ghcr.io/c0manch3/0xone-assistant:main`` when that
+# tag exists. On the very first run (no baseline yet), the job emits a
+# warning + records the baseline but does not fail. Maintenance burden
+# is kept low: the budget is the delta, not an absolute number — single
+# legitimate +200 MB phase-9 jump (pandoc + Pango) stays under cap.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "deploy/docker/Dockerfile"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/docker-image-size-check.yml"
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/c0manch3/0xone-assistant
+  # 300 MB delta cap — see workflow header comment for rationale.
+  SIZE_DELTA_BUDGET_MB: 300
+
+jobs:
+  size-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR (best effort)
+        # Best-effort — PRs from forks don't have GHCR pull rights but
+        # the rest of the gate still runs against the locally built
+        # image; just skips the baseline comparison.
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build PR runtime image
+        run: |
+          docker build \
+            --file deploy/docker/Dockerfile \
+            --target runtime \
+            --tag 0xone-pr:size-check \
+            .
+
+      - name: Measure PR image size
+        id: pr-size
+        run: |
+          # docker image inspect returns the on-disk uncompressed size in bytes.
+          BYTES=$(docker image inspect 0xone-pr:size-check --format '{{.Size}}')
+          MB=$(awk -v b="$BYTES" 'BEGIN { printf "%d", b/1024/1024 }')
+          echo "pr_size_mb=$MB" >> "$GITHUB_OUTPUT"
+          echo "PR image size: ${MB} MB"
+
+      - name: Pull baseline (main)
+        id: baseline
+        continue-on-error: true
+        env:
+          IMAGE_REF: ${{ env.IMAGE }}
+        run: |
+          if docker pull "${IMAGE_REF}:main"; then
+            BYTES=$(docker image inspect "${IMAGE_REF}:main" --format '{{.Size}}')
+            MB=$(awk -v b="$BYTES" 'BEGIN { printf "%d", b/1024/1024 }')
+            echo "baseline_mb=$MB" >> "$GITHUB_OUTPUT"
+            echo "baseline_present=1" >> "$GITHUB_OUTPUT"
+            echo "Baseline (main) image size: ${MB} MB"
+          else
+            echo "baseline_present=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::No ${IMAGE_REF}:main baseline available; recording PR size as new floor."
+          fi
+
+      - name: Assert delta within budget
+        if: steps.baseline.outputs.baseline_present == '1'
+        env:
+          PR_MB: ${{ steps.pr-size.outputs.pr_size_mb }}
+          BASE_MB: ${{ steps.baseline.outputs.baseline_mb }}
+          BUDGET_MB: ${{ env.SIZE_DELTA_BUDGET_MB }}
+        run: |
+          DELTA=$(( PR_MB - BASE_MB ))
+          echo "PR=${PR_MB} MB  baseline=${BASE_MB} MB  delta=${DELTA} MB  budget=${BUDGET_MB} MB"
+          if [ "$DELTA" -gt "$BUDGET_MB" ]; then
+            echo "::error::Image size delta ${DELTA} MB > budget ${BUDGET_MB} MB"
+            exit 1
+          fi
+          echo "::notice::Image size delta ${DELTA} MB within budget ${BUDGET_MB} MB"

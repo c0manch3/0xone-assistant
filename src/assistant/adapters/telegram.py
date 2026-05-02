@@ -202,6 +202,65 @@ class TelegramAdapter(MessengerAdapter):
         return self._polling_task
 
     # ------------------------------------------------------------------
+    # Phase 9 outbound document path
+    # ------------------------------------------------------------------
+    async def send_document(
+        self,
+        chat_id: int,
+        path: Path,
+        *,
+        caption: str | None = None,
+        suggested_filename: str | None = None,
+    ) -> None:
+        """Phase 9 §2.5 — deliver a rendered artefact to ``chat_id``.
+
+        - ``path.is_file()`` False → log + silent return (handler
+          already emitted a text fallback per HIGH-3).
+        - ``stat().st_size > TELEGRAM_DOC_MAX_BYTES`` → text fallback
+          + return; sweeper unlinks the artefact via TTL.
+        - Else → ``FSInputFile(path, filename=suggested_filename)`` →
+          ``bot.send_document(chat_id=..., document=..., caption=...)``.
+
+        R1.3 closure: local var named ``document`` (not ``file``) to
+        match aiogram parameter name AND avoid shadowing Python's
+        ``file`` builtin. Pass kw-args explicitly.
+        """
+        from aiogram.types import FSInputFile
+
+        if not path.is_file():
+            log.error(
+                "render_doc_send_document_missing_path",
+                path_basename=path.name,
+            )
+            return
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            log.warning(
+                "render_doc_send_document_stat_failed",
+                path_basename=path.name,
+                error=repr(exc),
+            )
+            return
+        if size > TELEGRAM_DOC_MAX_BYTES:
+            log.warning(
+                "render_doc_send_document_size_cap",
+                path_basename=path.name,
+                size_bytes=size,
+            )
+            await self._bot.send_message(
+                chat_id,
+                "файл слишком большой для Telegram (>20MB)",
+            )
+            return
+        document = FSInputFile(path, filename=suggested_filename)
+        await self._bot.send_document(
+            chat_id=chat_id,
+            document=document,
+            caption=caption,
+        )
+
+    # ------------------------------------------------------------------
     # Dispatcher entry points
     # ------------------------------------------------------------------
     async def _on_text(self, message: Message) -> None:
@@ -234,9 +293,29 @@ class TelegramAdapter(MessengerAdapter):
             return
 
         chunks: list[str] = []
+        flushed_any = False
 
         async def emit(text: str) -> None:
             chunks.append(text)
+
+        # Phase 9 fix-pack F1 (CRIT-1 / AC#19 ordering invariant): the
+        # handler invokes ``flush_text`` BEFORE each render_doc
+        # ``send_document`` so accumulated chunks land first. Without
+        # this primitive the entire ``full`` string ships AFTER the
+        # whole handler returns — opposite of the spec.
+        async def flush_text() -> None:
+            nonlocal flushed_any
+            if not chunks:
+                return
+            partial = "".join(chunks).strip()
+            chunks.clear()
+            if not partial:
+                return
+            flushed_any = True
+            for part in _split_for_telegram(
+                partial, limit=TELEGRAM_MSG_LIMIT
+            ):
+                await self._bot.send_message(message.chat.id, part)
 
         incoming = IncomingMessage(
             chat_id=message.chat.id,
@@ -244,9 +323,20 @@ class TelegramAdapter(MessengerAdapter):
             text=message.text,
         )
         async with ChatActionSender.typing(bot=self._bot, chat_id=message.chat.id):
-            await self._handler.handle(incoming, emit)
+            await self._handler.handle(
+                incoming, emit, flush_text=flush_text
+            )
 
-        full = "".join(chunks).strip() or "(пустой ответ)"
+        full = "".join(chunks).strip()
+        if not full:
+            # F1: only emit the empty-response placeholder when NOTHING
+            # was ever shipped — otherwise we'd append a stray
+            # "(пустой ответ)" after a clean text→doc sequence.
+            if not flushed_any:
+                await self._bot.send_message(
+                    message.chat.id, "(пустой ответ)"
+                )
+            return
         for part in _split_for_telegram(full, limit=TELEGRAM_MSG_LIMIT):
             await self._bot.send_message(message.chat.id, part)
 
@@ -443,14 +533,39 @@ class TelegramAdapter(MessengerAdapter):
         )
 
         chunks: list[str] = []
+        flushed_any = False
 
         async def emit(text: str) -> None:
             chunks.append(text)
 
-        async with ChatActionSender.typing(bot=self._bot, chat_id=message.chat.id):
-            await self._handler.handle(incoming, emit)
+        async def flush_text() -> None:
+            # F1 (AC#19): drain chunks BEFORE each render_doc send_document
+            # so owner-visible order is text → doc.
+            nonlocal flushed_any
+            if not chunks:
+                return
+            partial = "".join(chunks).strip()
+            chunks.clear()
+            if not partial:
+                return
+            flushed_any = True
+            for part in _split_for_telegram(
+                partial, limit=TELEGRAM_MSG_LIMIT
+            ):
+                await self._bot.send_message(message.chat.id, part)
 
-        full = "".join(chunks).strip() or "(пустой ответ)"
+        async with ChatActionSender.typing(bot=self._bot, chat_id=message.chat.id):
+            await self._handler.handle(
+                incoming, emit, flush_text=flush_text
+            )
+
+        full = "".join(chunks).strip()
+        if not full:
+            if not flushed_any:
+                await self._bot.send_message(
+                    message.chat.id, "(пустой ответ)"
+                )
+            return
         for part in _split_for_telegram(full, limit=TELEGRAM_MSG_LIMIT):
             await self._bot.send_message(message.chat.id, part)
 
@@ -707,14 +822,36 @@ class TelegramAdapter(MessengerAdapter):
         )
 
         chunks: list[str] = []
+        flushed_any = False
 
         async def emit(text: str) -> None:
             chunks.append(text)
 
-        async with ChatActionSender.typing(bot=self._bot, chat_id=chat_id):
-            await self._handler.handle(incoming, emit)
+        async def flush_text() -> None:
+            # F1 (AC#19): drain chunks BEFORE each render_doc send_document.
+            nonlocal flushed_any
+            if not chunks:
+                return
+            partial = "".join(chunks).strip()
+            chunks.clear()
+            if not partial:
+                return
+            flushed_any = True
+            for part in _split_for_telegram(
+                partial, limit=TELEGRAM_MSG_LIMIT
+            ):
+                await self._bot.send_message(chat_id, part)
 
-        full = "".join(chunks).strip() or "(пустой ответ)"
+        async with ChatActionSender.typing(bot=self._bot, chat_id=chat_id):
+            await self._handler.handle(
+                incoming, emit, flush_text=flush_text
+            )
+
+        full = "".join(chunks).strip()
+        if not full:
+            if not flushed_any:
+                await self._bot.send_message(chat_id, "(пустой ответ)")
+            return
         for part in _split_for_telegram(full, limit=TELEGRAM_MSG_LIMIT):
             await self._bot.send_message(chat_id, part)
 

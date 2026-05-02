@@ -25,6 +25,10 @@ from assistant.bridge.claude import ClaudeBridge
 from assistant.config import Settings, get_settings
 from assistant.handlers.message import ClaudeHandler
 from assistant.logger import get_logger, setup_logging
+from assistant.render_doc import (
+    RenderDocSubsystem,
+    _cleanup_stale_artefacts,
+)
 from assistant.scheduler.dispatcher import SchedulerDispatcher
 from assistant.scheduler.loop import (
     RealClock,
@@ -46,6 +50,7 @@ from assistant.subagent.store import SubagentStore
 from assistant.tools_sdk import _installer_core as _core
 from assistant.tools_sdk import installer as _installer_mod
 from assistant.tools_sdk import memory as _memory_mod
+from assistant.tools_sdk import render_doc as _render_doc_mod
 from assistant.tools_sdk import scheduler as _scheduler_mod
 from assistant.tools_sdk import subagent as _subagent_mod
 from assistant.tools_sdk import vault as _vault_mod
@@ -241,6 +246,12 @@ class Daemon:
         # leaves ``.git/index.lock``).
         self._vault_sync: VaultSyncSubsystem | None = None
         self._vault_sync_pending: set[asyncio.Task[Any]] = set()
+        # Phase 9: render_doc subsystem. ``None`` when disabled. The
+        # pending set carries in-flight @tool body tasks; ``Daemon.stop``
+        # drains BEFORE ``_bg_tasks`` cancel (CRIT-4 §2.12) so pandoc
+        # subprocesses get clean SIGTERM and staging files clean up.
+        self._render_doc: RenderDocSubsystem | None = None
+        self._render_doc_pending: set[asyncio.Task[Any]] = set()
 
     async def _preflight_claude_auth(self) -> None:
         """Fail-fast if the ``claude`` CLI is missing or unauthenticated.
@@ -423,6 +434,45 @@ class Daemon:
         else:
             self._adapter = TelegramAdapter(self._settings)
 
+        # Phase 9: render_doc subsystem construction. Built BEFORE the
+        # bridge so the @tool body references a real subsystem when
+        # the bridge fires its first request. ``startup_check`` runs
+        # synchronously to populate ``force_disabled_formats`` (HIGH-5)
+        # so the bridge's ``render_doc_tool_visible`` gate can flip to
+        # ``False`` if the subsystem is fully disabled. The TTL sweeper
+        # spawns later via ``_spawn_bg_supervised`` (after adapter.start
+        # so any SubagentStop notify reaches Telegram first — same
+        # pattern as vault_sync below).
+        if self._settings.render_doc.enabled:
+            artefact_dir = self._settings.artefact_dir
+            artefact_dir.mkdir(parents=True, exist_ok=True)
+            (artefact_dir / ".staging").mkdir(parents=True, exist_ok=True)
+            _cleanup_stale_artefacts(
+                artefact_dir,
+                cleanup_threshold_s=(
+                    self._settings.render_doc.cleanup_threshold_s
+                ),
+            )
+            self._render_doc = RenderDocSubsystem(
+                artefact_dir=artefact_dir,
+                settings=self._settings.render_doc,
+                adapter=self._adapter,
+                owner_chat_id=self._settings.owner_chat_id,
+                run_dir=self._settings.data_dir / "run",
+                pending_set=self._render_doc_pending,
+            )
+            await self._render_doc.startup_check()
+            if not self._render_doc.force_disabled:
+                _render_doc_mod.configure_render_doc(
+                    subsystem=self._render_doc,
+                )
+
+        render_doc_visible = (
+            self._settings.render_doc.enabled
+            and self._render_doc is not None
+            and not self._render_doc.force_disabled
+        )
+
         # Phase 8 fix-pack F1 (AC#5 closure): only the OWNER bridge
         # gets ``vault_tool_visible=True`` and only when the
         # subsystem-side ``effective_manual_tool_enabled`` is True
@@ -436,6 +486,17 @@ class Daemon:
             agents=sub_agents,
             vault_tool_visible=(
                 self._settings.vault_sync.effective_manual_tool_enabled
+            ),
+            render_doc_tool_visible=render_doc_visible,
+            # Fix-pack F3 (CR-4 path-traversal defense): give the bridge
+            # the resolved artefact root so it can drop envelopes whose
+            # ``path`` escapes the configured dir before the handler
+            # ever sees them. Defense-in-depth with the handler-side
+            # check.
+            render_doc_artefact_root=(
+                self._settings.artefact_dir
+                if self._settings.render_doc.enabled
+                else None
             ),
         )
 
@@ -470,6 +531,8 @@ class Daemon:
             audio_bg_sem=self._audio_bg_sem,
             audio_dispatch=self.spawn_audio_task,
             audio_persist_pending=self._audio_persist_pending,
+            render_doc=self._render_doc,
+            adapter=self._adapter,
         )
         self._adapter.set_handler(handler)
         self._adapter.set_transcription(transcription)
@@ -641,6 +704,22 @@ class Daemon:
                     reason=self._vault_sync.disabled_reason,
                 )
 
+        # Phase 9: render_doc TTL sweeper + force-disable owner notify.
+        # Boot ordering (HIGH-2): AFTER vault_sync block AND BEFORE
+        # scheduler block. The owner notify uses ``adapter.send_text``
+        # wrapped in ``asyncio.wait_for(timeout=10s)`` per phase-8 F9
+        # precedent (see ``RenderDocSubsystem.notify_force_disabled_if_needed``).
+        if self._render_doc is not None:
+            if self._render_doc.force_disabled:
+                self._spawn_bg(
+                    self._render_doc.notify_force_disabled_if_needed()
+                )
+            else:
+                self._spawn_bg_supervised(
+                    self._render_doc.loop,
+                    name="render_doc_sweeper",
+                )
+
         if sched_enabled:
             assert self._sched_store is not None
             self._sched_queue = asyncio.Queue(
@@ -759,6 +838,15 @@ class Daemon:
                 if self._vault_sync is not None:
                     rss_payload["vault_sync_pending"] = len(
                         self._vault_sync_pending
+                    )
+                # Phase 9 (W2-LOW-1 / AC#29): expose live render_doc
+                # ledger size. Field is OMITTED when subsystem is
+                # absent (clean log schema) and emitted as
+                # ``render_doc_inflight=0`` when present with empty
+                # ledger.
+                if self._render_doc is not None:
+                    rss_payload["render_doc_inflight"] = (
+                        self._render_doc.get_inflight_count()
                     )
                 plog.info("daemon_rss", **rss_payload)
             await asyncio.sleep(interval_s)
@@ -962,6 +1050,44 @@ class Daemon:
         # because the picker awaits inline (research RQ3 / devil H-6).
         if self._sub_picker is not None:
             self._sub_picker.request_stop()
+        # Phase 9 fix-pack F2 (W3-CRIT-2): drain in-flight render_doc
+        # @tool body tasks BEFORE ``adapter.stop()``. The handler's
+        # ``_flush_artefacts`` calls ``adapter.send_document`` directly
+        # during streaming; closing the aiogram session first cascades
+        # CancelledError to in-flight handlers and any send_document
+        # already in flight raises ``ClientSessionAlreadyClosed``.
+        # Reordering ensures the drain budget covers the artefact's
+        # delivery path before the underlying transport tears down.
+        if self._render_doc_pending:
+            render_pending = list(self._render_doc_pending)
+            log.info(
+                "daemon_draining_render_doc",
+                count=len(render_pending),
+            )
+            try:
+                _done, not_done = await asyncio.wait(
+                    render_pending,
+                    timeout=(
+                        self._settings.render_doc.render_drain_timeout_s
+                    ),
+                    return_when=asyncio.ALL_COMPLETED,
+                )
+                if not_done:
+                    log.warning(
+                        "daemon_render_doc_drain_timeout",
+                        outstanding=[t.get_name() for t in not_done],
+                    )
+                    for t in not_done:
+                        t.cancel()
+                    await asyncio.gather(
+                        *not_done, return_exceptions=True
+                    )
+            except Exception as exc:
+                log.warning(
+                    "daemon_render_doc_drain_error",
+                    error=repr(exc),
+                )
+        self._render_doc_pending.clear()
         if self._adapter is not None:
             await self._adapter.stop()
         # Phase 8: drain in-flight vault_sync pushes BEFORE _bg_tasks
@@ -1003,6 +1129,13 @@ class Daemon:
                     error=repr(exc),
                 )
         self._vault_sync_pending.clear()
+        # Phase 9 §2.13: flip in_flight=False on remaining ledger
+        # records so next-boot mtime cleanup picks them up.
+        if self._render_doc is not None:
+            with contextlib.suppress(Exception):
+                await (
+                    self._render_doc.mark_orphans_delivered_at_shutdown()
+                )
         # S8 (wave-3): cancel tracked bg coroutines (skill_creator bootstrap,
         # sweepers) BEFORE closing the sqlite connection. Otherwise a
         # long-running ``fetch_bundle_async`` could try to touch the DB-adjacent

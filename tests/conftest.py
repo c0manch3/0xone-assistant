@@ -101,6 +101,20 @@ def _reset_subagent_ctx() -> Iterator[None]:
     reset_subagent_for_tests()
 
 
+@pytest.fixture(autouse=True)
+def _reset_render_doc_ctx() -> Iterator[None]:
+    """Phase 9: reset the render_doc @tool module state so each test
+    can re-call ``configure_render_doc`` without ``RuntimeError``.
+    Mirrors the vault / scheduler / subagent autouse fixtures."""
+    from assistant.tools_sdk.render_doc import (
+        reset_render_doc_for_tests,
+    )
+
+    reset_render_doc_for_tests()
+    yield
+    reset_render_doc_for_tests()
+
+
 class FakeClock:
     """Deterministic clock for async tick-loop tests (RQ4).
 
