@@ -176,6 +176,22 @@ records `send_text` calls without touching aiogram.
 
 ## Open issues / things I couldn't resolve
 
+- **Hotfix 2026-04-28 — `openssh-client` missing in runtime image.**
+  First live tick after deploy failed with
+  `vault sync failed: push: ssh ...: 1: ssh: not found`. The runtime
+  stage installed `git` but not `openssh-client`, so the
+  `GIT_SSH_COMMAND="ssh ..."` envelope `vault_sync.git_ops` builds
+  for `git push` had no `ssh` binary to invoke. None of the four
+  reviewer waves caught it because every phase-8 test mocked
+  `git_push`; the real subprocess path was never exercised in CI.
+  Fix: add `openssh-client` to the runtime apt install (propagates
+  to the test stage via `FROM runtime`) plus a
+  `shutil.which("ssh")` regression test
+  (`tests/test_phase8_ssh_binary_available.py`). Forward lesson:
+  any future phase that introduces a new system-tool dependency
+  (binary on PATH, not a Python wheel) MUST ship a
+  `shutil.which`-based smoke test so the CI test container catches
+  it before live deploy.
 - **No live test of an actual `git push`** against a real GitHub
   repo. The container-level `docker exec` smoke test in the deploy
   runbook (`deploy/docker/README.md` "Phase 8 vault sync — one-time

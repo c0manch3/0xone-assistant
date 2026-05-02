@@ -126,13 +126,19 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CLAUDE_CODE_DISABLE_AUTOUPDATER=1
 
 # Runtime OS deps. ca-certificates+curl for HTTPS to api.anthropic.com
-# and api.telegram.org; git for phase 7 vault git push path; tini as
-# pid 1 to forward signals + reap zombies. NO nodejs (claude is the
+# and api.telegram.org; git for phase 7 vault git push path;
+# openssh-client because phase 8 vault_sync uses
+# GIT_SSH_COMMAND="ssh -i ... -o ..." to authenticate `git push` via
+# the deploy key — without it, every push fails with "ssh: not found"
+# on first live tick (phase 8 hotfix; tests had mocked git_push so the
+# missing binary went unnoticed until live deploy). tini as pid 1 to
+# forward signals + reap zombies. NO nodejs (claude is the
 # self-contained ELF inside the venv per RQ13).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         git \
+        openssh-client \
         tini \
         passwd \
     && rm -rf /var/lib/apt/lists/*
