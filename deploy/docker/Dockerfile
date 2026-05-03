@@ -164,8 +164,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # every dlopen failure mode + a Cyrillic font-coverage regression at
 # build, not at first runtime render.
 RUN pandoc --version \
-    && pandoc --list-extensions=markdown-raw_html-raw_tex-raw_attribute-tex_math_dollars-tex_math_single_backslash-yaml_metadata_block \
-        | grep -E '^-(raw_html|raw_tex|raw_attribute|tex_math_dollars|tex_math_single_backslash|yaml_metadata_block)$' \
+    && pandoc --list-extensions=markdown \
+        | grep -E '^[+-](raw_html|raw_tex|raw_attribute|tex_math_dollars|tex_math_single_backslash|yaml_metadata_block)$' \
+        | wc -l | grep -qx 6 \
+    && echo '<p>Привет</p>' \
+        | pandoc --from=markdown-raw_html-raw_tex-raw_attribute-tex_math_dollars-tex_math_single_backslash-yaml_metadata_block --to=html5 \
+        > /dev/null \
     && /opt/venv/bin/python -c "import weasyprint; print('weasyprint', weasyprint.__version__)" \
     && /opt/venv/bin/python -c "from weasyprint import HTML; data = HTML(string='<p>Привет</p>').write_pdf(); assert isinstance(data, (bytes, bytearray)) and data.startswith(b'%PDF-') and b'%%EOF' in data[-256:], data[:32]; print('weasyprint render probe ok', len(data))" \
     && rm -f /tmp/probe.pdf
