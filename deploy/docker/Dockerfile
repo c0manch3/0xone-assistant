@@ -166,10 +166,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pandoc --version \
     && echo 'hello' \
         | pandoc --from=markdown-raw_html-raw_tex-raw_attribute-tex_math_dollars-tex_math_single_backslash-yaml_metadata_block --to=html5 \
-        > /dev/null \
-    && /opt/venv/bin/python -c "import weasyprint; print('weasyprint', weasyprint.__version__)" \
-    && /opt/venv/bin/python -c "from weasyprint import HTML; data = HTML(string='<p>Привет</p>').write_pdf(); assert isinstance(data, (bytes, bytearray)) and data.startswith(b'%PDF-') and b'%%EOF' in data[-256:], data[:32]; print('weasyprint render probe ok', len(data))" \
-    && rm -f /tmp/probe.pdf
+        > /dev/null
 
 # Mirror non-root user from base stage. Use absolute paths because
 # slim-bookworm puts useradd/groupadd in /usr/sbin which is NOT on the
@@ -209,6 +206,18 @@ RUN ln -sf /opt/venv/lib/python3.12/site-packages/claude_agent_sdk/_bundled/clau
 # bundled binary OR a base image swap that breaks glibc compat
 # (manylinux_2_17 floor; bookworm ships glibc 2.36 — well above).
 RUN /usr/local/bin/claude --version
+
+# Phase 9 (F9 / DM-2 / DH-1): exercise the FULL WeasyPrint pipeline at
+# build time — not just ``import weasyprint``. ``HTML(...).write_pdf()``
+# triggers cffi binding load, libpango / libharfbuzz / libgobject
+# dlopen, font-subsetting, AND a real PDF byte-stream emit. Catches
+# every dlopen failure mode + a Cyrillic font-coverage regression at
+# build, not at first runtime render.
+#
+# Placed AFTER `COPY --from=builder /opt/venv /opt/venv` so the venv
+# python is actually present.
+RUN /opt/venv/bin/python -c "import weasyprint; print('weasyprint', weasyprint.__version__)" \
+    && /opt/venv/bin/python -c "from weasyprint import HTML; data = HTML(string='<p>Привет</p>').write_pdf(); assert isinstance(data, (bytes, bytearray)) and data.startswith(b'%PDF-') and b'%%EOF' in data[-256:], data[:32]; print('weasyprint render probe ok', len(data))"
 
 # Phase 6b (F17): verify pillow-heif HEIF plugin registers in Pillow
 # at build time. Catches a future SDK / wheel drop that breaks Pillow
