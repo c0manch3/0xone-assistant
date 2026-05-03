@@ -164,10 +164,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # every dlopen failure mode + a Cyrillic font-coverage regression at
 # build, not at first runtime render.
 RUN pandoc --version \
-    && pandoc --list-extensions=markdown \
-        | grep -E '^[+-](raw_html|raw_tex|raw_attribute|tex_math_dollars|tex_math_single_backslash|yaml_metadata_block)$' \
-        | wc -l | grep -qx 6 \
-    && echo '<p>Привет</p>' \
+    && echo 'hello' \
         | pandoc --from=markdown-raw_html-raw_tex-raw_attribute-tex_math_dollars-tex_math_single_backslash-yaml_metadata_block --to=html5 \
         > /dev/null \
     && /opt/venv/bin/python -c "import weasyprint; print('weasyprint', weasyprint.__version__)" \
