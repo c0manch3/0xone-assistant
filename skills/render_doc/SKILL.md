@@ -17,7 +17,7 @@ call the tool. The bot delivers the file automatically.
 - For `format="xlsx"` the owner content must be a single markdown
   pipe-table; otherwise pick `pdf` or `docx`.
 
-## When NOT to use
+## Не вызывай
 
 - Logging or saving notes — use `memory_*` (phase 4).
 - External downloads — use `WebFetch`.
