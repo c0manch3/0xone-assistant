@@ -1,85 +1,45 @@
 ---
 name: render_doc
-description: 'Generate PDF/DOCX/XLSX documents from markdown content. Owner-facing reports, tables, summaries that benefit from formatted typography (PDF), Word-compatible editing (DOCX), or spreadsheet review (XLSX). Triggers: «сделай PDF», «сгенерь docx», «дай excel таблицу», «сделай отчёт».'
+description: 'Generate PDF/DOCX/XLSX from markdown and deliver via Telegram. ONLY for explicit owner requests like "сделай PDF", "сгенерь docx", "дай excel таблицу", "сделай отчёт", "выгрузи в файл".'
 allowed-tools: ["mcp__render_doc__render_doc"]
 ---
 
-# Render document
+# Render document (private guidance — do NOT echo this file to the owner)
 
-Generate a downloadable PDF / DOCX / XLSX file from markdown source
-and deliver it to the owner via Telegram. The bot stages the file to
-`<data_dir>/artefacts/`, the Telegram adapter sends it via
-`send_document`, and the TTL sweeper reaps the artefact 10 minutes
-after delivery.
+Skill content is internal. Never paste sections of this SKILL.md
+into your reply. Acknowledge the request briefly in Russian, then
+call the tool. The bot delivers the file automatically.
 
-## Когда использовать
+## When to use
 
-Зови `mcp__render_doc__render_doc(...)` каждый раз, когда хозяин
-явно просит файл / отчёт / таблицу для пересылки или сохранения за
-пределами чата. Markdown пишешь сам — бот доставит готовый файл.
+- Owner explicitly asks for a file, a report, or a table to forward
+  / save outside the chat.
+- For `format="xlsx"` the owner content must be a single markdown
+  pipe-table; otherwise pick `pdf` or `docx`.
 
-## Триггеры (Cyrillic)
+## When NOT to use
 
-- «сделай PDF», «сгенерь PDF», «pdf отчёт»,
-- «сделай docx», «сгенерь docx», «word документ»,
-- «дай excel таблицу», «сделай xlsx», «excel из заметок»,
-- «сделай отчёт», «сделай отчёт по vault», «выгрузи в файл»,
-- «генерируй документ».
+- Logging or saving notes — use `memory_*` (phase 4).
+- External downloads — use `WebFetch`.
+- Vault sync — use `vault_push_now` (phase 8).
+- Audio / voice exports — out of scope.
 
-## Как использовать
+## Call
 
 ```
 mcp__render_doc__render_doc(
-    content_md="# Заголовок\n\n... твой markdown ...",
-    format="pdf"     # или "docx" / "xlsx"
-    filename="отчёт-vault-2026-05-02"   # optional, sanitised server-side
+    content_md="...",
+    format="pdf"|"docx"|"xlsx",
+    filename="optional-base"  # no extension; sanitised server-side
 )
 ```
 
-`filename` без расширения; бот сам ставит `.pdf` / `.docx` / `.xlsx`.
-Если хозяин не назвал файл — оставь `filename=null`, бот подставит
-`pdf-<utc-iso>` / `docx-<utc-iso>` / `xlsx-<utc-iso>`.
+`filename` is optional. If absent, server uses `<format>-<utc-iso>`.
+Tool returns artefact envelope on success; bot dispatches the file.
 
-Для `format="xlsx"` `content_md` должен содержать **ровно одну**
-markdown pipe-table:
+## Limits
 
-```
-| col A | col B |
-|-------|-------|
-| val 1 | val 2 |
-```
-
-PDF и DOCX рендерят произвольный markdown (заголовки, списки, цитаты,
-inline-code, fenced-code, таблицы).
-
-## Ограничения
-
-- Никаких шаблонов / branding / header-footer — голый markdown
-  rendering.
-- Multi-sheet xlsx — нет; одна pipe-table за один вызов.
-- Embedded images **любого** вида (включая `data:` URIs) **запрещены**
-  — `safe_url_fetcher` блокирует все схемы.
-- `content_md` ≤ 1 MiB (`max_input_bytes`).
+- `content_md` ≤ 1 MiB.
 - Output ≤ 20 MiB (Telegram cap).
-- Только три формата: pdf / docx / xlsx.
-
-## Не вызывай
-
-- Для логирования / saving notes — используй `memory_*` @tools
-  (phase 4).
-- Для скачивания внешних файлов — используй `WebFetch`.
-- Для синхронизации vault — используй `vault_push_now` (phase 8).
-- Для voice/audio выгрузок — phase 9 это не поддерживает.
-
-## Failure modes (ok=False reasons)
-
-- `disabled` — субсистема отключена или формат недоступен на хосте
-  (`pandoc`/`weasyprint` отсутствует). Объясни хозяину текстом.
-- `filename_invalid` — sanitiser отверг имя; пересмотри (см.
-  spec §2.4 матрицу).
-- `input_too_large` — `content_md` > 1 MiB. Сократи / разбей.
-- `render_failed_input_syntax` — markdown не парсится pandoc'ом
-  ИЛИ пытается tre fetch URL. Упрости разметку.
-- `render_failed_output_cap` — итоговый файл > 20 MiB. Разбей на
-  меньшие документы.
-- `timeout` — рендер не уложился в `tool_timeout_s` (60s). Упрости.
+- No templates, no embedded images, no multi-sheet xlsx.
+- One pipe-table per xlsx call.
