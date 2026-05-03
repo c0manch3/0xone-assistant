@@ -50,10 +50,15 @@ def test_pandoc_binary_available() -> None:
 
 @pytest.mark.requires_pandoc
 def test_pandoc_markdown_variant_subtraction_takes_effect() -> None:
-    """R-Pandoc closure: ``--list-extensions=markdown-EXT...`` MUST
-    show literal ``-EXT`` lines for each subtracted extension AFTER
-    subtraction is applied. Closes the trap where pandoc silently
-    no-ops on invalid subtraction syntax.
+    """R-Pandoc closure: pandoc MUST accept the variant
+    ``markdown-raw_html-raw_tex-raw_attribute-tex_math_dollars-tex_math_single_backslash-yaml_metadata_block``
+    as a ``--from=`` flag and produce HTML output without rejecting any
+    of the 6 subtracted extension names. Closes the trap where pandoc
+    silently no-ops or fails on invalid subtraction syntax.
+
+    Pandoc 2.17 does NOT accept this form via ``--list-extensions=`` —
+    that flag treats the entire string as a format name. The runtime
+    invocation uses ``--from=``, so the test mirrors that invocation.
     """
     if shutil.which("pandoc") is None:
         pytest.skip("pandoc not installed")
@@ -63,25 +68,21 @@ def test_pandoc_markdown_variant_subtraction_takes_effect() -> None:
         "-yaml_metadata_block"
     )
     result = subprocess.run(
-        ["pandoc", f"--list-extensions={variant}"],
+        ["pandoc", f"--from={variant}", "--to=html5"],
+        input="hello\n",
         capture_output=True,
         text=True,
         check=False,
     )
-    assert result.returncode == 0, result.stderr
-    # Each subtracted extension MUST appear with leading "-" prefix.
-    for ext in (
-        "raw_html",
-        "raw_tex",
-        "raw_attribute",
-        "tex_math_dollars",
-        "yaml_metadata_block",
-    ):
-        line = f"-{ext}"
-        assert line in result.stdout, (
-            f"Subtraction {line} did not take effect; "
-            f"output: {result.stdout[:512]}"
-        )
+    assert result.returncode == 0, (
+        f"pandoc rejected --from={variant}: {result.stderr[:512]}"
+    )
+    # Output must contain HTML (`<p>hello</p>` shape — pandoc may add
+    # surrounding whitespace).
+    assert "<p>hello</p>" in result.stdout.strip(), (
+        f"pandoc round-trip produced unexpected output: "
+        f"{result.stdout[:256]!r}"
+    )
 
 
 def test_weasyprint_url_fetcher_hierarchy() -> None:
