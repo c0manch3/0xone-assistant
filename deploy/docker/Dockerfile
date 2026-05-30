@@ -134,7 +134,15 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # missing binary went unnoticed until live deploy). tini as pid 1 to
 # forward signals + reap zombies. NO nodejs (claude is the
 # self-contained ELF inside the venv per RQ13).
-RUN apt-get update && apt-get install -y --no-install-recommends \
+#
+# Phase 10: `apt-get upgrade -y` pulls the latest bookworm security
+# point releases (deb12u*) on top of the digest-pinned base layer. The
+# base image is pinned (2026-04-25) but the Debian security archive is
+# live, so without this the runtime ships whatever CVEs accrued since
+# the pin. Closes the Trivy HIGH/CRITICAL OS gate (libgnutls30 /
+# libcap2 / libgssapi-krb5-2 et al.) that blocked the phase-10 deploy.
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         git \
