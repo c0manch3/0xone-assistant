@@ -235,6 +235,8 @@ class ClaudeBridge:
         vault_tool_visible: bool = False,
         render_doc_tool_visible: bool = False,
         render_doc_artefact_root: Path | None = None,
+        websearch_tool_visible: bool = False,
+        websearch_max_budget_usd: float | None = None,
     ) -> None:
         """Phase 6 (research RQ1 + RQ2): ``extra_hooks`` is a dict
         keyed by SDK hook event name (``"SubagentStart"``,
@@ -266,6 +268,20 @@ class ClaudeBridge:
         ``vault_tool_visible=settings.vault_sync.effective_manual_tool_enabled``
         — which is ``True`` only when both
         ``vault_sync.enabled=True`` AND ``vault_sync.manual_tool_enabled=True``.
+
+        Phase 10 (WebSearch gate): ``websearch_tool_visible`` gates the
+        ``"WebSearch"`` built-in tool name in ``allowed_tools``.
+        WebSearch is a CLI BUILT-IN, not an MCP server, so ONLY
+        ``allowed_tools`` is touched — there is no ``mcp_servers`` entry
+        (unlike vault / render_doc). Default ``False`` so picker / audio
+        / every test fixture cannot silently rack up billed searches
+        ($10/1000). Only the OWNER bridge in :class:`Daemon.start`
+        passes ``websearch_tool_visible=settings.websearch.enabled``.
+        When set, ``websearch_max_budget_usd`` (optional) is forwarded
+        to ``ClaudeAgentOptions.max_budget_usd`` as a per-query hard USD
+        ceiling — applied ONLY when websearch is visible so non-search
+        bridges (and a websearch-enabled bridge whose owner left the
+        budget ``None``) are never clipped.
         """
         self._settings = settings
         sem_size = (
@@ -278,6 +294,8 @@ class ClaudeBridge:
         self._agents = agents
         self._vault_tool_visible = vault_tool_visible
         self._render_doc_tool_visible = render_doc_tool_visible
+        self._websearch_tool_visible = websearch_tool_visible
+        self._websearch_max_budget_usd = websearch_max_budget_usd
         # Phase 9 fix-pack F3 (CR-4 path-traversal defense): resolved
         # artefact root used by ``_parse_render_doc_artefact_block`` to
         # reject envelopes whose ``path`` escapes the configured dir.
@@ -388,6 +406,20 @@ class ClaudeBridge:
         if self._render_doc_tool_visible:
             allowed_tools.extend(RENDER_DOC_TOOL_NAMES)
             mcp_servers["render_doc"] = RENDER_DOC_SERVER
+        # Phase 10: conditional WebSearch built-in. Unlike vault /
+        # render_doc this touches ONLY ``allowed_tools`` — WebSearch is
+        # a CLI built-in, not an MCP server, so NO ``mcp_servers`` entry
+        # is added. Default-OFF (``websearch_tool_visible=False``) keeps
+        # the daemon observably identical to the pre-phase10 baseline;
+        # only the owner bridge opts in. The SSRF PreToolUse hook
+        # (``make_webfetch_hook``, matcher="WebFetch") is correctly
+        # INAPPLICABLE — WebSearch runs server-side inside Anthropic's
+        # infra with no client URL to guard. Injection defense for the
+        # untrusted RESULT text is documentation-level (system_prompt.md
+        # "## Web search" untrusted-data paragraph), since the SDK gives
+        # no server-side result-wrapping hook.
+        if self._websearch_tool_visible:
+            allowed_tools.append("WebSearch")
         opts_kwargs: dict[str, Any] = {
             "cwd": str(pr),
             "setting_sources": ["project"],
@@ -400,6 +432,20 @@ class ClaudeBridge:
         }
         if self._agents:
             opts_kwargs["agents"] = self._agents
+        # Phase 10: hard per-query USD ceiling. Applied ONLY when
+        # WebSearch is visible on this bridge AND an owner configured a
+        # cap — so non-search bridges and a websearch-enabled bridge
+        # that left ``WEBSEARCH_MAX_BUDGET_USD`` unset (``None``) keep
+        # the SDK default (no cap) and long legitimate non-search turns
+        # are never clipped. ``max_budget_usd`` caps the WHOLE turn's
+        # USD (tokens + searches), which is the only hard $ brake the
+        # SDK 0.1.63 surfaces (``max_uses`` is a Messages-API param not
+        # exposed by the Agent SDK / CLI).
+        if (
+            self._websearch_tool_visible
+            and self._websearch_max_budget_usd is not None
+        ):
+            opts_kwargs["max_budget_usd"] = self._websearch_max_budget_usd
         return ClaudeAgentOptions(**opts_kwargs)
 
     def _render_system_prompt(self) -> str:

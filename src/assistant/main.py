@@ -498,6 +498,15 @@ class Daemon:
                 if self._settings.render_doc.enabled
                 else None
             ),
+            # Phase 10: WebSearch is a BILLED server-side tool
+            # ($10/1000 searches). Only the OWNER bridge opts in, and
+            # only when ``WEBSEARCH_ENABLED=true``. The picker / audio
+            # bridges below stay default-False so unattended background
+            # and audio paths cannot silently spend money. The optional
+            # per-query USD ceiling rides along (applied only when
+            # websearch is visible).
+            websearch_tool_visible=self._settings.websearch.enabled,
+            websearch_max_budget_usd=self._settings.websearch.max_budget_usd,
         )
 
         # Phase 6e (Alt-C): SEPARATE audio bridge. ``max_concurrent``
@@ -548,6 +557,30 @@ class Daemon:
                 self._settings,
                 extra_hooks=sub_hooks or None,
                 agents=sub_agents,
+                # Phase 10 (review must-fix #1): the researcher subagent
+                # gains ``WebSearch`` via ``AgentDefinition.tools`` (see
+                # ``definitions.build_agents``) ONLY when
+                # ``websearch.subagent_enabled`` is True — that subagent
+                # runs INSIDE this picker bridge's SDK session. Mirror the
+                # gate here so (a) the picker session's top-level
+                # ``allowed_tools`` stays consistent with the subagent it
+                # dispatches, and (b) the per-query USD ceiling actually
+                # reaches the unattended researcher path: ``max_budget_usd``
+                # only attaches when ``websearch_tool_visible`` is True (it
+                # caps the WHOLE picker turn — picker stub + spawned
+                # subagent token/search spend). Without this the
+                # ``maxTurns=15`` researcher searched with NO USD cap.
+                # ``subagent_enabled`` already requires ``enabled=True``
+                # (config validator), so gating semantics are preserved:
+                # WebSearch reaches the researcher ONLY when
+                # ``subagent_enabled``. The audio bridge stays
+                # WebSearch-free (it never passes the kwarg).
+                websearch_tool_visible=(
+                    self._settings.websearch.subagent_enabled
+                ),
+                websearch_max_budget_usd=(
+                    self._settings.websearch.max_budget_usd
+                ),
             )
             self._sub_picker = SubagentRequestPicker(
                 self._sub_store,

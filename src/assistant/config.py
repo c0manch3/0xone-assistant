@@ -497,6 +497,102 @@ class RenderDocSettings(BaseSettings):
         return self
 
 
+class WebSearchSettings(BaseSettings):
+    """Phase 10 ``WebSearch`` built-in-tool knobs (``WEBSEARCH_`` env
+    prefix).
+
+    Mounted on :class:`Settings` as ``settings.websearch``. Mirrors the
+    phase-8 vault / phase-9 render_doc gating pattern but is simpler
+    because ``WebSearch`` is a CLI BUILT-IN tool, not an MCP server —
+    enabling it is purely a matter of appending the literal string
+    ``"WebSearch"`` to ``ClaudeAgentOptions.allowed_tools`` (verified
+    against the bundled ``claude_agent_sdk`` 0.1.63 + CLI 2.1.114). No
+    ``mcp_servers`` entry is ever added.
+
+    Default ``enabled=False`` because WebSearch is a SERVER-SIDE, BILLED
+    tool: $10 / 1000 searches flat-rate, NO volume discount, and the
+    fee applies regardless of the OAuth / Pro / Max subscription path
+    (each search also re-enters as input tokens, so a result-heavy turn
+    costs more than the raw $0.01/search implies). The default-OFF gate
+    is the PRIMARY cost control; once flipped on, the only remaining
+    hard brakes the SDK exposes are ``ClaudeAgentOptions.max_turns``
+    (already set) and ``ClaudeAgentOptions.max_budget_usd`` (wired
+    below).
+
+    OAuth invariant: NO ``api_key`` field — the CLI session under
+    ``~/.claude/`` is the sole auth path, identical to every other
+    subsystem.
+
+    CORRECTION vs the original task brief: ``ClaudeAgentOptions`` in
+    SDK 0.1.63 exposes NO ``allowed_domains`` / ``blocked_domains`` /
+    ``max_uses`` / ``user_location`` fields for the built-in WebSearch
+    tool — those are Messages-API ``web_search_20250305`` server-tool
+    DEFINITION params, not surfaced by the Agent SDK or the CLI
+    built-in, and there is no ``extra_args`` CLI flag for them either.
+    So domain / max-uses controls are intentionally OUT of scope; do
+    not add fields claiming to wire them.
+
+    Fields:
+      - ``enabled`` — master gate for the interactive owner bridge.
+      - ``subagent_enabled`` — SEPARATE gate (default ``False``) that
+        grants ``WebSearch`` to the read-only ``researcher`` subagent.
+        It is decoupled from ``enabled`` on purpose: the researcher is
+        dispatched through the picker bridge as an UNATTENDED,
+        least-supervised background job (``maxTurns=15``), and
+        ``AgentDefinition.tools`` — not the picker bridge's top-level
+        ``allowed_tools`` — governs the subagent session. So adding
+        ``WebSearch`` to ``researcher.tools`` really does spend money in
+        the background. Owners who want interactive search WITHOUT
+        unattended-subagent search keep this ``False`` (the default).
+      - ``max_budget_usd`` — optional per-query USD ceiling passed to
+        ``ClaudeAgentOptions.max_budget_usd`` ONLY on bridges where
+        websearch is enabled. ``None`` (default) means no cap. CAVEAT:
+        this caps the WHOLE turn's USD (tokens + searches), so a
+        non-None value set too low can clip legitimate long non-search
+        turns when the flag is on — pick a value high enough to absorb
+        normal turns yet low enough to catch a search loop (~$0.50-1.00
+        is a reasonable starting point). Applied to both the owner
+        bridge (when ``enabled``) and the subagent path (when
+        ``subagent_enabled``).
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="WEBSEARCH_",
+        env_file=[_user_env_file(), Path(".env")],
+        extra="ignore",
+    )
+    enabled: bool = False
+    subagent_enabled: bool = False
+    max_budget_usd: float | None = None
+
+    @model_validator(mode="after")
+    def _validate_websearch_consistency(self) -> WebSearchSettings:
+        """Cross-field validators.
+
+          - ``subagent_enabled=True`` requires ``enabled=True``. The
+            researcher subagent search path is a SUPERSET of the
+            interactive capability — enabling background search while
+            the owner cannot search interactively is almost certainly a
+            misconfiguration (and would silently spend money on the
+            least-supervised path). Reject early. Mirrors the
+            ``VaultSyncSettings`` ``manual_tool_enabled requires
+            enabled`` precedent.
+          - ``max_budget_usd`` (when set) must be > 0. A zero / negative
+            ceiling would either disable every turn or be nonsensical.
+        """
+        if self.subagent_enabled and not self.enabled:
+            raise ValueError(
+                "subagent_enabled=True requires enabled=True; set "
+                "WEBSEARCH_ENABLED=true or WEBSEARCH_SUBAGENT_ENABLED=false"
+            )
+        if self.max_budget_usd is not None and self.max_budget_usd <= 0:
+            raise ValueError(
+                "max_budget_usd must be > 0 when set "
+                f"(got {self.max_budget_usd})"
+            )
+        return self
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=[_user_env_file(), Path(".env")],
@@ -522,6 +618,7 @@ class Settings(BaseSettings):
     )
     vault_sync: VaultSyncSettings = Field(default_factory=VaultSyncSettings)
     render_doc: RenderDocSettings = Field(default_factory=RenderDocSettings)
+    websearch: WebSearchSettings = Field(default_factory=WebSearchSettings)
 
     # ------------------------------------------------------------------
     # Phase 6c: voice / audio / URL transcription via Mac mini Whisper.
